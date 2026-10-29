@@ -154,6 +154,41 @@ try {
   await page.locator('.chip-btn.on', { hasText: 'Оффер' }).waitFor();
   assert.equal(await page.getByLabel('Период').inputValue(), 'last_7_days', 'Rep-2 period restored');
 
+  // D11: uEPC, Approve %, CR (холд), CPA columns
+  await api('/api/campaigns', { id: 'd11', name: 'D11 Test', streams: [{ name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] }] });
+  const d11r1 = await fetch(server.url + '/r/d11', { redirect: 'manual' });
+  const d11cid = new URL(d11r1.headers.get('location')).searchParams.get('click_id');
+  await fetch(server.url + '/r/d11', { redirect: 'manual' });
+  await fetch(`${server.url}/postback?secret=conversion-test-secret&click_id=${d11cid}&revenue=10&currency=USD`);
+  const d11Stats = await (await fetch(server.url + '/stats?campaign=d11', { headers: { authorization: 'Bearer ' + TOKEN } })).json();
+  await page.goto(server.url + '/admin#/campaigns');
+  await page.locator('table.grid tbody tr', { hasText: 'D11 Test' }).waitFor();
+  await page.locator('button[aria-label="Колонки"]').click();
+  const d11Chooser = page.getByRole('dialog', { name: 'Выбор колонок' });
+  await d11Chooser.waitFor();
+  await d11Chooser.locator('.col-list label', { hasText: 'uEPC' }).waitFor();
+  await d11Chooser.locator('.col-list label', { hasText: 'Approve %' }).waitFor();
+  await d11Chooser.locator('.col-list label', { hasText: 'CR (холд)' }).waitFor();
+  await d11Chooser.locator('.col-list label', { hasText: 'CPA' }).waitFor();
+  await d11Chooser.locator('.col-list label', { hasText: 'uEPC' }).locator('input[type=checkbox]').check();
+  await d11Chooser.locator('.col-list label', { hasText: 'Approve %' }).locator('input[type=checkbox]').check();
+  await d11Chooser.getByRole('button', { name: 'Применить' }).click();
+  await d11Chooser.waitFor({ state: 'detached' });
+  await page.locator('table.grid th', { hasText: 'uEPC' }).waitFor();
+  await page.locator('table.grid th', { hasText: 'Approve %' }).waitFor();
+  const d11TableText = await page.locator('table.grid').innerText();
+  assert.ok(!d11TableText.includes('[object'), 'no stringified DOM nodes with new metric columns');
+  // Approve % = 100% (1 sale, 0 rejected, 0 leads)
+  if (d11Stats.sales > 0 && !d11Stats.leads && !d11Stats.rejected) {
+    const approvePct = await page.evaluate(() => {
+      const ths = [...document.querySelectorAll('table.grid th')];
+      const idx = ths.findIndex((th) => th.textContent.trim() === 'Approve %');
+      const row = [...document.querySelectorAll('table.grid tbody tr')].find((r) => r.textContent.includes('D11 Test'));
+      return row?.querySelectorAll('td')[idx]?.textContent?.trim() || null;
+    });
+    assert.match(approvePct || '', /100/, `Approve % should show 100% for 1 sale, got: ${approvePct}`);
+  }
+
   assert.deepEqual(errors, []);
 
   // Accounts: a REQUIRE_LOGIN install starts with the setup screen; owner creates a buyer; logout returns to login.
