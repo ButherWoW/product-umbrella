@@ -97,5 +97,16 @@ await runUi('accounts', { env: { REQUIRE_LOGIN: '1' } }, async (ui) => {
   await p2.locator('[data-nav=dashboard]').click();
   await p2.locator('.kpi', { hasText: 'Заработок баера' }).waitFor();
   assert.equal(await p2.getByRole('heading', { name: 'Баеры' }).count(), 0, 'buyers do not see the per-buyer table');
+  // Ownership: a team offer is read-only for the buyer (badge, no edit/copy/archive); their own offer keeps the controls.
+  await ui.api('/api/offers', { id: 'buyer-own', url: 'https://own.example.com/', ownerId: buyerUser.id });
+  await p2.goto(ui.url + '/admin#/offers');
+  const teamRow = p2.locator('table.grid tbody tr', { hasText: 'offer-1' });
+  const ownRow = p2.locator('table.grid tbody tr', { hasText: 'buyer-own' });
+  await ownRow.waitFor();
+  assert.equal(await teamRow.locator('.badge', { hasText: 'командный' }).count(), 1, 'team offer badge');
+  assert.equal(await teamRow.getByRole('button', { name: 'Изменить' }).count(), 0, 'no edit button on a team offer');
+  assert.equal(await teamRow.getByRole('button', { name: 'Копировать' }).count(), 0, 'no copy button on a team offer');
+  assert.equal(await ownRow.getByRole('button', { name: 'Изменить' }).count(), 1, 'own offer stays editable');
+  assert.equal(await ownRow.locator('.badge').count(), 0);
   await p2.screenshot({ path: join(tmpdir(), 'umbrella-admin-buyer.png') });
 });

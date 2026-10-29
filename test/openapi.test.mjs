@@ -18,9 +18,7 @@ const EXCEPTIONS = new Map([
   ['/admin/', 'same page as /admin'],
   ['/admin/admin.js', 'static file of the panel'],
   ['/admin/admin.css', 'static file of the panel'],
-  ['/assets/stream-editor.js', 'static script of the stream editor'],
-  ['/assets/event-logs.js', 'static script of the dashboard journals'],
-  ['/assets/event-logs.css', 'static style of the dashboard journals'],
+  ['/admin/stream-policy.js', 'src/stream-policy.js served to the panel (same no-cloaking check in the browser)'],
 ]);
 
 // "/api/users/{id}" and the regex form "/api/users/([0-9a-f-]{36})" both become "/api/users/{}".

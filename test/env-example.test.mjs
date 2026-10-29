@@ -19,7 +19,9 @@ export function envNames(source, isShell) {
     ? [/\$\{([A-Z][A-Z0-9_]*):[-?=]/g] // ${NAME:-default} / ${NAME:?error}: read from the environment
     : [/\bprocess\.env\.([A-Z][A-Z0-9_]*)/g, /\bprocess\.env\[['"]([A-Z][A-Z0-9_]*)['"]\]/g,
       /\benv\.([A-Z][A-Z0-9_]*)/g, // helpers that take (env = process.env)
-      /\bsecret\(\s*'([A-Z][A-Z0-9_]*)'/g]; // scripts/import-keitaro-*: secret('NAME', file) reads process.env[NAME]
+      // Helpers that read process.env[name] / env[name] for a literal first argument:
+      // secret('KEITARO_API_KEY', file), envLimit('LP_CLICK_RATE_LIMIT', 300), num('LOGIN_WINDOW_MS', …).
+      /\b(?:secret|envLimit|num)\(\s*'([A-Z][A-Z0-9_]*)'/g];
   for (const re of patterns) for (const m of source.matchAll(re)) names.add(m[1]);
   return names;
 }
@@ -35,7 +37,7 @@ const example = readFileSync(join(root, '.env.example'), 'utf8');
 const listed = new Set([...example.matchAll(/^#?\s*([A-Z][A-Z0-9_]*)=/gm)].map((m) => m[1]));
 
 test('the scan finds the variables (guards against a broken regex)', () => {
-  for (const name of ['DATABASE_URL', 'ADMIN_TOKEN', 'LOG_FILE', 'SOURCE_POSTBACK_ALLOW_PRIVATE', 'KEITARO_API_KEY', 'BACKUP_DIR']) {
+  for (const name of ['DATABASE_URL', 'ADMIN_TOKEN', 'LOG_FILE', 'SOURCE_POSTBACK_ALLOW_PRIVATE', 'KEITARO_API_KEY', 'BACKUP_DIR', 'LP_CLICK_RATE_LIMIT', 'LOGIN_WINDOW_MS']) {
     assert.ok(used.has(name), `${name} not found by the scan`);
   }
 });

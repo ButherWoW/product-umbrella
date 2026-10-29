@@ -1,7 +1,7 @@
 import './log-setup.js';
 import http from 'node:http';
 import { randomUUID, createHash, timingSafeEqual } from 'node:crypto';
-import { mkdir, appendFile, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, appendFile, readFile, writeFile as fsWriteFile, chmod } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { db, query, closeDb } from './db.js';
@@ -13,10 +13,12 @@ import { createConversionRecorder, hasRecordedConversion, findRecordedConversion
 import { createEventMirror } from './event-mirror.js';
 import { createConversionCapCounter, resolveOffer, zonedDayStart } from './conversion-cap.js';
 import { createJournalGate, filterJournal, campaignPlan, retentionPlan, clearCampaignRows, retentionRows } from './retention.js';
-import { createSourcePostbacks, resolveSourcePostback, parsePostbackUrl, parsePostbackStatuses, journalHasSourcePostback, sendPostback, fillPostbackMacros, stripQuery, allowPrivateFromEnv, SAMPLE_MACROS } from './source-postback.js';
+import { createSourcePostbacks, resolveSourcePostback, parsePostbackUrl, parsePostbackStatuses, journalHasSourcePostback, sendPostback, deliverWithRetry, fillPostbackMacros, stripQuery, allowPrivateFromEnv, SAMPLE_MACROS } from './source-postback.js';
 import { connectionType, CONNECTION_TYPES } from './connection-type.js';
 import { createBindingStore, bindingKey, boundChoice, streamRef, parseBindMode, parseBindTtl } from './visitor-binding.js';
 import { createMonitor, MONITOR_MODES } from './monitor.js';
+import { BOT_UA_RE, DATACENTER_RE, cloakingCondition, cloakingMessage, disabledByPolicy, streamPolicyError } from './stream-policy.js';
+import { createRateLimiter, createLoginLimiter, loginLimitsFromEnv } from './rate-limit.js';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const dataDir = process.env.DATA_DIR || join(root, 'data');
@@ -27,6 +29,15 @@ const settingsFile = join(dataDir, 'settings.json');
 const campaignsFile = join(dataDir, 'campaigns.json');
 const sourcesFile = join(dataDir, 'sources.json');
 const networksFile = join(dataDir, 'networks.json');
+// Data files hold postback URLs with network credentials, visitor IPs and settings: owner-only (0600).
+// The journal is appended with the same mode; files created by older versions are tightened at startup.
+const DATA_FILE_MODE = 0o600;
+const writeFile = (file, data, options = {}) => fsWriteFile(file, data, { mode: DATA_FILE_MODE, ...options });
+async function tightenDataFiles() {
+  for (const file of [eventsFile, offersFile, landingsFile, settingsFile, campaignsFile, sourcesFile, networksFile, join(dataDir, 'users.json'), join(dataDir, 'sessions.json'), join(dataDir, 'fx-rates.json')]) {
+    try { await chmod(file, DATA_FILE_MODE); } catch (error) { if (error.code !== 'ENOENT') console.warn('[data] chmod failed:', file, error.message); }
+  }
+}
 const port = Number(process.env.PORT || 4100);
 // Public path prefix when served behind a proxy under a subpath (nginx strips it before proxying).
 const basePath = /^\/[A-Za-z0-9_-]{1,40}$/.test(process.env.BASE_PATH || '') ? process.env.BASE_PATH : '';
@@ -35,6 +46,8 @@ const users = createUserStore({ db, dataDir });
 const requireLogin = /^(1|true|yes)$/i.test(process.env.REQUIRE_LOGIN || '');
 // Source postbacks to loopback (and plain http) only in tests: SOURCE_POSTBACK_ALLOW_PRIVATE=1.
 const sourcePostbackAllowPrivate = allowPrivateFromEnv();
+// Offer S2S postbacks go through the same hardened sender; S2S_ALLOW_PRIVATE=1 (or the flag above) is for tests only.
+const s2sAllowPrivate = sourcePostbackAllowPrivate || /^(1|true|yes)$/i.test(process.env.S2S_ALLOW_PRIVATE || '');
 // Amounts without a currency (and all click costs) are in DEFAULT_CURRENCY; reports convert to any currency at current rates.
 const rates = createRates({ dataDir, defaultCurrency: normalizeCurrency(process.env.DEFAULT_CURRENCY, 'EUR'),
   refreshMs: process.env.FX_REFRESH === '0' ? 0 : 12 * 3600 * 1000 });
@@ -67,13 +80,17 @@ const convertConversion = (cv, currency) => (cv.revenue === null || cv.revenue =
 const convertClickCost = (click, currency) => (click.cost || click.revenue ? { ...click, cost: Number(click.cost || 0) * rates.factor(rates.defaultCurrency, currency),
   revenue: Number(click.revenue || 0) * rates.factor(rates.defaultCurrency, currency) } : click);
 const SESSION_COOKIE = 'umb_session';
-const loginFailures = new Map();
+const loginLimiter = createLoginLimiter(loginLimitsFromEnv());
 const postbackSecret = process.env.POSTBACK_SECRET || '';
 const adminToken = process.env.ADMIN_TOKEN || '';
 const requirePostgres = /^(1|true|yes)$/i.test(process.env.REQUIRE_POSTGRES || '');
 const clickRateLimit = Math.max(0, Number(process.env.CLICK_RATE_LIMIT || 120));
 const clickRateWindowMs = Math.max(1000, Number(process.env.CLICK_RATE_WINDOW_MS || 60000));
-const rateBuckets = new Map();
+// Separate, more generous limits for the landing click-out and incoming postbacks (per IP and minute window; 0 = off).
+const envLimit = (name, fallback) => { const n = Number.parseInt(process.env[name] ?? '', 10); return Number.isFinite(n) && n >= 0 ? n : fallback; };
+const clickLimiter = createRateLimiter({ limit: clickRateLimit, windowMs: clickRateWindowMs });
+const lpClickLimiter = createRateLimiter({ limit: envLimit('LP_CLICK_RATE_LIMIT', 300), windowMs: Math.max(1000, envLimit('LP_CLICK_RATE_WINDOW_MS', 60000)) });
+const postbackLimiter = createRateLimiter({ limit: envLimit('POSTBACK_RATE_LIMIT', 1200), windowMs: Math.max(1000, envLimit('POSTBACK_RATE_WINDOW_MS', 60000)) });
 const adminAllowedIps = parseAdminAllowedIps(process.env.ADMIN_ALLOWED_IPS);
 const adminIpAllowed = (req) => !adminAllowedIps.length || adminAllowedIps.some((rule) => ipMatches(normalizeIp(clientIp(req)), rule));
 // Offers store { url, postbackUrl } objects. Old saves with bare strings are migrated on load.
@@ -99,8 +116,7 @@ if (process.env.GEOIP_ASN_DB) {
     console.log('[geo] ASN database loaded');
   } catch (e) { console.warn('[geo] ASN database unavailable, ISP lookup disabled:', e.message); }
 }
-// Hosting / cloud networks: real visitors do not browse from these; crawlers, scanners and review bots do.
-const DATACENTER_RE = /\b(amazon|google llc|google cloud|microsoft|azure|digitalocean|ovh|hetzner|linode|akamai|vultr|oracle|alibaba|tencent|cloudflare|leaseweb|contabo|scaleway|choopa|m247|datacamp|facebook|hostinger|ionos|hosting|servers?|data ?cent(er|re)s?|colocation)\b/i;
+// Hosting / cloud networks (DATACENTER_RE) and bot User-Agents (BOT_UA_RE) live in stream-policy.js, shared with the no-cloaking check.
 function lookupAsn(ip) {
   if (!asnReader || !ip) return null;
   try {
@@ -128,18 +144,20 @@ function clientIp(req) {
   return chain[Math.max(0, chain.length - trustProxyHops)];
 }
 
-function rateLimited(ip) {
-  if (!clickRateLimit || !ip) return false;
-  const now = Date.now();
-  const bucket = (rateBuckets.get(ip) || []).filter((at) => now - at < clickRateWindowMs);
-  if (bucket.length >= clickRateLimit) { rateBuckets.set(ip, bucket); return true; }
-  bucket.push(now); rateBuckets.set(ip, bucket);
-  if (rateBuckets.size > 10000) for (const [key, values] of rateBuckets) if (!values.length || now - values.at(-1) >= clickRateWindowMs) rateBuckets.delete(key);
-  return false;
+function rateLimited(ip, limiter = clickLimiter) {
+  return limiter.hit(ip);
 }
 const campaigns = new Map([['demo', { name: 'Demo campaign', active: true, streams: [], dailyCap: null, capUrl: null, allowDevices: [], allowGeos: [], geoCapUrl: null }]]);
+// Clicks whose PostgreSQL insert failed: only for these may getClickRecord fall back to the JSONL journal.
+const unmirroredClicks = new Set();
 const eventMirror = db ? createEventMirror({ query,
-  onError: (type, error) => console.warn(`[db] ${type} insert:`, error.message) }) : null;
+  onError: (type, error, payload) => {
+    console.warn(`[db] ${type} insert:`, error.message);
+    if (type === 'click' && payload?.clickId) {
+      unmirroredClicks.add(payload.clickId);
+      if (unmirroredClicks.size > 100000) unmirroredClicks.delete(unmirroredClicks.values().next().value);
+    }
+  } }) : null;
 
 // Offer / landing monitoring: MONITOR=0 turns the timer off (POST /api/monitor/check still works).
 // MONITOR_ALLOW_PRIVATE lists private IPs that may be fetched anyway — only for tests against 127.0.0.1.
@@ -254,6 +272,11 @@ function parseStreams(raw) {
       if (s.enabled === false) stream.enabled = false;
       // Remembers that the offer monitor (src/monitor.js) switched the stream off, so it may switch it back on.
       if (s.enabled === false && s.disabledBy === 'monitor') stream.disabledBy = 'monitor';
+      // Switched off by the no-cloaking policy (src/stream-policy.js); the reason is shown in the panel.
+      if (s.enabled === false && s.disabledBy === 'policy') {
+        stream.disabledBy = 'policy';
+        if (s.disabledReason) stream.disabledReason = String(s.disabledReason).slice(0, 500);
+      }
       if (s.countClicks === false) stream.countClicks = false;
       out.push(stream);
     } else if (OFFER_ID_RE.test(String(s.offerId || '')) && Number(s.weight) > 0) {
@@ -436,8 +459,6 @@ async function simulateClick(input, canSee) {
   }
 }
 
-const BOT_UA_RE = /bot\b|bot\/|crawl|spider|slurp|facebookexternalhit|headless|phantomjs|selenium|puppeteer|playwright|lighthouse|pingdom|uptimerobot|scrapy|curl\/|wget\/|python-requests|python-urllib|aiohttp|go-http-client|java\/|okhttp|apache-httpclient|libwww-perl/i;
-
 function isBot(ua) {
   return !ua || BOT_UA_RE.test(ua);
 }
@@ -503,6 +524,37 @@ const MACRO_RE = new RegExp(`\\{(click_id|subid|campaign|offer_id|device|country
 // Values are URL-encoded: they come from visitors' query strings and must not inject extra parameters.
 function applyMacros(template, vars) {
   return template.replace(MACRO_RE, (_, k) => encodeURIComponent(vars[k] ?? ''));
+}
+// Macros in the host part (https://{source}/, https://{sub_id_1}.example.com/) would let a visitor choose where
+// a redirect or postback goes (open redirect), and encoding does not help: URL parsing decodes %2E in hosts.
+// Rule: a macro may only stand for subdomain labels in front of a literal domain of at least two labels
+// (https://{x}.example.com/ — the result must stay under .example.com). A host that is all macro, a macro
+// glued to the domain (https://{x}example.com) or a result outside the literal domain is refused.
+const AUTHORITY_RE = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i;
+function hostSafe(template, result) {
+  const authority = String(template).match(AUTHORITY_RE)?.[1];
+  if (authority === undefined) return true;
+  const host = authority.slice(authority.lastIndexOf('@') + 1);
+  const macros = [...host.matchAll(MACRO_RE)];
+  if (!macros.length) return true;
+  const last = macros.at(-1);
+  const suffix = host.slice(last.index + last[0].length).replace(/:[^:\]]*$/, '').toLowerCase();
+  if (!/^\.[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(suffix)) return false;
+  try {
+    const hostname = new URL(result).hostname.toLowerCase();
+    return hostname.endsWith(suffix) && hostname.length > suffix.length;
+  } catch { return false; }
+}
+// applyMacros for a redirect or postback target: null when a host-position macro moved the host.
+function expandUrl(template, vars) {
+  const result = applyMacros(template, vars);
+  return hostSafe(template, result) ? result : null;
+}
+// Same, for request handlers: an unsafe destination answers 404 (nothing is recorded before it).
+function expandUrlOrFail(template, vars) {
+  const result = expandUrl(template, vars);
+  if (result === null) throw Object.assign(new Error('unsafe_destination'), { statusCode: 404 });
+  return result;
 }
 
 // Classify visitor device from User-Agent header.
@@ -731,6 +783,11 @@ async function todayRevenue(campaign) {
   } catch { return 0; }
 }
 
+// Owner of an offer, landing, source or network: the id of the user who created it; null = team (owner / ADMIN_TOKEN).
+function parseOwnerId(value) {
+  return /^[0-9a-f-]{36}$/i.test(String(value || '')) ? String(value).toLowerCase() : null;
+}
+
 function parseOffer(raw) {
   // Accept bare string (legacy) or object { url, postbackUrl? }.
   const urlStr = typeof raw === 'string' ? raw : String(raw?.url || '');
@@ -747,7 +804,7 @@ function parseOffer(raw) {
   const capTz = typeof raw?.capTz === 'string' && validTimeZone(raw.capTz) ? raw.capTz : 'UTC';
   const altOfferId = OFFER_ID_RE.test(String(raw?.altOfferId || '')) ? String(raw.altOfferId) : null;
   return { url: urlStr, postbackUrl, payoutType, payout, payoutCurrency, dailyCap, name, networkId, archived: raw?.archived === true, group: typeof raw?.group === 'string' ? raw.group.trim().slice(0, 60) : '',
-    conversionCap, capTz, altOfferId };
+    conversionCap, capTz, altOfferId, ownerId: parseOwnerId(raw?.ownerId) };
 }
 
 // Validation of the payout fields in POST/PATCH /api/offers (absent fields are not checked).
@@ -772,9 +829,9 @@ function conversionCapError(id, body) {
 async function loadOffers() {
   if (db) {
     try {
-      const { rows } = await db.query('SELECT id, url, postback_url, payout_type, payout, payout_currency, daily_cap, name, network_id, "group", archived, conversion_cap, cap_tz, alt_offer_id FROM offers');
+      const { rows } = await db.query('SELECT id, url, postback_url, payout_type, payout, payout_currency, daily_cap, name, network_id, "group", archived, conversion_cap, cap_tz, alt_offer_id, owner_id FROM offers');
       for (const row of rows) if (/^[a-z0-9_-]{2,80}$/i.test(row.id) && /^https:\/\//i.test(row.url)) offers.set(row.id, parseOffer({ url: row.url, postbackUrl: row.postback_url, payoutType: row.payout_type, payout: row.payout, payoutCurrency: row.payout_currency, dailyCap: row.daily_cap, name: row.name, networkId: row.network_id, group: row.group, archived: row.archived === true,
-        conversionCap: row.conversion_cap, capTz: row.cap_tz, altOfferId: row.alt_offer_id }));
+        conversionCap: row.conversion_cap, capTz: row.cap_tz, altOfferId: row.alt_offer_id, ownerId: row.owner_id }));
       return;
     } catch (error) { console.warn('[db] offers load fallback:', error.message); }
   }
@@ -795,7 +852,7 @@ async function saveOffers() {
 
 async function persistOffer(id, value) {
   const offer = typeof value === 'string' ? { url: value, postbackUrl: null } : value;
-  if (db) await db.query('INSERT INTO offers (id, url, postback_url, daily_cap, name, network_id, "group", archived, conversion_cap, cap_tz, alt_offer_id, payout_type, payout, payout_currency) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) ON CONFLICT (id) DO UPDATE SET url = EXCLUDED.url, postback_url = EXCLUDED.postback_url, payout_type = EXCLUDED.payout_type, payout = EXCLUDED.payout, payout_currency = EXCLUDED.payout_currency, daily_cap = EXCLUDED.daily_cap, name = EXCLUDED.name, network_id = EXCLUDED.network_id, "group" = EXCLUDED."group", archived = EXCLUDED.archived, conversion_cap = EXCLUDED.conversion_cap, cap_tz = EXCLUDED.cap_tz, alt_offer_id = EXCLUDED.alt_offer_id', [id, offer.url, offer.postbackUrl, offer.dailyCap ?? null, offer.name ?? null, offer.networkId ?? null, offer.group ?? '', offer.archived === true, offer.conversionCap ?? null, offer.capTz || 'UTC', offer.altOfferId ?? null, offer.payoutType || 'cpa', offer.payout ?? null, offer.payoutCurrency ?? null]);
+  if (db) await db.query('INSERT INTO offers (id, url, postback_url, daily_cap, name, network_id, "group", archived, conversion_cap, cap_tz, alt_offer_id, payout_type, payout, payout_currency, owner_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) ON CONFLICT (id) DO UPDATE SET url = EXCLUDED.url, postback_url = EXCLUDED.postback_url, payout_type = EXCLUDED.payout_type, payout = EXCLUDED.payout, payout_currency = EXCLUDED.payout_currency, daily_cap = EXCLUDED.daily_cap, name = EXCLUDED.name, network_id = EXCLUDED.network_id, "group" = EXCLUDED."group", archived = EXCLUDED.archived, conversion_cap = EXCLUDED.conversion_cap, cap_tz = EXCLUDED.cap_tz, alt_offer_id = EXCLUDED.alt_offer_id, owner_id = EXCLUDED.owner_id', [id, offer.url, offer.postbackUrl, offer.dailyCap ?? null, offer.name ?? null, offer.networkId ?? null, offer.group ?? '', offer.archived === true, offer.conversionCap ?? null, offer.capTz || 'UTC', offer.altOfferId ?? null, offer.payoutType || 'cpa', offer.payout ?? null, offer.payoutCurrency ?? null, offer.ownerId ?? null]);
   else await saveOffers();
 }
 
@@ -813,16 +870,17 @@ function parseSource(raw) {
     // Postback to the traffic source: URL with macros and the conversion statuses that trigger it.
     postbackUrl: parsePostbackUrl(raw.postbackUrl, { allowHttp: sourcePostbackAllowPrivate }),
     postbackStatuses: parsePostbackStatuses(raw.postbackStatuses),
+    ownerId: parseOwnerId(raw.ownerId),
   };
 }
 
 async function loadSources() {
   if (db) {
     try {
-      const { rows } = await db.query('SELECT id, name, param_map, cost_model, cpc, cost_from_param, postback_url, postback_statuses FROM sources');
+      const { rows } = await db.query('SELECT id, name, param_map, cost_model, cpc, cost_from_param, postback_url, postback_statuses, owner_id FROM sources');
       for (const row of rows) if (OFFER_ID_RE.test(row.id)) {
         const s = parseSource({ name: row.name, paramMap: row.param_map, costModel: row.cost_model, cpc: row.cpc, costFromParam: row.cost_from_param,
-          postbackUrl: row.postback_url, postbackStatuses: row.postback_statuses });
+          postbackUrl: row.postback_url, postbackStatuses: row.postback_statuses, ownerId: row.owner_id });
         if (s) sources.set(row.id, s);
       }
       return;
@@ -844,22 +902,22 @@ async function saveSources() {
 }
 
 async function persistSource(id, value) {
-  if (db) await db.query('INSERT INTO sources (id, name, param_map, cost_model, cpc, cost_from_param, postback_url, postback_statuses) VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8::jsonb) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, param_map = EXCLUDED.param_map, cost_model = EXCLUDED.cost_model, cpc = EXCLUDED.cpc, cost_from_param = EXCLUDED.cost_from_param, postback_url = EXCLUDED.postback_url, postback_statuses = EXCLUDED.postback_statuses',
-    [id, value.name ?? null, JSON.stringify(value.paramMap || {}), value.costModel, value.cpc, value.costFromParam, value.postbackUrl ?? null, JSON.stringify(value.postbackStatuses || ['sale'])]);
+  if (db) await db.query('INSERT INTO sources (id, name, param_map, cost_model, cpc, cost_from_param, postback_url, postback_statuses, owner_id) VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8::jsonb, $9) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, param_map = EXCLUDED.param_map, cost_model = EXCLUDED.cost_model, cpc = EXCLUDED.cpc, cost_from_param = EXCLUDED.cost_from_param, postback_url = EXCLUDED.postback_url, postback_statuses = EXCLUDED.postback_statuses, owner_id = EXCLUDED.owner_id',
+    [id, value.name ?? null, JSON.stringify(value.paramMap || {}), value.costModel, value.cpc, value.costFromParam, value.postbackUrl ?? null, JSON.stringify(value.postbackStatuses || ['sale']), value.ownerId ?? null]);
   else await saveSources();
 }
 
 function parseNetwork(raw) {
   const name = typeof raw?.name === 'string' ? raw.name.trim().slice(0, 120) : '';
   if (!name) return null;
-  return { name, offerParams: typeof raw?.offerParams === 'string' ? raw.offerParams.trim().slice(0, 1000) : '', clickIdParam: typeof raw?.clickIdParam === 'string' ? raw.clickIdParam.trim().slice(0, 80) : 'sub1', payoutParam: typeof raw?.payoutParam === 'string' ? raw.payoutParam.trim().slice(0, 80) : 'payout', notes: typeof raw?.notes === 'string' ? raw.notes.slice(0, 2000) : '' };
+  return { name, offerParams: typeof raw?.offerParams === 'string' ? raw.offerParams.trim().slice(0, 1000) : '', clickIdParam: typeof raw?.clickIdParam === 'string' ? raw.clickIdParam.trim().slice(0, 80) : 'sub1', payoutParam: typeof raw?.payoutParam === 'string' ? raw.payoutParam.trim().slice(0, 80) : 'payout', notes: typeof raw?.notes === 'string' ? raw.notes.slice(0, 2000) : '', ownerId: parseOwnerId(raw?.ownerId) };
 }
 async function loadNetworks() {
-  if (db) { try { const { rows } = await db.query('SELECT id,name,offer_params,click_id_param,payout_param,notes FROM networks'); for (const r of rows) { const n=parseNetwork({name:r.name,offerParams:r.offer_params,clickIdParam:r.click_id_param,payoutParam:r.payout_param,notes:r.notes}); if(n) networks.set(r.id,n); } return; } catch (e) { console.warn('[db] networks load fallback:', e.message); } }
+  if (db) { try { const { rows } = await db.query('SELECT id,name,offer_params,click_id_param,payout_param,notes,owner_id FROM networks'); for (const r of rows) { const n=parseNetwork({name:r.name,offerParams:r.offer_params,clickIdParam:r.click_id_param,payoutParam:r.payout_param,notes:r.notes,ownerId:r.owner_id}); if(n) networks.set(r.id,n); } return; } catch (e) { console.warn('[db] networks load fallback:', e.message); } }
   try { const saved=JSON.parse(await readFile(networksFile,'utf8')); for (const [id,raw] of Object.entries(saved||{})) if (OFFER_ID_RE.test(id) && parseNetwork(raw)) networks.set(id,parseNetwork(raw)); } catch (e) { if(e.code!=='ENOENT') console.warn('[networks] invalid config ignored'); }
 }
 async function saveNetworks() { await mkdir(dataDir,{recursive:true}); await writeFile(networksFile,JSON.stringify(Object.fromEntries(networks),null,2)+'\n'); }
-async function persistNetwork(id,v) { if(db) await db.query('INSERT INTO networks (id,name,offer_params,click_id_param,payout_param,notes) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,offer_params=EXCLUDED.offer_params,click_id_param=EXCLUDED.click_id_param,payout_param=EXCLUDED.payout_param,notes=EXCLUDED.notes',[id,v.name,v.offerParams,v.clickIdParam,v.payoutParam,v.notes]); else await saveNetworks(); }
+async function persistNetwork(id,v) { if(db) await db.query('INSERT INTO networks (id,name,offer_params,click_id_param,payout_param,notes,owner_id) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,offer_params=EXCLUDED.offer_params,click_id_param=EXCLUDED.click_id_param,payout_param=EXCLUDED.payout_param,notes=EXCLUDED.notes,owner_id=EXCLUDED.owner_id',[id,v.name,v.offerParams,v.clickIdParam,v.payoutParam,v.notes,v.ownerId??null]); else await saveNetworks(); }
 
 function parseCampaign(id, value) {
   return {
@@ -924,6 +982,28 @@ async function loadCampaigns() {
   } catch (error) { if (error.code !== 'ENOENT') console.warn('[campaigns] invalid config ignored'); }
 }
 
+// No-cloaking policy on stored campaigns: a stream with a forbidden condition is kept (so the owner sees what it was)
+// but switched off with the reason, once, with an audit entry from «system».
+async function enforceStreamPolicy() {
+  for (const [id, c] of campaigns) {
+    let changed = false;
+    const streams = (c.streams || []).map((s) => {
+      const found = s.conditions && !disabledByPolicy(s) ? cloakingCondition(s.conditions) : null;
+      if (!found) return s;
+      changed = true;
+      return { ...s, enabled: false, disabledBy: 'policy', disabledReason: cloakingMessage(s.name, found), _wasEnabled: s.enabled !== false };
+    });
+    if (!changed) continue;
+    for (const s of streams.filter((x) => '_wasEnabled' in x)) {
+      console.warn(`[policy] campaign ${id}: stream «${s.name || ''}» switched off — ${s.disabledReason}`);
+      await event('audit', { actor: 'system', action: 'disable_stream', entity: 'campaign', entityId: id,
+        changes: { stream: [null, s.name ?? null], enabled: [s._wasEnabled, false], reason: [null, s.disabledReason] } });
+    }
+    campaigns.set(id, { ...c, streams: streams.map(({ _wasEnabled, ...s }) => s) });
+    await persistCampaign(id, campaigns.get(id));
+  }
+}
+
 async function saveCampaigns() {
   await mkdir(dataDir, { recursive: true });
   await writeFile(campaignsFile, JSON.stringify(Object.fromEntries(campaigns), null, 2) + '\n');
@@ -950,7 +1030,7 @@ async function event(type, payload) {
   await mkdir(dataDir, { recursive: true });
   return journalGate.shared(async () => {
     const record = { id: randomUUID(), type, at: new Date().toISOString(), ...payload };
-    await appendFile(eventsFile, `${JSON.stringify(record)}\n`);
+    await appendFile(eventsFile, `${JSON.stringify(record)}\n`, { mode: DATA_FILE_MODE });
     // `mirrored` settles once PostgreSQL has the event (null without a database).
     return { mirrored: eventMirror?.enqueue(record) ?? null };
   });
@@ -1123,14 +1203,14 @@ function parseLanding(raw) {
   const url = String(raw?.url || '').trim();
   if (!/^https:\/\//i.test(url)) return null;
   const name = typeof raw?.name === 'string' && raw.name.trim() ? raw.name.trim().slice(0, 200) : null;
-  return { url: url.slice(0, 2048), name };
+  return { url: url.slice(0, 2048), name, ownerId: parseOwnerId(raw?.ownerId) };
 }
 
 async function loadLandings() {
   if (db) {
     try {
-      const { rows } = await db.query('SELECT id, url, name FROM landings');
-      for (const row of rows) { const l = OFFER_ID_RE.test(row.id) && parseLanding(row); if (l) landings.set(row.id, l); }
+      const { rows } = await db.query('SELECT id, url, name, owner_id FROM landings');
+      for (const row of rows) { const l = OFFER_ID_RE.test(row.id) && parseLanding({ ...row, ownerId: row.owner_id }); if (l) landings.set(row.id, l); }
       return;
     } catch (error) { console.warn('[db] landings load fallback:', error.message); }
   }
@@ -1140,7 +1220,7 @@ async function loadLandings() {
 }
 
 async function persistLanding(id, landing) {
-  if (db) await db.query('INSERT INTO landings (id, url, name) VALUES ($1, $2, $3) ON CONFLICT (id) DO UPDATE SET url = EXCLUDED.url, name = EXCLUDED.name', [id, landing.url, landing.name]);
+  if (db) await db.query('INSERT INTO landings (id, url, name, owner_id) VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO UPDATE SET url = EXCLUDED.url, name = EXCLUDED.name, owner_id = EXCLUDED.owner_id', [id, landing.url, landing.name, landing.ownerId ?? null]);
   else { await mkdir(dataDir, { recursive: true }); await writeFile(landingsFile, JSON.stringify(Object.fromEntries(landings), null, 2) + '\n'); }
 }
 
@@ -1166,12 +1246,22 @@ function publicBase(req) {
   return `${proto}://${req.headers.host || 'localhost'}${onTrackingDomain(req) ? '' : basePath}`;
 }
 
-// Full click record for /lp/click. PostgreSQL first; JSONL when the mirror has not caught up yet.
+// Full click record for /lp/click. PostgreSQL first. A missing row is answered from PostgreSQL alone (after the
+// mirror's queued inserts are flushed): /lp/click is public, and scanning the whole JSONL journal for every
+// unknown click id would let anyone load the server. The journal is read only when the query itself fails or
+// when this click's mirror insert failed (unmirroredClicks).
 async function getClickRecord(clickId) {
   if (db) {
     try {
-      const { rows } = await db.query('SELECT campaign, offer_id, landing_id, subid, country, params, cost FROM clicks WHERE click_id = $1', [clickId]);
-      if (rows.length) { const r = rows[0]; return { campaign: r.campaign, offerId: r.offer_id, landingId: r.landing_id, subid: r.subid, country: r.country, params: r.params, cost: Number(r.cost) || 0 }; }
+      const select = async () => {
+        const { rows } = await db.query('SELECT campaign, offer_id, landing_id, subid, country, params, cost FROM clicks WHERE click_id = $1', [clickId]);
+        const r = rows[0];
+        return r ? { campaign: r.campaign, offerId: r.offer_id, landingId: r.landing_id, subid: r.subid, country: r.country, params: r.params, cost: Number(r.cost) || 0 } : null;
+      };
+      let found = await select();
+      if (!found && eventMirror) { await eventMirror.flush(); found = await select(); }
+      if (found) return found;
+      if (!unmirroredClicks.has(clickId)) return null;
     } catch (e) { console.warn('[db] getClickRecord fallback:', e.message); }
   }
   try {
@@ -1244,24 +1334,52 @@ async function logPostback(type, payload) {
   try { await event(type, payload); } catch (error) { console.warn('[postbacks] journal not written:', error.message); }
 }
 // Outgoing S2S postback: up to 3 attempts (network error, 5xx or 429), pause S2S_RETRY_MS × attempt; every attempt is logged.
+// Sent by the hardened sender of src/source-postback.js (SSRF guard): https only, every resolved address must be
+// public and is pinned for the connection, redirects are not followed. A refusal is final and journaled.
 const S2S_ATTEMPTS = 3;
 const s2sRetryMs = Number.isFinite(Number(process.env.S2S_RETRY_MS)) && process.env.S2S_RETRY_MS !== '' ? Number(process.env.S2S_RETRY_MS) : 2000;
-async function deliverS2s(s2sUrl, meta) {
-  for (let attempt = 1; attempt <= S2S_ATTEMPTS; attempt += 1) {
-    let statusCode = null, error = null;
-    try {
-      const response = await fetch(s2sUrl, { signal: AbortSignal.timeout(10000) });
-      await response.body?.cancel();
-      statusCode = response.status;
-      if (!response.ok) error = `HTTP ${response.status}`;
-    } catch (failure) { error = String(failure.message || failure).slice(0, 300); }
-    await logPostback('postback_out', { ...meta, url: redactUrl(s2sUrl), statusCode, error, attempt });
-    if (!error) return;
-    const retryable = statusCode === null || statusCode >= 500 || statusCode === 429;
-    if (!retryable || attempt === S2S_ATTEMPTS) { console.warn('[s2s] postback failed:', error, `(attempt ${attempt})`); return; }
-    await new Promise((resolve) => setTimeout(resolve, s2sRetryMs * attempt));
-  }
+async function deliverS2s(s2sUrl, meta, send = sendPostback) {
+  const result = await deliverWithRetry(async (attempt) => {
+    let outcome;
+    if (!s2sUrl) outcome = { httpStatus: null, error: 'unsafe_destination', noRetry: true };
+    else if (!s2sAllowPrivate && !/^https:\/\//i.test(s2sUrl)) outcome = { httpStatus: null, error: 'invalid_scheme', noRetry: true };
+    else outcome = await send(s2sUrl, { allowPrivate: s2sAllowPrivate, timeoutMs: 10000 });
+    const error = outcome.error && /^http_\d+$/.test(outcome.error) ? `HTTP ${outcome.httpStatus}` : (outcome.error ? String(outcome.error).slice(0, 300) : null);
+    await logPostback('postback_out', { ...meta, url: s2sUrl ? redactUrl(s2sUrl) : null, statusCode: outcome.httpStatus, error, attempt });
+    return { ...outcome, error };
+  }, { attempts: S2S_ATTEMPTS, backoffMs: s2sRetryMs });
+  if (result.error) console.warn('[s2s] postback failed:', result.error, `(attempt ${result.attempts})`);
+  return result;
 }
+// Postbacks with a wrong secret: the first one per IP and minute is journaled as usual, the rest only counted;
+// at the end of the minute the count is journaled as one event («invalid_postback_secret ×N more»).
+const rejectedPostbacks = (() => {
+  const windows = new Map();
+  const flush = (all = false) => {
+    const now = Date.now(), writes = [];
+    for (const [ip, w] of windows) {
+      if (!all && now - w.since < 60000) continue;
+      windows.delete(ip);
+      if (w.suppressed) writes.push(logPostback('postback_in', { clickId: null, campaign: null, offerId: null, tid: null, status: null, revenue: null, currency: null,
+        url: null, statusCode: 401, error: `invalid_postback_secret ×${w.suppressed} more`, ip: ip === 'unknown' || ip === 'other' ? null : ip }));
+    }
+    return Promise.all(writes);
+  };
+  setInterval(flush, 60000).unref();
+  return {
+    // true → journal this rejection; false → counted only.
+    note(ip) {
+      const now = Date.now();
+      const w = windows.get(ip);
+      if (w && now - w.since < 60000) { w.suppressed += 1; return false; }
+      if (w) flush();
+      if (windows.size >= 10000) { const other = windows.get('other') || { since: now, suppressed: 0 }; other.suppressed += 1; windows.set('other', other); return false; }
+      windows.set(ip, { since: now, suppressed: 0 });
+      return true;
+    },
+    flush,
+  };
+})();
 // GET /api/postbacks: PostgreSQL first, the JSONL journal as fallback. Newest first.
 async function readPostbacks({ direction, campaign, allowed, from, to, limit }) {
   const fromMs = from ? Date.parse(`${from}T00:00:00Z`) : null;
@@ -1515,7 +1633,7 @@ const recordPostback = createConversionRecorder({
     sourcePostbacks.dispatch({ clickId, status: status || 'sale', revenue, currency, previousStatus, click });
     const offer = offers.get(click.offerId);
     if (!offer?.postbackUrl) return;
-    const s2sUrl = applyMacros(offer.postbackUrl, { click_id: clickId, tid: tid ?? '', revenue: revenue ?? '', currency: currency ?? '', status: status || 'sale' });
+    const s2sUrl = expandUrl(offer.postbackUrl, { click_id: clickId, tid: tid ?? '', revenue: revenue ?? '', currency: currency ?? '', status: status || 'sale' });
     deliverS2s(s2sUrl, { clickId, campaign: click.campaign ?? null, offerId: click.offerId ?? null, tid: tid || null, status: status || 'sale' })
       .catch((error) => console.warn('[s2s] postback failed:', error.message));
   },
@@ -1550,14 +1668,12 @@ function sessionCookie(req, token, maxAgeSeconds) {
 
 const isPrivatePath = (p) => (p.startsWith('/api/') && !p.startsWith('/api/auth/')) || p === '/stats' || p.startsWith('/stats/') || p === '/dashboard' || p.startsWith('/assets/');
 
-function loginBlocked(ip) {
-  const now = Date.now();
-  const recent = (loginFailures.get(ip) || []).filter((t) => now - t < 15 * 60 * 1000);
-  loginFailures.set(ip, recent);
-  return recent.length >= 10;
-}
-
 async function readJson(req, maxBytes = 64 * 1024) {
+  // Already read by the hideRevenue write check (with the largest route limit); the route's own limit still applies.
+  if (req.jsonBody !== undefined) {
+    if (req.jsonBodyBytes > maxBytes) throw Object.assign(new Error('request_too_large'), { statusCode: 413 });
+    return req.jsonBody;
+  }
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
@@ -1565,82 +1681,9 @@ async function readJson(req, maxBytes = 64 * 1024) {
     if (size > maxBytes) throw Object.assign(new Error('request_too_large'), { statusCode: 413 });
     chunks.push(chunk);
   }
+  req.jsonBodyBytes = size;
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); }
   catch { throw Object.assign(new Error('invalid_json'), { statusCode: 400 }); }
-}
-
-function dashboard(res) {
-  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
-  res.end(`<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Product Umbrella</title><link rel="stylesheet" href="/assets/event-logs.css">
-  <style>:root{--tiffany:#0abab5;--deep:#123b40;--ink:#173b40;--line:#d6eeeb;--paper:#fff}*{box-sizing:border-box}body{font:16px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,sans-serif;max-width:1040px;margin:0 auto;padding:48px 24px;background:linear-gradient(145deg,#f1fffd,#fff 55%,#e9fbf8);color:var(--ink)}h1{font-size:36px;letter-spacing:-.04em;margin:0 0 2px;color:var(--deep)}h2{margin:34px 0 14px;color:var(--deep)}small,.muted{color:#648287}.cards{display:flex;gap:16px;flex-wrap:wrap;margin:30px 0}.card{background:rgba(255,255,255,.85);border:1px solid var(--line);box-shadow:0 12px 30px rgba(18,59,64,.08);border-radius:18px;padding:20px;min-width:180px;flex:1}.value{font-size:34px;font-weight:750;color:var(--deep)}form{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px}input,button{font:inherit;border-radius:10px;padding:11px 13px;border:1px solid #b8ded9}input{background:#fff;min-width:190px;color:var(--ink)}button{background:var(--tiffany);border-color:var(--tiffany);color:#fff;font-weight:700;cursor:pointer;box-shadow:0 5px 12px rgba(10,186,181,.25)}button:hover{background:#079b98}ul{list-style:none;margin:0;padding:0;display:grid;gap:8px}li{background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px 14px}table{width:100%;border-collapse:separate;border-spacing:0;background:rgba(255,255,255,.9);border:1px solid var(--line);border-radius:16px;overflow:hidden;box-shadow:0 10px 25px rgba(18,59,64,.06)}td,th{text-align:left;padding:14px 16px;border-bottom:1px solid var(--line)}th{color:#5c7d81;background:#f3fffd;font-size:13px;text-transform:uppercase;letter-spacing:.08em}tr:last-child td{border-bottom:0}</style>
-  <style>#stream-editor{margin-top:40px;padding:24px;background:white;border:1px solid var(--line);border-radius:18px}#stream-editor fieldset{border:1px solid var(--line);border-radius:12px;margin:18px 0;padding:18px}#stream-editor label{display:grid;gap:5px;min-width:0}#stream-editor label span{font-size:12px;color:#648287}#stream-editor input,#stream-editor select{width:100%;min-width:0;font:inherit;padding:10px;border:1px solid #b8ded9;border-radius:10px;background:white}#stream-editor .editor-row{display:flex;flex-wrap:wrap;align-items:end;gap:10px;margin:12px 0}#stream-editor .editor-row label{flex:1;min-width:140px}#stream-editor .editor-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin:12px 0}#stream-editor summary{cursor:pointer;color:var(--deep)}#stream-editor [role=status]{color:#17685f}#stream-editor a{color:#17685f;overflow-wrap:anywhere}#stream-editor button:disabled{opacity:.5;cursor:wait}</style>
-  <h1>Product Umbrella</h1><small>Локальный трекер кампаний</small><div id="app">Загрузка…</div><section id="stream-editor" aria-label="Редактор потоков"></section><section id="event-logs" aria-label="Журнал событий"></section>
-  <script>
-  function fmt(n){return n==null?'—':Number(n).toFixed(2);}
-  function esc(value){return String(value).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#39;');}
-  function tbl(rows,hdrs){return '<table><thead><tr>'+hdrs.map(h=>'<th>'+h+'</th>').join('')+'</tr></thead><tbody>'+(rows||'<tr><td colspan="'+hdrs.length+'">Нет данных</td></tr>')+'</tbody></table>';}
-  function csvDownload(data,filename){const a=document.createElement('a');a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(data);a.download=filename;a.click();}
-  function sparkline(series){const BARS='▁▂▃▄▅▆▇█';const vals=series.map(v=>v.clicks);const mx=Math.max(...vals,1);return vals.map(v=>BARS[Math.round((v/mx)*(BARS.length-1))]).join('');}
-  let lastStats={};
-  async function render(q={}){
-    const p=new URLSearchParams(q);
-    const compareUrl=q.from&&q.to?('/stats/compare?from='+encodeURIComponent(q.from)+'&to='+encodeURIComponent(q.to)):null;
-    const paramField=q.param||'sub_id_1';
-    const [s,o,c,ts,src,net,cmp,pr,bots]=await Promise.all([fetch('/stats?'+p).then(r=>r.json()),fetch('/api/offers').then(r=>r.json()),fetch('/api/campaigns').then(r=>r.json()),fetch('/stats/timeseries?from='+new Date(Date.now()-6*86400000).toISOString().slice(0,10)).then(r=>r.json()),fetch('/api/sources').then(r=>r.json()),fetch('/api/networks').then(r=>r.json()),compareUrl?fetch(compareUrl).then(r=>r.json()):Promise.resolve(null),fetch('/stats/params?field='+encodeURIComponent(paramField)+(q.from?'&from='+q.from:'')+(q.to?'&to='+q.to:'')).then(r=>r.json()),fetch('/stats/bots'+(q.from?'?from='+q.from+(q.to?'&to='+q.to:''):'')).then(r=>r.json())]);
-    lastStats=s;
-    const campRows=Object.entries(s.byCampaign).map(([name,v])=>'<tr><td><a href="?campaign='+encodeURIComponent(name)+'" style="color:#087f7b;text-decoration:none;font-weight:650">'+esc(name)+'</a></td><td>'+v.clicks+'</td><td>'+v.conversions+'</td><td>'+((v.conversions/Math.max(v.clicks,1))*100).toFixed(2)+'%</td><td>'+fmt(v.revenue)+'</td></tr>').join('');
-    const ctryRows=Object.entries(s.byCountry||{}).sort((a,b)=>b[1].clicks-a[1].clicks).slice(0,15).map(([ctry,v])=>'<tr><td>'+ctry+'</td><td>'+v.clicks+'</td><td>'+v.conversions+'</td><td>'+fmt(v.revenue)+'</td></tr>').join('');
-    const offerRows=Object.entries(s.byOffer||{}).sort((a,b)=>b[1].clicks-a[1].clicks).map(([id,v])=>'<tr><td>'+id+'</td><td>'+v.clicks+'</td><td>'+v.conversions+'</td><td>'+((v.conversions/Math.max(v.clicks,1))*100).toFixed(2)+'%</td><td>'+fmt(v.revenue)+'</td></tr>').join('');
-    const streamRows=Object.entries(s.byStream||{}).sort((a,b)=>b[1].clicks-a[1].clicks).map(([name,v])=>'<tr><td>'+esc(name)+'</td><td>'+v.clicks+'</td><td>'+v.conversions+'</td><td>'+((v.cr||0)*100).toFixed(2)+'%</td><td>'+fmt(v.revenue)+'</td><td>'+fmt(v.epc)+'</td></tr>').join('');
-    const paramRows=(pr.rows||[]).map(v=>'<tr><td>'+esc(v.value||'(не передан)')+'</td><td>'+v.clicks+'</td><td>'+v.conversions+'</td><td>'+fmt(v.revenue)+'</td></tr>').join('');
-    const offerList=Object.entries(o.offers).map(([id,v])=>'<li><input type="checkbox" data-offer-select="'+esc(id)+'"> <b>'+esc(id)+'</b> — '+esc(typeof v==='string'?v:v.url)+(v.group?' <small>['+esc(v.group)+']</small>':'')+(v.postbackUrl?' <small>[S2S]</small>':'')+(v.networkId&&net.networks?.[v.networkId]?' <small>['+esc(net.networks[v.networkId].name)+']</small>':'')+' <button data-offer-action="clone" data-offer="'+esc(id)+'">Копировать</button> <button data-offer-action="archive" data-offer="'+esc(id)+'">'+(v.archived?'Восстановить':'В архив')+'</button></li>').join('');
-    const campList=Object.entries(c.campaigns).map(([id,v])=>'<li><b>'+esc(id)+'</b> — '+esc(v.name)+(v.group?' <small>['+esc(v.group)+']</small>':'')+' <button data-campaign="'+esc(id)+'" data-active="'+(!v.active)+'">'+(v.active?'Выключить':'Включить')+'</button> <button data-campaign-action="clone" data-campaign-id="'+esc(id)+'">Копировать</button> <button data-campaign-action="archive" data-campaign-id="'+esc(id)+'">'+(v.archived?'Восстановить':'В архив')+'</button></li>').join('');
-    const campOpts='<option value="">Все кампании</option>'+Object.keys(c.campaigns).map(id=>'<option>'+id+'</option>').join('');
-    const sourceOpts='<option value="">Без источника</option>'+Object.entries(src.sources||{}).map(([id,v])=>'<option value="'+esc(id)+'">'+esc(v.name)+' ('+esc(id)+')</option>').join('');
-    const networkOpts='<option value="">Без сети</option>'+Object.entries(net.networks||{}).map(([id,v])=>'<option value="'+esc(id)+'">'+esc(v.name)+' ('+esc(id)+')</option>').join('');
-    const inp=k=>'<input id="f-'+k+'" '+(k==='from'||k==='to'?'type="date"':'placeholder="'+(k==='country'?'Страна (US)':'Оффер')+'"')+' style="font:inherit;border-radius:10px;padding:10px;border:1px solid #b8ded9;background:#fff;width:130px">';
-    const spark=ts&&ts.series&&ts.series.length?'<div style="font-family:monospace;font-size:18px;letter-spacing:2px;color:#1a7f6e;margin:-6px 0 6px;line-height:1" title="Клики за 7 дней">'+sparkline(ts.series)+'</div><div style="font-size:11px;color:#999;margin-bottom:8px">7 дней</div>':'';
-    document.querySelector('#app').innerHTML=
-      '<div class="cards"><div class="card"><div class="muted">Клики</div><div class="value">'+s.clicks+'</div>'+spark+(cmp?.deltaPct?.clicks!=null?'<small>Δ '+cmp.deltaPct.clicks+'%</small>':'')+'</div>'
-      +'<div class="card"><div class="muted">Конверсии</div><div class="value">'+s.conversions+'</div>'+(cmp?.deltaPct?.conversions!=null?'<small>Δ '+cmp.deltaPct.conversions+'%</small>':'')+'</div>'
-      +'<div class="card"><div class="muted">CR</div><div class="value">'+((s.conversions/Math.max(s.clicks,1))*100).toFixed(2)+'%</div></div>'
-      +'<div class="card"><div class="muted">Revenue</div><div class="value">'+fmt(s.revenue)+'</div>'+(cmp?.deltaPct?.revenue!=null?'<small>Δ '+cmp.deltaPct.revenue+'%</small>':'')+'</div></div>'
-      +(bots.total>0?'<div class="card" style="margin-bottom:20px"><div class="muted">Боты</div><div class="value">'+bots.total+'</div><small>Доля: '+((bots.total/Math.max(s.clicks+bots.total,1))*100).toFixed(2)+'%</small></div>':'')
-      +'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px;align-items:center">'
-      +'<select id="f-campaign" style="font:inherit;border-radius:10px;padding:10px 13px;border:1px solid #b8ded9;background:#fff">'+campOpts+'</select>'
-      +inp('from')+inp('to')+inp('country')+inp('offer')
-      +'<input id="f-stream" placeholder="Поток (или default)" aria-label="Фильтр по потоку">'
-      +'<button id="f-apply">Применить</button>'
-      +'<button id="f-csv" style="background:#1a7f6e">CSV</button></div>'
-      +'<h2>По кампаниям</h2>'+tbl(campRows,['Кампания','Клики','Конв.','CR','Revenue'])
-      +(offerRows?'<h2>По офферам</h2>'+tbl(offerRows,['Оффер','Клики','Конв.','CR','Revenue']):'')
-      +(streamRows?'<h2>По потокам</h2>'+tbl(streamRows,['Поток','Клики','Конв.','CR','Revenue','EPC']):'')
-      +'<h2>По параметру</h2><div style="margin-bottom:8px"><select id="f-param" style="font:inherit;border-radius:10px;padding:10px;border:1px solid #b8ded9;background:#fff"><option value="sub_id_1">sub_id_1</option><option value="source">source</option><option value="keyword">keyword</option><option value="creative_id">creative_id</option></select><button id="f-param-apply">Показать</button></div>'+tbl(paramRows,['Значение','Клики','Конв.','Revenue'])
-      +(ctryRows?'<h2>По странам (топ-15)</h2>'+tbl(ctryRows,['Страна','Клики','Конв.','Revenue']):'')
-      +'<h2>Добавить оффер</h2><form id="offer-form"><input name="id" placeholder="offer-id" required pattern="[A-Za-z0-9_-]{2,80}"><input name="url" type="url" placeholder="https://..." required><input name="group" placeholder="Группа (необязательно)" maxlength="60"><input name="postbackUrl" type="url" placeholder="S2S URL (необязательно)"><select name="networkId" style="font:inherit;border-radius:10px;padding:10px 13px;border:1px solid #b8ded9;background:#fff">'+networkOpts+'</select><button>Сохранить</button></form>'
-      +'<h2>Офферы</h2><button id="bulk-offer-archive" style="background:#1a7f6e">Архивировать выбранные</button><ul>'+(offerList||'<li>Пока нет офферов</li>')+'</ul>'
-      +'<h2>Кампании</h2><form id="campaign-form"><input name="id" placeholder="campaign-id" required pattern="[A-Za-z0-9_-]{2,80}"><input name="name" placeholder="Название" required><input name="group" placeholder="Группа (необязательно)" maxlength="60"><select name="sourceId" style="font:inherit;border-radius:10px;padding:10px 13px;border:1px solid #b8ded9;background:#fff">'+sourceOpts+'</select><button>Создать</button></form>'
-      +'<h2>Источники</h2><form id="source-form"><input name="id" placeholder="source-id" required pattern="[A-Za-z0-9_-]{2,80}"><input name="name" placeholder="Название источника" required><select name="costModel" style="font:inherit;border-radius:10px;padding:10px;border:1px solid #b8ded9;background:#fff"><option value="none">Без CPC</option><option value="cpc">CPC</option></select><input name="cpc" type="number" min="0" step="0.000001" placeholder="CPC"><input name="paramMap" placeholder="Параметры JSON: {&quot;sub_id_1&quot;:&quot;ad_id&quot;}"><button>Добавить источник</button></form><ul>'+(Object.entries(src.sources||{}).map(([id,v])=>'<li><b>'+esc(id)+'</b> — '+esc(v.name)+' <small>('+esc(v.costModel||'none')+')</small></li>').join('')||'<li>Источники пока не созданы</li>')+'</ul>'
-      +'<h2>Партнёрские сети</h2><form id="network-form"><input name="id" placeholder="network-id" required pattern="[A-Za-z0-9_-]{2,80}"><input name="name" placeholder="Название сети" required><input name="clickIdParam" placeholder="click id: sub1"><input name="payoutParam" placeholder="payout: payout"><button>Добавить сеть</button></form><ul>'+(Object.entries(net.networks||{}).map(([id,v])=>'<li><b>'+esc(id)+'</b> — '+esc(v.name)+' <small>click: '+esc(v.clickIdParam||'sub1')+', payout: '+esc(v.payoutParam||'payout')+'</small></li>').join('')||'<li>Сети пока не созданы</li>')+'</ul>'
-      +'<ul>'+(campList||'<li>Нет кампаний</li>')+'</ul>'
-      +'<h2>Тренды</h2><div><select id="trend-campaigns" multiple size="4" style="min-width:220px;font:inherit;border:1px solid #b8ded9;border-radius:10px;padding:8px">'+Object.keys(c.campaigns).map(id=>'<option value="'+esc(id)+'">'+esc(id)+'</option>').join('')+'</select><select id="trend-metric" style="font:inherit;border:1px solid #b8ded9;border-radius:10px;padding:10px"><option value="clicks">Клики</option><option value="conversions">Конверсии</option><option value="revenue">Доход</option></select><button id="trend-load">Показать</button></div><div id="trend-output" class="muted" style="margin-top:10px">Выберите до пяти кампаний</div>';
-    for(const key of ['campaign','from','to','country','offer','stream'])document.querySelector('#f-'+key).value=q[key]||'';
-    document.querySelector('#f-param').value=paramField;
-    document.querySelector('#f-param-apply').onclick=()=>render({...q,param:document.querySelector('#f-param').value});
-    document.querySelector('#f-apply').onclick=()=>{const f={};for(const key of ['campaign','from','to','country','offer','stream']){const value=document.querySelector('#f-'+key).value;if(value)f[key]=value;}render(f);};
-    document.querySelector('#f-csv').onclick=()=>{const rows=['campaign,clicks,conversions,cr,revenue',...Object.entries(lastStats.byCampaign||{}).map(([n,v])=>[n,v.clicks,v.conversions,((v.conversions/Math.max(v.clicks,1))*100).toFixed(2),v.revenue.toFixed(2)].join(','))].join('\\n');csvDownload(rows,'stats.csv');};
-    document.querySelector('#trend-load').onclick=async()=>{const ids=[...document.querySelector('#trend-campaigns').selectedOptions].slice(0,5).map(x=>x.value);if(!ids.length)return;const metric=document.querySelector('#trend-metric').value;const rows=await Promise.all(ids.map(async id=>({id,data:(await (await fetch('/stats/timeseries?campaign='+encodeURIComponent(id))).json()).series||[]})));const days=[...new Set(rows.flatMap(x=>x.data.map(v=>v.date)))].sort();document.querySelector('#trend-output').innerHTML=tbl(days.map(day=>'<tr><td>'+day+'</td>'+rows.map(x=>'<td>'+fmt((x.data.find(v=>v.date===day)||{})[metric]||0)+'</td>').join('')+'</tr>').join(''),['День',...rows.map(x=>x.id)]);};
-    document.querySelector('#offer-form').onsubmit=async e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.target));if(!body.postbackUrl)delete body.postbackUrl;const r=await fetch('/api/offers',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});if(!r.ok)return alert('Ошибка');render();};
-    document.querySelector('#campaign-form').onsubmit=async e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.target));const r=await fetch('/api/campaigns',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});if(!r.ok)return alert('Ошибка');render();};
-    document.querySelector('#source-form').onsubmit=async e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.target));if(body.cpc)body.cpc=Number(body.cpc);if(body.paramMap){try{body.paramMap=JSON.parse(body.paramMap);}catch{return alert('Неверный JSON paramMap');}}else delete body.paramMap;const r=await fetch('/api/sources',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});if(!r.ok)return alert('Ошибка');render();};
-    document.querySelector('#network-form').onsubmit=async e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.target));const r=await fetch('/api/networks',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});if(!r.ok)return alert('Ошибка');render();};
-    document.querySelectorAll('[data-campaign]').forEach(b=>b.onclick=async()=>{await fetch('/api/campaigns/'+b.dataset.campaign,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({active:b.dataset.active==='true'})});render();});
-    document.querySelectorAll('[data-campaign-action]').forEach(b=>b.onclick=async()=>{const id=b.dataset.campaignId;if(b.dataset.campaignAction==='clone')await fetch('/api/campaigns/'+id+'/clone',{method:'POST'});else await fetch('/api/campaigns/'+id,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({archived:b.textContent.includes('В архив')})});render();});
-    document.querySelectorAll('[data-offer-action]').forEach(b=>b.onclick=async()=>{const id=b.dataset.offer;if(b.dataset.offerAction==='clone')await fetch('/api/offers/'+id+'/clone',{method:'POST'});else await fetch('/api/offers/'+id,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({archived:b.textContent.includes('В архив')})});render();});
-    document.querySelector('#bulk-offer-archive').onclick=async()=>{const ids=[...document.querySelectorAll('[data-offer-select]:checked')].map(x=>x.dataset.offer);await Promise.all(ids.map(id=>fetch('/api/offers/'+id,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({archived:true})})));render();};
-  }
-  render();
-  </script><script type="module" src="/assets/stream-editor.js"></script><script type="module" src="/assets/event-logs.js"></script></html>`);
 }
 
 const htmlAttr = (v) => String(v).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
@@ -1679,29 +1722,86 @@ const hidesRevenue = (req) => restrictedUser(req) && req.user.hideRevenue === tr
 const isViewer = (req) => req.user?.role === 'viewer' && !bearerAuthorized(req);
 // hideRevenue removes these keys (not zeroes them: a zero profit or ROI would be a lie) at any depth of the response.
 const REVENUE_KEY = /revenue|profit|payout|earning|^(roi|epc|uepc|rpm)$/i;
-const URL_KEY = /^(url|postbackUrl)$/;
+// Names of postback parameters (a network's payoutParam) are configuration, not amounts.
+const isRevenueKey = (k) => REVENUE_KEY.test(k) && !/Param$/.test(k);
+// urls mode also drops destination URLs: offer/postback URLs and the landing URL in /api/simulate.
+const URL_KEY = /^(url|postbackUrl|landing)$/;
 function stripRevenue(value, urls) {
   if (Array.isArray(value)) return value.map((v) => stripRevenue(v, urls));
   if (!value || typeof value !== 'object') return value;
-  return Object.fromEntries(Object.entries(value).filter(([k]) => !REVENUE_KEY.test(k) && !(urls && URL_KEY.test(k))).map(([k, v]) => [k, stripRevenue(v, urls)]));
+  return Object.fromEntries(Object.entries(value).filter(([k]) => !isRevenueKey(k) && !(urls && URL_KEY.test(k))).map(([k, v]) => [k, stripRevenue(v, urls)]));
 }
-// Paths whose responses are filtered for a hideRevenue user; urls: also drop offer/postback URLs.
+// Every /api/* and /stats* JSON response is filtered for a hideRevenue user (so a new endpoint cannot leak revenue,
+// revenueCap or the team's revenue/profit goals by default). Not filtered: the account/user/key routes, whose
+// payload carries the permission flags themselves (hideRevenue would match REVENUE_KEY).
+const REVENUE_FILTER_EXEMPT = (path) => path.startsWith('/api/auth/') || path === '/api/users' || path.startsWith('/api/users/')
+  || path === '/api/keys' || path.startsWith('/api/keys/') || path === '/api/security';
+// urls: also drop offer/postback/landing URLs (postback journals: the URLs carry revenue/payout values).
 function revenueFilterFor(path) {
-  if (path === '/stats' || path.startsWith('/stats/') || path === '/api/conversions') return { urls: false };
-  // Postback journals: revenue fields and the URLs (they carry revenue/payout values) are dropped.
   if (path === '/api/offers' || path.startsWith('/api/offers/') || path === '/api/audit' || path === '/api/simulate' || path === '/api/monitor' || path === '/api/postbacks') return { urls: true };
+  if ((path.startsWith('/api/') && !REVENUE_FILTER_EXEMPT(path)) || path === '/stats' || path.startsWith('/stats/')) return { urls: false };
   return null;
 }
-// offersAccess 'own': ids of offers used in the streams of campaigns the user can see; null = no restriction.
+// Top-level body fields a hideRevenue user may not write: payout, payoutType, payoutCurrency, revenueCap,
+// dailyRevenueGoal, dailyProfitGoal… (every key the filter hides from them, even null to clear a value).
+const revenueWriteFields = (body) => (body && typeof body === 'object' && !Array.isArray(body) ? Object.keys(body).filter(isRevenueKey) : []);
+// Offer and landing ids referenced by streams (conditional and legacy flat streams).
+function streamRefs(streams) {
+  const refs = { offers: new Set(), landings: new Set() };
+  for (const st of streams || []) {
+    (st.offers ? st.offers.map((o) => o.offerId) : st.offerId ? [st.offerId] : []).forEach((o) => refs.offers.add(o));
+    (st.landings || []).forEach((l) => refs.landings.add(l.landingId));
+  }
+  return refs;
+}
+// offersAccess 'own': the user's own offers plus the offers used in the streams of campaigns the user can see
+// (those are read-only unless the user owns them); null = no restriction.
 function visibleOfferIds(req) {
   if (!restrictedUser(req) || req.user.offersAccess !== 'own') return null;
   const allowed = scopeCampaigns(req);
-  const ids = new Set();
+  const ids = new Set([...offers].filter(([, o]) => o.ownerId === req.user.id).map(([id]) => id));
   for (const [id, c] of campaigns) {
     if (allowed && !allowed.includes(id)) continue;
-    for (const st of c.streams || []) (st.offers ? st.offers.map((o) => o.offerId) : st.offerId ? [st.offerId] : []).forEach((o) => ids.add(o));
+    streamRefs(c.streams).offers.forEach((o) => ids.add(o));
   }
   return ids;
+}
+// Ownership of offers, landings, sources and networks. The owner, ADMIN_TOKEN and a fresh dev install manage everything;
+// anyone else changes (edits, archives, clones) only entities whose ownerId is their own id. Team entities (ownerId null)
+// and other users' entities are read-only for them.
+const canManage = (req, entity) => !restrictedUser(req) || (Boolean(entity?.ownerId) && entity.ownerId === req.user.id);
+// ownerId of a new entity: the creating user; the owner / ADMIN_TOKEN create team entities unless they name an owner.
+const creatorOwnerId = (req, body) => (restrictedUser(req) ? req.user.id : parseOwnerId(body?.ownerId));
+// The owner may reassign an entity (PATCH ownerId); everyone else keeps the current owner.
+const nextOwnerId = (req, body, cur) => (!restrictedUser(req) && body?.ownerId !== undefined ? parseOwnerId(body.ownerId) : cur.ownerId ?? null);
+// May the user send traffic to this offer? Team offers and their own ('own' access: only the offers visible to them).
+function offerUsable(req, id, visible = visibleOfferIds(req)) {
+  if (!restrictedUser(req)) return true;
+  const offer = offers.get(id);
+  if (!offer) return false;
+  return visible ? visible.has(id) : !offer.ownerId || offer.ownerId === req.user.id;
+}
+function landingUsable(req, id) {
+  if (!restrictedUser(req)) return true;
+  const landing = landings.get(id);
+  return Boolean(landing) && (!landing.ownerId || landing.ownerId === req.user.id);
+}
+// Every offer and landing a restricted user puts into streams must be usable by them. Ids already present in the
+// campaign's current streams stay allowed (the owner may have put them there), so saving such a campaign keeps working.
+function streamRefsError(req, streams, current = []) {
+  if (!restrictedUser(req)) return null;
+  const keep = streamRefs(current), refs = streamRefs(streams), visible = visibleOfferIds(req);
+  for (const id of refs.offers) if (!keep.offers.has(id) && !offerUsable(req, id, visible)) return { error: 'offer_not_usable', offerId: id };
+  for (const id of refs.landings) if (!keep.landings.has(id) && !landingUsable(req, id)) return { error: 'landing_not_usable', landingId: id };
+  return null;
+}
+// /r/:campaign/:offer may only send traffic to an offer of that campaign's streams. A legacy campaign without offer
+// streams accepts team offers and offers of the campaign's owner. Unknown campaigns fall through to the usual 404.
+function explicitOfferAllowed(campaign, offerId, offer) {
+  if (!campaign) return true;
+  const refs = streamRefs(campaign.streams).offers;
+  if (refs.size) return refs.has(offerId);
+  return !offer.ownerId || offer.ownerId === campaign.ownerId;
 }
 
 // Change history (Keitaro «Лог»): who changed what and when. Kept in the JSONL journal; never stores passwords.
@@ -1761,10 +1861,12 @@ async function handleAuthRoute(req, res, url) {
   }
   if (path === '/api/auth/login' && req.method === 'POST') {
     const ip = clientIp(req) || 'unknown';
-    if (loginBlocked(ip)) return json(res, 429, { error: 'too_many_attempts' });
+    // Reserved before the (slow, async) password check: parallel guesses are counted too. See src/rate-limit.js.
+    const ticket = loginLimiter.reserve(body.email, ip);
+    if (!ticket) return json(res, 429, { error: 'too_many_attempts' });
     const user = await users.authenticate(body.email, body.password);
-    if (!user) { loginFailures.get(ip).push(Date.now()); return json(res, 401, { error: 'invalid_credentials' }); }
-    loginFailures.delete(ip);
+    if (!user) return json(res, 401, { error: 'invalid_credentials' });
+    loginLimiter.success(ticket);
     req.user = user;
     await audit(req, 'login', 'user', user.id, null, null);
     const token = await users.createSession(user.id);
@@ -1873,8 +1975,14 @@ const server = http.createServer(async (req, res) => {
     // Read-only role: every write to the panel API is refused; signing in and out stays possible.
     if (isViewer(req) && !['GET', 'HEAD'].includes(req.method) && isPrivatePath(url.pathname)) return json(res, 403, { error: 'read_only' });
     if (hidesRevenue(req)) {
-      if (url.pathname === '/dashboard') { res.writeHead(302, { location: `${basePath}/admin` }); return res.end(); }
       res.revenueFilter = revenueFilterFor(url.pathname);
+      // Revenue settings cannot be written by someone who cannot see them. The body is read here once and
+      // handed to the route through readJson (req.jsonBody).
+      if (res.revenueFilter && ['POST', 'PATCH', 'PUT'].includes(req.method)) {
+        req.jsonBody = await readJson(req, 2 * 1024 * 1024);
+        const fields = revenueWriteFields(req.jsonBody);
+        if (fields.length) return json(res, 403, { error: 'revenue_hidden', fields });
+      }
     }
     if (url.pathname === '/stats' || url.pathname.startsWith('/stats/') || url.pathname === '/api/clicks' || url.pathname === '/api/conversions' || url.pathname === '/api/bots'
       || url.pathname === '/api/postbacks') {
@@ -1884,17 +1992,6 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname.startsWith('/api/auth/') || url.pathname === '/api/users' || url.pathname.startsWith('/api/users/')
       || url.pathname === '/api/keys' || url.pathname.startsWith('/api/keys/') || url.pathname === '/api/security') {
       return await handleAuthRoute(req, res, url);
-    }
-    const logAsset = new Map([['/assets/event-logs.js', ['event-logs.js', 'text/javascript']],
-      ['/assets/event-logs.css', ['event-logs.css', 'text/css']]]).get(url.pathname);
-    if (logAsset && req.method === 'GET') {
-      const asset = await readFile(join(root, 'public', logAsset[0]));
-      res.writeHead(200, { 'content-type': `${logAsset[1]}; charset=utf-8`, 'cache-control': 'no-store' });
-      return res.end(asset);
-    }
-    if (url.pathname === '/assets/stream-editor.js' && req.method === 'GET') {
-      res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store' });
-      return res.end(await readFile(join(root, 'public', 'stream-editor.js')));
     }
     // Shared click handler for both stream and explicit-offer routes.
     async function handleClick(campaignId, offerId, targetTemplate, streamName = null, countClick = true, extra = {}) {
@@ -1914,7 +2011,7 @@ const server = http.createServer(async (req, res) => {
       if (uaBot || dcBot) {
         await event('bot', { campaign: campaignId, offerId, stream: streamName, userAgent: req.headers['user-agent'] || null, ip: clientIp(req),
           reason: uaBot ? 'user_agent' : 'datacenter', isp: network?.isp ?? null });
-        const dest = applyMacros(targetTemplate, { campaign: campaignId, offer_id: offerId });
+        const dest = expandUrlOrFail(targetTemplate, { campaign: campaignId, offer_id: offerId });
         res.writeHead(302, { location: dest, 'cache-control': 'no-store' });
         return res.end();
       }
@@ -1941,7 +2038,7 @@ const server = http.createServer(async (req, res) => {
       // IP deduplication: skip click if same IP clicked within dedupeWindow minutes
       if (c.dedupeWindow > 0 && await isDuplicateClick(campaignId, ip, c.dedupeWindow)) {
         // Silent redirect to the same destination without recording a new click
-        res.writeHead(302, { location: applyMacros(targetTemplate, { campaign: campaignId, offer_id: offerId }), 'cache-control': 'no-store' });
+        res.writeHead(302, { location: expandUrlOrFail(targetTemplate, { campaign: campaignId, offer_id: offerId }), 'cache-control': 'no-store' });
         return res.end();
       }
 
@@ -1994,7 +2091,7 @@ const server = http.createServer(async (req, res) => {
       }
       const macroVars = { ...params, cost: cost || '', click_id: clickId, subid: subid || '', campaign: campaignId, offer_id: offerId, device, country: country || '',
         lp_click_url: `${publicBase(req)}/lp/click?click_id=${clickId}` };
-      const expanded = applyMacros(targetTemplate, macroVars);
+      const expanded = expandUrlOrFail(targetTemplate, macroVars);
       const destination = new URL(expanded);
       if (!targetTemplate.includes('{click_id}')) destination.searchParams.set('click_id', clickId);
       for (const key of ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'subid']) {
@@ -2070,7 +2167,7 @@ const server = http.createServer(async (req, res) => {
     if (match && req.method === 'GET') {
       const [, campaignId, offerId] = match;
       const offer = offers.get(offerId);
-      if (!offer || offer.archived) return json(res, 404, { error: 'offer_not_found' });
+      if (!offer || offer.archived || !explicitOfferAllowed(campaigns.get(campaignId), offerId, offer)) return json(res, 404, { error: 'offer_not_found' });
       // Conversion cap on an explicit offer: its alternative if one is usable, otherwise capUrl / 429 like the click cap.
       if (offer.conversionCap) {
         const routing = await offerRouting([{ offerId }]);
@@ -2085,14 +2182,16 @@ const server = http.createServer(async (req, res) => {
       return await handleClick(campaignId, offerId, offer.url);
     }
     if (url.pathname === '/postback' && req.method === 'GET') {
-      // Every incoming postback is journaled with its response code (G7), including rejected ones.
+      if (rateLimited(clientIp(req), postbackLimiter)) return json(res, 429, { error: 'postback_rate_limited' });
+      // Every incoming postback is journaled with its response code (G7). Rejected secrets are aggregated
+      // (one journal event per IP and minute, see rejectedPostbacks) so a flood cannot grow the journal.
       const q = (key) => (url.searchParams.get(key) || '').slice(0, 200) || null;
       const context = {};
       const logIncoming = (statusCode, error = null) => logPostback('postback_in', { clickId: q('click_id'), campaign: context.click?.campaign ?? null,
         offerId: context.click?.offerId ?? null, tid: q('tid'), status: q('status'), revenue: q('revenue') || q('payout'), currency: q('currency'),
         url: redactUrl(req.url), statusCode, error, ip: clientIp(req) || null });
       if (postbackSecret && !safeEqual(url.searchParams.get('secret'), postbackSecret)) {
-        await logIncoming(401, 'invalid_postback_secret');
+        if (rejectedPostbacks.note(clientIp(req) || 'unknown')) await logIncoming(401, 'invalid_postback_secret');
         return json(res, 401, { error: 'invalid_postback_secret' });
       }
       try {
@@ -2156,8 +2255,8 @@ const server = http.createServer(async (req, res) => {
       } else return json(res, 400, { error: 'invalid_group' });
       const columns = ['key', 'clicks', 'conversions', 'revenue', 'cost', 'cr', 'epc', 'rpm', 'uniqueClicks', 'leads', 'sales', 'rejected', 'pendingRevenue', 'profit', 'roi']
         .filter((c) => !hidesRevenue(req) || !REVENUE_KEY.test(c));
-      // Cells starting with = + - @ are prefixed so spreadsheets do not run them as formulas.
-      const cell = (v) => { let text = v === null || v === undefined ? '' : typeof v === 'number' ? String(Math.round(v * 10000) / 10000) : String(v); if (/^[=+\-@]/.test(text) && typeof v !== 'number') text = `'${text}`; return /[",\n;]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text; };
+      // Text cells starting with = + - @ tab or CR are prefixed with ' so spreadsheets do not run them as formulas.
+      const cell = (v) => { let text = v === null || v === undefined ? '' : typeof v === 'number' ? String(Math.round(v * 10000) / 10000) : String(v); if (/^[=+\-@\t\r]/.test(text) && typeof v !== 'number') text = `'${text}`; return /[",\n;]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text; };
       const csv = [['group', ...columns.slice(1)].join(','), ...rows.map((r) => columns.map((c) => cell(r[c])).join(','))].join('\n') + '\n';
       res.writeHead(200, { 'content-type': 'text/csv; charset=utf-8', 'content-disposition': `attachment; filename="umbrella-${group}-${currency}.csv"`, 'cache-control': 'no-store' });
       return res.end('\ufeff' + csv);
@@ -2219,15 +2318,16 @@ const server = http.createServer(async (req, res) => {
       }
     }
     if (url.pathname === '/lp/click' && req.method === 'GET') {
+      if (rateLimited(clientIp(req), lpClickLimiter)) return json(res, 429, { error: 'click_rate_limited' });
       const clickId = url.searchParams.get('click_id') || '';
       if (!/^[0-9a-f-]{36}$/i.test(clickId)) return json(res, 400, { error: 'click_id_required' });
       const click = await getClickRecord(clickId);
       if (!click) return json(res, 404, { error: 'click_not_found' });
       const offer = offers.get(click.offerId);
       if (!offer) return json(res, 404, { error: 'offer_not_found' });
-      await event('lp_click', { clickId, campaign: click.campaign, landingId: click.landingId ?? null });
       const vars = { ...(click.params || {}), cost: click.cost || '', click_id: clickId, subid: click.subid || '', campaign: click.campaign, offer_id: click.offerId, device: '', country: click.country || '' };
-      const destination = new URL(applyMacros(offer.url, vars));
+      const destination = new URL(expandUrlOrFail(offer.url, vars));
+      await event('lp_click', { clickId, campaign: click.campaign, landingId: click.landingId ?? null });
       if (!offer.url.includes('{click_id}')) destination.searchParams.set('click_id', clickId);
       return sendRedirect(res, destination.toString(), campaigns.get(click.campaign)?.redirectMethod);
     }
@@ -2315,7 +2415,8 @@ const server = http.createServer(async (req, res) => {
       const body = await readJson(req);
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       if (!OFFER_ID_RE.test(String(body.id || ''))) return json(res, 400, { error: 'valid_id_required' });
-      const landing = parseLanding(body);
+      if (landings.has(String(body.id))) return json(res, 409, { error: 'id_taken' });
+      const landing = parseLanding({ ...body, ownerId: creatorOwnerId(req, body) });
       if (!landing) return json(res, 400, { error: 'https_url_required' });
       landings.set(String(body.id), landing);
       await persistLanding(String(body.id), landing);
@@ -2329,7 +2430,8 @@ const server = http.createServer(async (req, res) => {
       const id = landingUpdate[1];
       const cur = landings.get(id);
       if (!cur) return json(res, 404, { error: 'landing_not_found' });
-      const updated = parseLanding({ url: body.url ?? cur.url, name: body.name !== undefined ? body.name : cur.name });
+      if (!canManage(req, cur)) return json(res, 403, { error: 'landing_not_yours' });
+      const updated = parseLanding({ url: body.url ?? cur.url, name: body.name !== undefined ? body.name : cur.name, ownerId: nextOwnerId(req, body, cur) });
       if (!updated) return json(res, 400, { error: 'https_url_required' });
       landings.set(id, updated);
       await persistLanding(id, updated);
@@ -2344,13 +2446,14 @@ const server = http.createServer(async (req, res) => {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const body = await readJson(req);
       if (!/^[a-z0-9_-]{2,80}$/i.test(String(body.id || '')) || !/^https:\/\//i.test(String(body.url || ''))) return json(res, 400, { error: 'id_and_https_url_required' });
-      // offersAccess 'own' must not overwrite an offer the user cannot see.
-      if (offers.has(String(body.id)) && visibleOfferIds(req) && !visibleOfferIds(req).has(String(body.id))) return json(res, 409, { error: 'offer_id_taken' });
+      // POST never overwrites: changes go through PATCH, where ownership is checked.
+      if (offers.has(String(body.id))) return json(res, 409, { error: 'id_taken' });
+      if (body.altOfferId && !offerUsable(req, String(body.altOfferId))) return json(res, 403, { error: 'offer_not_usable', offerId: String(body.altOfferId) });
       if (body.networkId !== undefined && body.networkId !== null && !networks.has(String(body.networkId))) return json(res, 400, { error: 'network_not_found' });
       const capError = conversionCapError(String(body.id), body) || payoutError(body);
       if (capError) return json(res, 400, { error: capError });
       const offer = parseOffer({ url: String(body.url), postbackUrl: body.postbackUrl, payoutType: body.payoutType, payout: body.payout, payoutCurrency: body.payoutCurrency, dailyCap: body.dailyCap, name: body.name, networkId: body.networkId, archived: body.archived, group: body.group,
-        conversionCap: body.conversionCap, capTz: body.capTz, altOfferId: body.altOfferId });
+        conversionCap: body.conversionCap, capTz: body.capTz, altOfferId: body.altOfferId, ownerId: creatorOwnerId(req, body) });
       if (!offer) return json(res, 400, { error: 'id_and_https_url_required' });
       offers.set(String(body.id), offer);
       await persistOffer(String(body.id), offer);
@@ -2362,15 +2465,18 @@ const server = http.createServer(async (req, res) => {
     if (offerClone && req.method === 'POST') {
       if (!(await adminAuthorized(req))) return json(res,401,{error:'admin_authorization_required'});
       const id=offerClone[1],cur=offers.get(id); if(!cur || (visibleOfferIds(req) && !visibleOfferIds(req).has(id))) return json(res,404,{error:'offer_not_found'});
+      if (!canManage(req, cur)) return json(res, 403, { error: 'offer_not_yours' });
       let nextId=`${id}-copy`, n=2; while(offers.has(nextId)) nextId=`${id}-copy${n++}`;
-      const copy=parseOffer({...cur,name:`${cur.name||id} (копия)`,archived:false}); offers.set(nextId,copy); await persistOffer(nextId,copy); await audit(req,'create','offer',nextId,null,copy); return json(res,201,{id:nextId,...copy});
+      const copy=parseOffer({...cur,name:`${cur.name||id} (копия)`,archived:false,ownerId:creatorOwnerId(req, {})}); offers.set(nextId,copy); await persistOffer(nextId,copy); await audit(req,'create','offer',nextId,null,copy); return json(res,201,{id:nextId,...copy});
     }
     if (offerUpdate && req.method === 'PATCH') {
       const id = offerUpdate[1];
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       if (!offers.has(id) || (visibleOfferIds(req) && !visibleOfferIds(req).has(id))) return json(res, 404, { error: 'offer_not_found' });
+      if (!canManage(req, offers.get(id))) return json(res, 403, { error: 'offer_not_yours' });
       const body = await readJson(req);
       const cur = offers.get(id);
+      if (body.altOfferId && String(body.altOfferId) !== cur.altOfferId && !offerUsable(req, String(body.altOfferId))) return json(res, 403, { error: 'offer_not_usable', offerId: String(body.altOfferId) });
       const newUrl = body.url !== undefined ? String(body.url) : cur.url;
       const newPostbackUrl = body.postbackUrl !== undefined ? body.postbackUrl : cur.postbackUrl;
       const newDailyCap = body.dailyCap !== undefined ? body.dailyCap : cur.dailyCap;
@@ -2378,7 +2484,7 @@ const server = http.createServer(async (req, res) => {
       const capError = conversionCapError(id, body) || payoutError(body);
       if (capError) return json(res, 400, { error: capError });
       const updated = parseOffer({ url: newUrl, postbackUrl: newPostbackUrl, payoutType: body.payoutType !== undefined ? body.payoutType : cur.payoutType, payout: body.payout !== undefined ? body.payout : cur.payout, payoutCurrency: body.payoutCurrency !== undefined ? body.payoutCurrency : cur.payoutCurrency, dailyCap: newDailyCap, name: body.name !== undefined ? body.name : cur.name, networkId: body.networkId !== undefined ? body.networkId : cur.networkId, archived: body.archived !== undefined ? body.archived : cur.archived, group: body.group !== undefined ? body.group : cur.group,
-        conversionCap: body.conversionCap !== undefined ? body.conversionCap : cur.conversionCap, capTz: body.capTz !== undefined ? body.capTz : cur.capTz, altOfferId: body.altOfferId !== undefined ? body.altOfferId : cur.altOfferId });
+        conversionCap: body.conversionCap !== undefined ? body.conversionCap : cur.conversionCap, capTz: body.capTz !== undefined ? body.capTz : cur.capTz, altOfferId: body.altOfferId !== undefined ? body.altOfferId : cur.altOfferId, ownerId: nextOwnerId(req, body, cur) });
       if (!updated) return json(res, 400, { error: 'invalid_url' });
       offers.set(id, updated);
       await persistOffer(id, updated);
@@ -2404,9 +2510,10 @@ const server = http.createServer(async (req, res) => {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const body = await readJson(req);
       if (!OFFER_ID_RE.test(String(body.id || ''))) return json(res, 400, { error: 'valid_id_required' });
+      if (sources.has(String(body.id))) return json(res, 409, { error: 'id_taken' });
       if (!canSeeSourcePostback) { delete body.postbackUrl; delete body.postbackStatuses; }
       if (body.postbackUrl && !parsePostbackUrl(body.postbackUrl, { allowHttp: sourcePostbackAllowPrivate })) return json(res, 400, { error: 'invalid_postback_url' });
-      const source = parseSource(body);
+      const source = parseSource({ ...body, ownerId: creatorOwnerId(req, body) });
       if (!source) return json(res, 400, { error: 'invalid_source' });
       sources.set(String(body.id), source);
       await persistSource(String(body.id), source);
@@ -2417,6 +2524,7 @@ const server = http.createServer(async (req, res) => {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const id = sourceUpdate[1];
       if (!sources.has(id)) return json(res, 404, { error: 'source_not_found' });
+      if (!canManage(req, sources.get(id))) return json(res, 403, { error: 'source_not_yours' });
       const body = await readJson(req);
       if (!canSeeSourcePostback) { delete body.postbackUrl; delete body.postbackStatuses; }
       if (body.postbackUrl && !parsePostbackUrl(body.postbackUrl, { allowHttp: sourcePostbackAllowPrivate })) return json(res, 400, { error: 'invalid_postback_url' });
@@ -2429,6 +2537,7 @@ const server = http.createServer(async (req, res) => {
         costFromParam: body.costFromParam !== undefined ? body.costFromParam : cur.costFromParam,
         postbackUrl: body.postbackUrl !== undefined ? body.postbackUrl : cur.postbackUrl,
         postbackStatuses: body.postbackStatuses !== undefined ? body.postbackStatuses : cur.postbackStatuses,
+        ownerId: nextOwnerId(req, body, cur),
       });
       sources.set(id, updated);
       await persistSource(id, updated);
@@ -2437,12 +2546,12 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/networks' && req.method === 'GET') return json(res, 200, { networks: Object.fromEntries(networks) });
     if (url.pathname === '/api/networks' && req.method === 'POST') {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
-      const body=await readJson(req), id=String(body.id||''), network=parseNetwork(body);
-      if(!OFFER_ID_RE.test(id)) return json(res,400,{error:'valid_id_required'}); if(!network) return json(res,400,{error:'name_required'}); if(networks.has(id)) return json(res,409,{error:'network_exists'});
+      const body=await readJson(req), id=String(body.id||''), network=parseNetwork({ ...body, ownerId: creatorOwnerId(req, body) });
+      if(!OFFER_ID_RE.test(id)) return json(res,400,{error:'valid_id_required'}); if(!network) return json(res,400,{error:'name_required'}); if(networks.has(id)) return json(res,409,{error:'id_taken'});
       networks.set(id,network); await persistNetwork(id,network); await audit(req,'create','network',id,null,network); return json(res,201,{id,...network});
     }
     const networkUpdate=url.pathname.match(/^\/api\/networks\/([A-Za-z0-9_-]{2,80})$/);
-    if(networkUpdate && req.method==='PATCH') { if(!(await adminAuthorized(req))) return json(res,401,{error:'admin_authorization_required'}); const id=networkUpdate[1],cur=networks.get(id); if(!cur) return json(res,404,{error:'network_not_found'}); const next=parseNetwork({...cur,...await readJson(req)}); if(!next) return json(res,400,{error:'name_required'}); networks.set(id,next); await persistNetwork(id,next); await audit(req,'update','network',id,cur,next); return json(res,200,{id,...next}); }
+    if(networkUpdate && req.method==='PATCH') { if(!(await adminAuthorized(req))) return json(res,401,{error:'admin_authorization_required'}); const id=networkUpdate[1],cur=networks.get(id); if(!cur) return json(res,404,{error:'network_not_found'}); if(!canManage(req,cur)) return json(res,403,{error:'network_not_yours'}); const body=await readJson(req); const next=parseNetwork({...cur,...body,ownerId:nextOwnerId(req,body,cur)}); if(!next) return json(res,400,{error:'name_required'}); networks.set(id,next); await persistNetwork(id,next); await audit(req,'update','network',id,cur,next); return json(res,200,{id,...next}); }
     if (url.pathname === '/api/campaigns' && req.method === 'GET') {
       const allowed = scopeCampaigns(req);
       return json(res, 200, { campaigns: Object.fromEntries([...campaigns].filter(([id]) => !allowed || allowed.includes(id))) });
@@ -2454,6 +2563,10 @@ const server = http.createServer(async (req, res) => {
       if (OFFER_ID_RE.test(String(body.sourceId ?? '')) && !sources.has(String(body.sourceId))) return json(res, 400, { error: 'source_not_found' });
       if (body.sourcePostbackUrl && !parsePostbackUrl(body.sourcePostbackUrl, { allowHttp: sourcePostbackAllowPrivate })) return json(res, 400, { error: 'invalid_postback_url' });
       if (campaigns.has(String(body.id)) && !canEditCampaign(req, campaigns.get(String(body.id)))) return json(res, 403, { error: 'campaign_not_yours' });
+      const cloaking = streamPolicyError(parseStreams(body.streams));
+      if (cloaking) return json(res, 400, cloaking);
+      const refsError = streamRefsError(req, parseStreams(body.streams), campaigns.get(String(body.id))?.streams);
+      if (refsError) return json(res, 403, refsError);
       // A buyer's new campaign is always theirs; the owner may assign it to someone.
       const ownerId = isBuyer(req) ? req.user.id : (body.ownerId ?? req.user?.id ?? null);
       const sourceDefaults = body.sourceId ? sources.get(String(body.sourceId)) : null;
@@ -2477,9 +2590,13 @@ const server = http.createServer(async (req, res) => {
       if (!campaigns.has(id)) return json(res, 404, { error: 'campaign_not_found' });
       if (!canEditCampaign(req, campaigns.get(id))) return json(res, 403, { error: 'campaign_not_yours' });
       const body = await readJson(req);
+      const cloaking = body.streams === undefined ? null : streamPolicyError(parseStreams(body.streams));
+      if (cloaking) return json(res, 400, cloaking);
       if (OFFER_ID_RE.test(String(body.sourceId ?? '')) && !sources.has(String(body.sourceId))) return json(res, 400, { error: 'source_not_found' });
       if (body.sourcePostbackUrl && !parsePostbackUrl(body.sourcePostbackUrl, { allowHttp: sourcePostbackAllowPrivate })) return json(res, 400, { error: 'invalid_postback_url' });
       const cur = campaigns.get(id);
+      const refsError = body.streams === undefined ? null : streamRefsError(req, parseStreams(body.streams), cur.streams);
+      if (refsError) return json(res, 403, refsError);
       campaigns.set(id, parseCampaign(id, {
         name: body.name === undefined ? cur.name : body.name,
         group: body.group === undefined ? cur.group : body.group,
@@ -2550,13 +2667,23 @@ const server = http.createServer(async (req, res) => {
       if (!Array.isArray(body.streams)) return json(res, 400, { error: 'streams_array_required' });
       const streams = parseStreams(body.streams);
       if (body.streams.length > 0 && streams.length === 0) return json(res, 400, { error: 'invalid_streams_all_rejected' });
+      const cloaking = streamPolicyError(streams);
+      if (cloaking) return json(res, 400, cloaking);
       const current = campaigns.get(id);
+      const refsError = streamRefsError(req, streams, current.streams);
+      if (refsError) return json(res, 403, refsError);
       campaigns.set(id, { ...current, streams });
       await persistCampaign(id, campaigns.get(id));
       await audit(req, 'update', 'campaign', id, current, campaigns.get(id));
       return json(res, 200, { id, streams });
     }
-    if (url.pathname === '/dashboard' && req.method === 'GET') return dashboard(res);
+    // The legacy inline /dashboard page is gone (the panel is /admin); old bookmarks are redirected.
+    if (url.pathname === '/dashboard' && req.method === 'GET') { res.writeHead(302, { location: `${basePath}/admin` }); return res.end(); }
+    // The no-cloaking rule shared with the panel: one module, so the editor and the API refuse the same conditions.
+    if (url.pathname === '/admin/stream-policy.js' && req.method === 'GET') {
+      res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store' });
+      return res.end(await readFile(join(root, 'src', 'stream-policy.js')));
+    }
     const adminAsset = { '/admin': ['index.html', 'text/html'], '/admin/': ['index.html', 'text/html'], '/admin/admin.js': ['admin.js', 'text/javascript'], '/admin/admin.css': ['admin.css', 'text/css'] }[url.pathname];
     if (adminAsset && req.method === 'GET') {
       res.writeHead(200, { 'content-type': `${adminAsset[1]}; charset=utf-8`, 'cache-control': 'no-store' });
@@ -2737,6 +2864,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+await tightenDataFiles();
 await rates.start();
 await loadSettings();
 await loadSources();
@@ -2744,6 +2872,7 @@ await loadNetworks();
 await loadOffers();
 await loadLandings();
 await loadCampaigns();
+await enforceStreamPolicy();
 // One-time copy of bot events recorded before the bots table existed (only while the table is empty).
 if (db) {
   try {
@@ -2771,6 +2900,6 @@ if (retentionDays > 0) {
 }
 if (monitorEnabled) monitor.start();
 
-async function shutdown() { monitor.stop(); await new Promise((resolve) => server.close(resolve)); await eventMirror?.drain(); await closeDb(); process.exit(0); }
+async function shutdown() { monitor.stop(); await rejectedPostbacks.flush(true); await new Promise((resolve) => server.close(resolve)); await eventMirror?.drain(); await closeDb(); process.exit(0); }
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);

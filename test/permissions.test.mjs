@@ -130,6 +130,47 @@ test('hideRevenue strips revenue fields and offer URLs on the server', { timeout
   assert.equal((await call('/stats', { cookie: buyer.cookie })).json.revenue, 12.5);
 });
 
+test('hideRevenue: every panel response is filtered and revenue fields cannot be written', { timeout: 30000 }, async (t) => {
+  const { call, owner, addUser, addOffer } = await boot(t);
+  const buyer = await addUser('hidden@example.com', { hideRevenue: true });
+  await addOffer('offer-h');
+  assert.equal((await call('/api/landings', { method: 'POST', cookie: owner, body: { id: 'lp-h', url: 'https://lp-h.example.com/page' } })).status, 201);
+  assert.equal((await call('/api/campaigns', { method: 'POST', cookie: owner, body: { id: 'h-camp', name: 'H', ownerId: buyer.id, revenueCap: 50,
+    streams: [{ name: 'Main', offers: [{ offerId: 'offer-h', weight: 1 }], landings: [{ landingId: 'lp-h', weight: 1 }] }] } })).status, 201);
+  assert.equal((await call('/api/settings', { method: 'PATCH', cookie: owner, body: { dailyRevenueGoal: 1000, dailyProfitGoal: 400 } })).status, 200);
+
+  // Reads: revenueCap, the team goals and the simulated landing URL are gone; the owner still sees them.
+  const camps = await call('/api/campaigns', { cookie: buyer.cookie });
+  assert.ok(camps.json.campaigns['h-camp'], 'campaign listed');
+  assert.ok(!('revenueCap' in camps.json.campaigns['h-camp']), 'revenueCap stripped');
+  assert.equal((await call('/api/campaigns', { cookie: owner })).json.campaigns['h-camp'].revenueCap, 50);
+  const team = await call('/api/settings', { cookie: buyer.cookie });
+  assert.doesNotMatch(team.text, /Goal/, 'no revenue/profit goals');
+  assert.ok('buyerSharePct' in team.json);
+  assert.equal((await call('/api/settings', { cookie: owner })).json.dailyRevenueGoal, 1000);
+  const sim = await call('/api/simulate', { method: 'POST', cookie: buyer.cookie, body: { campaign: 'h-camp', userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)' } });
+  assert.equal(sim.status, 200, sim.text);
+  assert.doesNotMatch(sim.text, /lp-h\.example\.com|offer-h\.example\.com/, 'no landing or offer URL in the simulation');
+  assert.match((await call('/api/simulate', { method: 'POST', cookie: owner, body: { campaign: 'h-camp' } })).text, /lp-h\.example\.com/, 'owner sees the landing');
+  assert.equal((await call('/api/auth/me', { cookie: buyer.cookie })).json.user.hideRevenue, true, 'own permission flags are not filtered');
+
+  // Writes: payout / revenueCap / goals are refused with 403 revenue_hidden, other fields still save.
+  for (const [method, path, body] of [
+    ['PATCH', '/api/offers/offer-h', { payout: 5 }], ['PATCH', '/api/offers/offer-h', { payoutType: 'cpc' }], ['PATCH', '/api/offers/offer-h', { payoutCurrency: 'USD' }],
+    ['POST', '/api/offers', { id: 'offer-new', url: 'https://n.example.com/', payout: 3 }],
+    ['PATCH', '/api/campaigns/h-camp', { revenueCap: 1 }], ['PATCH', '/api/campaigns/h-camp', { revenueCap: null }],
+    ['POST', '/api/campaigns', { id: 'h-new', name: 'N', revenueCap: 10 }], ['PATCH', '/api/settings', { dailyRevenueGoal: 1 }], ['PATCH', '/api/settings', { dailyProfitGoal: 1 }],
+  ]) {
+    const r = await call(path, { method, cookie: buyer.cookie, body });
+    assert.deepEqual([r.status, r.json?.error], [403, 'revenue_hidden'], `${method} ${path} ${JSON.stringify(body)}`);
+  }
+  assert.equal((await call('/api/campaigns', { cookie: owner })).json.campaigns['h-camp'].revenueCap, 50, 'cap unchanged');
+  assert.equal((await call('/api/campaigns/h-camp', { method: 'PATCH', cookie: buyer.cookie, body: { name: 'Renamed' } })).status, 200, 'other fields save');
+  assert.equal((await call('/api/campaigns', { cookie: owner })).json.campaigns['h-camp'].revenueCap, 50, 'a save without the field keeps the cap');
+  // The owner is never restricted.
+  assert.equal((await call('/api/offers/offer-h', { method: 'PATCH', cookie: owner, body: { payout: 5, payoutType: 'cpa' } })).status, 200);
+});
+
 test("offersAccess 'own' limits the offer catalog to offers used in the user's campaigns", { timeout: 30000 }, async (t) => {
   const { call, owner, addUser, addOffer, addCampaign } = await boot(t);
   const buyer = await addUser('own@example.com');
@@ -147,9 +188,13 @@ test("offersAccess 'own' limits the offer catalog to offers used in the user's c
   assert.deepEqual(Object.keys((await call('/api/offers', { cookie: buyer.cookie })).json.offers), ['offer-mine']);
   assert.equal((await call('/api/offers/offer-team', { method: 'PATCH', cookie: buyer.cookie, body: { name: 'x' } })).status, 404, 'foreign offer cannot be edited');
   assert.equal((await call('/api/offers/offer-team/clone', { method: 'POST', cookie: buyer.cookie })).status, 404);
-  assert.equal((await call('/api/offers', { method: 'POST', cookie: buyer.cookie, body: { id: 'offer-free', url: 'https://evil.example.com/' } })).json.error, 'offer_id_taken', 'no overwrite of hidden offers');
-  assert.equal((await call('/api/offers/offer-mine', { method: 'PATCH', cookie: buyer.cookie, body: { name: 'Mine' } })).status, 200, 'own offer editable');
-  assert.deepEqual(await offerIds(owner), catalog, 'owner unaffected');
+  assert.equal((await call('/api/offers', { method: 'POST', cookie: buyer.cookie, body: { id: 'offer-free', url: 'https://evil.example.com/' } })).json.error, 'id_taken', 'no overwrite of hidden offers');
+  // An offer used in the buyer's campaign but created by the team is visible read-only; offers the buyer created are theirs.
+  assert.equal((await call('/api/offers/offer-mine', { method: 'PATCH', cookie: buyer.cookie, body: { name: 'Mine' } })).json.error, 'offer_not_yours', 'team offer read-only');
+  assert.equal((await call('/api/offers', { method: 'POST', cookie: buyer.cookie, body: { id: 'offer-own', url: 'https://own.example.com/' } })).status, 201);
+  assert.deepEqual(Object.keys((await call('/api/offers', { cookie: buyer.cookie })).json.offers).sort(), ['offer-mine', 'offer-own'], 'own offers listed');
+  assert.equal((await call('/api/offers/offer-own', { method: 'PATCH', cookie: buyer.cookie, body: { name: 'Mine' } })).status, 200, 'own offer editable');
+  assert.deepEqual(await offerIds(owner), [...catalog, 'offer-own'].sort(), 'owner sees everything');
   assert.equal((await call('/api/users', { cookie: owner })).json.users.find((u) => u.id === buyer.id).offersAccess, 'own', 'stored with the user');
 });
 

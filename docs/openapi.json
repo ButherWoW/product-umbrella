@@ -144,6 +144,13 @@
               "null"
             ],
             "description": "ISO 4217; null = DEFAULT_CURRENCY"
+          },
+          "ownerId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "User who owns the record; null = team record (created by the owner or ADMIN_TOKEN). Buyers edit, archive and clone only their own records."
           }
         }
       },
@@ -162,6 +169,13 @@
               "string",
               "null"
             ]
+          },
+          "ownerId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "User who owns the record; null = team record (created by the owner or ADMIN_TOKEN). Buyers edit, archive and clone only their own records."
           }
         }
       },
@@ -858,6 +872,13 @@
           },
           "postbackUrlMasked": {
             "type": "boolean"
+          },
+          "ownerId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "User who owns the record; null = team record (created by the owner or ADMIN_TOKEN). Buyers edit, archive and clone only their own records."
           }
         }
       },
@@ -887,6 +908,13 @@
           "notes": {
             "type": "string",
             "maxLength": 2000
+          },
+          "ownerId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "User who owns the record; null = team record (created by the owner or ADMIN_TOKEN). Buyers edit, archive and clone only their own records."
           }
         }
       }
@@ -2529,6 +2557,13 @@
                       "null"
                     ],
                     "description": "ISO 4217; null = DEFAULT_CURRENCY"
+                  },
+                  "ownerId": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "Owner or ADMIN_TOKEN only: assign the record to a user. A buyer's record is always theirs."
                   }
                 }
               }
@@ -2561,6 +2596,16 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "description": "id_taken: the id exists (also for the owner; change it with PATCH)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           }
         },
         "x-summary-ru": "создать оффер: `{ id, url, … }`"
@@ -2691,6 +2736,16 @@
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
+          "403": {
+            "description": "offer_not_yours: a buyer may change only their own records",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
           "404": {
             "$ref": "#/components/responses/NotFound"
           }
@@ -2804,7 +2859,14 @@
             "$ref": "#/components/responses/Unauthorized"
           },
           "403": {
-            "$ref": "#/components/responses/Forbidden"
+            "description": "campaign_not_yours, or offer_not_usable / landing_not_usable: a buyer may put only team and own offers and landings into streams",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           }
         },
         "x-summary-ru": "создать кампанию: `{ id, name, sourceId?, … }`"
@@ -2859,7 +2921,14 @@
             "$ref": "#/components/responses/Unauthorized"
           },
           "403": {
-            "$ref": "#/components/responses/Forbidden"
+            "description": "campaign_not_yours, or offer_not_usable / landing_not_usable: a buyer may put only team and own offers and landings into streams",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
@@ -2963,7 +3032,14 @@
             "$ref": "#/components/responses/Unauthorized"
           },
           "403": {
-            "$ref": "#/components/responses/Forbidden"
+            "description": "campaign_not_yours, or offer_not_usable / landing_not_usable: a buyer may put only team and own offers and landings into streams",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
@@ -3047,6 +3123,13 @@
                       "string",
                       "null"
                     ]
+                  },
+                  "ownerId": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "Owner or ADMIN_TOKEN only: assign the record to a user. A buyer's record is always theirs."
                   }
                 }
               }
@@ -3088,6 +3171,16 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "description": "id_taken: the id exists (also for the owner; change it with PATCH)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           }
         },
         "x-summary-ru": "создать лендинг"
@@ -3162,6 +3255,16 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "landing_not_yours: a buyer may change only their own records",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
@@ -4841,33 +4944,18 @@
     },
     "/dashboard": {
       "get": {
-        "summary": "Legacy dashboard (HTML)",
-        "description": "Old one-page dashboard. Requires login when REQUIRE_LOGIN=1; users who must not see revenue are redirected to /admin.",
+        "summary": "Legacy link to the panel",
+        "description": "The built-in dashboard page was removed; the old URL answers 302 to /admin (under BASE_PATH).",
         "operationId": "dashboardPage",
         "tags": [
           "ui"
         ],
-        "security": [
-          {
-            "bearerAuth": []
-          },
-          {
-            "cookieAuth": []
-          },
-          {}
-        ],
         "responses": {
-          "200": {
-            "description": "HTML page",
-            "content": {
-              "text/html": {}
-            }
-          },
           "302": {
-            "description": "Redirect to /admin (login required or revenue hidden)"
+            "description": "Redirect to /admin"
           }
         },
-        "x-summary-ru": "старый одностраничный дашборд (HTML)"
+        "x-summary-ru": "старая ссылка: `302` на `/admin` (встроенная страница удалена)"
       }
     },
     "/stats/bots": {
@@ -5125,7 +5213,7 @@
         "x-summary-ru": "список источников трафика"
       },
       "post": {
-        "summary": "Create or replace a traffic source",
+        "summary": "Create a traffic source",
         "description": "Source = template for campaigns: paramMap, cost model and the postback to the source. A new campaign with sourceId takes these defaults. Buyers cannot set postbackUrl/postbackStatuses.",
         "operationId": "createSource",
         "tags": [
@@ -5186,6 +5274,13 @@
                     "items": {
                       "type": "string"
                     }
+                  },
+                  "ownerId": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "Owner or ADMIN_TOKEN only: assign the record to a user. A buyer's record is always theirs."
                   }
                 }
               }
@@ -5215,6 +5310,16 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "description": "id_taken: the id exists (also for the owner; change it with PATCH)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           }
         },
         "x-summary-ru": "создать источник: `paramMap`, модель расхода, постбэк в источник"
@@ -5316,6 +5421,16 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "source_not_yours: a buyer may change only their own records",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
@@ -5465,6 +5580,13 @@
                       "id": {
                         "type": "string",
                         "pattern": "^[A-Za-z0-9_-]{2,80}$"
+                      },
+                      "ownerId": {
+                        "type": [
+                          "string",
+                          "null"
+                        ],
+                        "description": "Owner or ADMIN_TOKEN only: assign the record to a user. A buyer's record is always theirs."
                       }
                     }
                   },
@@ -5494,7 +5616,7 @@
             "$ref": "#/components/responses/Unauthorized"
           },
           "409": {
-            "description": "network_exists",
+            "description": "id_taken: the id exists (also for the owner; change it with PATCH)",
             "content": {
               "application/json": {
                 "schema": {
@@ -5560,6 +5682,16 @@
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
+          "403": {
+            "description": "network_not_yours: a buyer may change only their own records",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
           "404": {
             "$ref": "#/components/responses/NotFound"
           }
@@ -5600,6 +5732,16 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "offer_not_yours",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
