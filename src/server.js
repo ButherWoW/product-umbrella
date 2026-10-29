@@ -1103,6 +1103,7 @@ function securityHeaders(res, path) {
 }
 
 function json(res, status, body) {
+  if (res.revenueFilter) body = stripRevenue(body, res.revenueFilter.urls);
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(body));
 }
@@ -1266,7 +1267,8 @@ function sendRedirect(res, location, method = 'http') {
 }
 
 // Buyers see and edit only their own campaigns; owners, the admin token and a fresh dev install see everything.
-const isBuyer = (req) => req.user?.role === 'buyer' && !bearerAuthorized(req);
+// A viewer is scoped like a buyer unless the owner gave it viewAll (it never writes anyway).
+const isBuyer = (req) => (req.user?.role === 'buyer' || (req.user?.role === 'viewer' && !req.user.viewAll)) && !bearerAuthorized(req);
 function scopeCampaigns(req) {
   if (!isBuyer(req)) return null;
   return [...campaigns].filter(([, c]) => c.ownerId === req.user.id).map(([id]) => id);
@@ -1279,6 +1281,36 @@ function campaignScope(req, requested) {
   return { campaign: requested, allowed };
 }
 const canEditCampaign = (req, c) => !isBuyer(req) || c?.ownerId === req.user.id;
+
+// Per-user permission flags (Keitaro «Права пользователей»). They never restrict the owner or ADMIN_TOKEN.
+const restrictedUser = (req) => Boolean(req.user) && req.user.role !== 'owner' && !bearerAuthorized(req);
+const hidesRevenue = (req) => restrictedUser(req) && req.user.hideRevenue === true;
+const isViewer = (req) => req.user?.role === 'viewer' && !bearerAuthorized(req);
+// hideRevenue removes these keys (not zeroes them: a zero profit or ROI would be a lie) at any depth of the response.
+const REVENUE_KEY = /revenue|profit|payout|earning|^(roi|epc|uepc|rpm)$/i;
+const URL_KEY = /^(url|postbackUrl)$/;
+function stripRevenue(value, urls) {
+  if (Array.isArray(value)) return value.map((v) => stripRevenue(v, urls));
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value).filter(([k]) => !REVENUE_KEY.test(k) && !(urls && URL_KEY.test(k))).map(([k, v]) => [k, stripRevenue(v, urls)]));
+}
+// Paths whose responses are filtered for a hideRevenue user; urls: also drop offer/postback URLs.
+function revenueFilterFor(path) {
+  if (path === '/stats' || path.startsWith('/stats/') || path === '/api/conversions') return { urls: false };
+  if (path === '/api/offers' || path.startsWith('/api/offers/') || path === '/api/audit' || path === '/api/simulate') return { urls: true };
+  return null;
+}
+// offersAccess 'own': ids of offers used in the streams of campaigns the user can see; null = no restriction.
+function visibleOfferIds(req) {
+  if (!restrictedUser(req) || req.user.offersAccess !== 'own') return null;
+  const allowed = scopeCampaigns(req);
+  const ids = new Set();
+  for (const [id, c] of campaigns) {
+    if (allowed && !allowed.includes(id)) continue;
+    for (const st of c.streams || []) (st.offers ? st.offers.map((o) => o.offerId) : st.offerId ? [st.offerId] : []).forEach((o) => ids.add(o));
+  }
+  return ids;
+}
 
 // Change history (Keitaro «Лог»): who changed what and when. Kept in the JSONL journal; never stores passwords.
 const PRIMITIVE = (v) => v === null || ['string', 'number', 'boolean'].includes(typeof v);
@@ -1357,11 +1389,27 @@ async function handleAuthRoute(req, res, url) {
   }
   if (path === '/api/users' && req.method === 'POST') {
     if (!isOwner) return json(res, 403, { error: 'owner_only' });
-    const created = await users.create({ email: body.email, password: body.password, role: body.role || 'buyer' });
-    await audit(req, 'create', 'user', created.id, null, { email: created.email, role: created.role });
+    const created = await users.create({ email: body.email, password: body.password, role: body.role || 'buyer', hideRevenue: body.hideRevenue, offersAccess: body.offersAccess, viewAll: body.viewAll });
+    await audit(req, 'create', 'user', created.id, null, { email: created.email, role: created.role, hideRevenue: created.hideRevenue, offersAccess: created.offersAccess, viewAll: created.viewAll });
     return json(res, 201, { user: created });
   }
   const userDelete = path.match(/^\/api\/users\/([0-9a-f-]{36})$/);
+  if (userDelete && req.method === 'PATCH') {
+    if (!isOwner) return json(res, 403, { error: 'owner_only' });
+    const id = userDelete[1];
+    const all = await users.list();
+    const target = all.find((u) => u.id === id);
+    if (!target) return json(res, 404, { error: 'user_not_found' });
+    const input = { role: body.role, hideRevenue: body.hideRevenue, offersAccess: body.offersAccess, viewAll: body.viewAll };
+    if (input.role !== undefined && input.role !== target.role) {
+      if (req.user?.id === id) return json(res, 409, { error: 'cannot_change_own_role' });
+      if (target.role === 'owner' && all.filter((u) => u.role === 'owner').length === 1) return json(res, 409, { error: 'last_owner' });
+    }
+    const updated = await users.update(id, input);
+    const view = (u) => ({ role: u.role, hideRevenue: u.hideRevenue, offersAccess: u.offersAccess, viewAll: u.viewAll });
+    await audit(req, 'update', 'user', id, view(target), view(updated));
+    return json(res, 200, { user: updated });
+  }
   if (userDelete && req.method === 'DELETE') {
     if (!isOwner) return json(res, 403, { error: 'owner_only' });
     const id = userDelete[1];
@@ -1427,6 +1475,12 @@ const server = http.createServer(async (req, res) => {
     if (requireLogin && isPrivatePath(url.pathname) && !req.user && !bearerAuthorized(req)) {
       if (url.pathname === '/dashboard') { res.writeHead(302, { location: `${basePath}/admin` }); return res.end(); }
       return json(res, 401, { error: 'login_required' });
+    }
+    // Read-only role: every write to the panel API is refused; signing in and out stays possible.
+    if (isViewer(req) && !['GET', 'HEAD'].includes(req.method) && isPrivatePath(url.pathname)) return json(res, 403, { error: 'read_only' });
+    if (hidesRevenue(req)) {
+      if (url.pathname === '/dashboard') { res.writeHead(302, { location: `${basePath}/admin` }); return res.end(); }
+      res.revenueFilter = revenueFilterFor(url.pathname);
     }
     if (url.pathname === '/stats' || url.pathname.startsWith('/stats/') || url.pathname === '/api/clicks' || url.pathname === '/api/conversions' || url.pathname === '/api/bots') {
       req.scope = campaignScope(req, url.searchParams.get('campaign') || null);
@@ -1688,7 +1742,8 @@ const server = http.createServer(async (req, res) => {
       } else if (TRACK_FIELDS.includes(group) || DIMENSION_FIELDS.includes(group)) {
         rows = (await paramReport({ field: group, campaign, allowed, from, to, currency })).map((r) => ({ key: r.value, ...r }));
       } else return json(res, 400, { error: 'invalid_group' });
-      const columns = ['key', 'clicks', 'conversions', 'revenue', 'cost', 'cr', 'epc', 'rpm', 'uniqueClicks', 'leads', 'sales', 'rejected', 'pendingRevenue', 'profit', 'roi'];
+      const columns = ['key', 'clicks', 'conversions', 'revenue', 'cost', 'cr', 'epc', 'rpm', 'uniqueClicks', 'leads', 'sales', 'rejected', 'pendingRevenue', 'profit', 'roi']
+        .filter((c) => !hidesRevenue(req) || !REVENUE_KEY.test(c));
       // Cells starting with = + - @ are prefixed so spreadsheets do not run them as formulas.
       const cell = (v) => { let text = v === null || v === undefined ? '' : typeof v === 'number' ? String(Math.round(v * 10000) / 10000) : String(v); if (/^[=+\-@]/.test(text) && typeof v !== 'number') text = `'${text}`; return /[",\n;]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text; };
       const csv = [['group', ...columns.slice(1)].join(','), ...rows.map((r) => columns.map((c) => cell(r[c])).join(','))].join('\n') + '\n';
@@ -1812,12 +1867,15 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { id, ...updated });
     }
     if (url.pathname === '/api/offers' && req.method === 'GET') {
-      return json(res, 200, { offers: Object.fromEntries(offers) });
+      const visible = visibleOfferIds(req);
+      return json(res, 200, { offers: Object.fromEntries([...offers].filter(([id]) => !visible || visible.has(id))) });
     }
     if (url.pathname === '/api/offers' && req.method === 'POST') {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const body = await readJson(req);
       if (!/^[a-z0-9_-]{2,80}$/i.test(String(body.id || '')) || !/^https:\/\//i.test(String(body.url || ''))) return json(res, 400, { error: 'id_and_https_url_required' });
+      // offersAccess 'own' must not overwrite an offer the user cannot see.
+      if (offers.has(String(body.id)) && visibleOfferIds(req) && !visibleOfferIds(req).has(String(body.id))) return json(res, 409, { error: 'offer_id_taken' });
       if (body.networkId !== undefined && body.networkId !== null && !networks.has(String(body.networkId))) return json(res, 400, { error: 'network_not_found' });
       const capError = conversionCapError(String(body.id), body);
       if (capError) return json(res, 400, { error: capError });
@@ -1833,14 +1891,14 @@ const server = http.createServer(async (req, res) => {
     const offerClone = url.pathname.match(/^\/api\/offers\/([A-Za-z0-9_-]{2,80})\/clone$/);
     if (offerClone && req.method === 'POST') {
       if (!(await adminAuthorized(req))) return json(res,401,{error:'admin_authorization_required'});
-      const id=offerClone[1],cur=offers.get(id); if(!cur) return json(res,404,{error:'offer_not_found'});
+      const id=offerClone[1],cur=offers.get(id); if(!cur || (visibleOfferIds(req) && !visibleOfferIds(req).has(id))) return json(res,404,{error:'offer_not_found'});
       let nextId=`${id}-copy`, n=2; while(offers.has(nextId)) nextId=`${id}-copy${n++}`;
       const copy=parseOffer({...cur,name:`${cur.name||id} (копия)`,archived:false}); offers.set(nextId,copy); await persistOffer(nextId,copy); await audit(req,'create','offer',nextId,null,copy); return json(res,201,{id:nextId,...copy});
     }
     if (offerUpdate && req.method === 'PATCH') {
       const id = offerUpdate[1];
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
-      if (!offers.has(id)) return json(res, 404, { error: 'offer_not_found' });
+      if (!offers.has(id) || (visibleOfferIds(req) && !visibleOfferIds(req).has(id))) return json(res, 404, { error: 'offer_not_found' });
       const body = await readJson(req);
       const cur = offers.get(id);
       const newUrl = body.url !== undefined ? String(body.url) : cur.url;
