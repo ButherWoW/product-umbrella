@@ -1467,10 +1467,15 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/postback' && req.method === 'GET') {
       if (postbackSecret && !safeEqual(url.searchParams.get('secret'), postbackSecret)) return json(res, 401, { error: 'invalid_postback_secret' });
-      await event('postback_in', { clickId: url.searchParams.get('click_id') || null, status: url.searchParams.get('status') || 'sale', revenue: url.searchParams.get('revenue') || null, currency: url.searchParams.get('currency') || null });
+      const incomingClickId = url.searchParams.get('click_id');
+      const incomingClick = incomingClickId ? await getClickData(incomingClickId) : null;
+      const incomingOffer = incomingClick ? offers.get(incomingClick.offerId) : null;
+      const suppliedRevenue = url.searchParams.get('revenue') ?? url.searchParams.get('payout');
+      const fallbackRevenue = suppliedRevenue === null && incomingOffer?.payout !== null && incomingOffer?.payout !== undefined ? String(incomingOffer.payout) : suppliedRevenue;
+      await event('postback_in', { clickId: incomingClickId || null, status: url.searchParams.get('status') || 'sale', revenue: fallbackRevenue, currency: url.searchParams.get('currency') || incomingOffer?.payoutCurrency || null });
       try {
-        const result = await recordPostback({ clickId: url.searchParams.get('click_id'),
-          revenue: url.searchParams.get('revenue'), currency: url.searchParams.get('currency'), status: url.searchParams.get('status') });
+        const result = await recordPostback({ clickId: incomingClickId,
+          revenue: fallbackRevenue, currency: url.searchParams.get('currency') || incomingOffer?.payoutCurrency, status: url.searchParams.get('status') });
         return json(res, 200, result);
       } catch (error) {
         await event('postback_in', { clickId: url.searchParams.get('click_id') || null, statusCode: error.statusCode || 500, error: error.message });
