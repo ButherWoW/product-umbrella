@@ -56,6 +56,7 @@
           "action": { "type": "string", "enum": ["offers", "url", "not_found", "campaign"] },
           "weight": { "type": "integer" },
           "enabled": { "type": "boolean" },
+          "disabledBy": { "type": "string", "enum": ["monitor"], "description": "Set when the offer monitor switched the stream off; it switches it back on when the targets answer again." },
           "countClicks": { "type": "boolean" },
           "offers": {
             "type": "array",
@@ -123,7 +124,8 @@
           "paramMap": { "type": "object" },
           "costModel": { "type": "string", "enum": ["none", "cpc"] },
           "cpc": { "type": "number" },
-          "costFromParam": { "type": "boolean" }
+          "costFromParam": { "type": "boolean" },
+          "monitoring": { "type": "string", "enum": ["off", "notify", "disable"], "default": "notify", "description": "Offer/landing monitoring: off, notify (event + audit), disable (also switches the stream off and back on)." }
         }
       },
       "StatsMetrics": {
@@ -1543,6 +1545,51 @@
             }
           },
           "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/monitor": {
+      "get": {
+        "summary": "Offer and landing monitor state",
+        "description": "Per checked URL (without query string): whether it answers, last status, since when it is down and which campaigns/streams use it. Buyers see only their own campaigns.",
+        "operationId": "getMonitor",
+        "tags": ["system"],
+        "security": [{ "bearerAuth": [] }, { "cookieAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Monitor state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "enabled": { "type": "boolean" },
+                    "intervalMs": { "type": "integer" },
+                    "targets": { "type": "array", "items": { "type": "object", "properties": {
+                      "url": { "type": "string" }, "ok": { "type": "boolean" }, "status": { "type": ["integer", "null"] }, "error": { "type": ["string", "null"] },
+                      "checkedAt": { "type": "string", "format": "date-time" }, "downSince": { "type": ["string", "null"], "format": "date-time" }, "failures": { "type": "integer" },
+                      "campaigns": { "type": "array", "items": { "type": "object", "properties": {
+                        "campaign": { "type": "string" }, "name": { "type": "string" }, "stream": { "type": "string" }, "target": { "type": "string" }, "mode": { "type": "string", "enum": ["off", "notify", "disable"] } } } }
+                    } } }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "description": "Authorization required" }
+        }
+      }
+    },
+    "/api/monitor/check": {
+      "post": {
+        "summary": "Run a monitor check now",
+        "description": "Checks every monitored URL immediately and applies notify/disable actions. Owner only.",
+        "operationId": "runMonitorCheck",
+        "tags": ["system"],
+        "security": [{ "bearerAuth": [] }, { "cookieAuth": [] }],
+        "responses": {
+          "200": { "description": "Check finished; same targets as GET /api/monitor plus checked/down counts" },
+          "403": { "description": "Owner only" }
         }
       }
     },

@@ -49,6 +49,8 @@ http://localhost:4100/r/demo/offer-1?utm_source=facebook&utm_campaign=test
 | `POST /api/campaigns` | создать кампанию: `{ id, name }` |
 | `PATCH /api/campaigns/:id` | изменить `active` или `name` |
 | `PUT /api/campaigns/:id/streams` | настроить weighted offer streams |
+| `GET /api/monitor` | состояние проверок офферов и лендингов (баер видит только свои кампании) |
+| `POST /api/monitor/check` | проверить сейчас (только владелец) |
 | `GET /postback` | записать конверсию; требует `click_id` и, если задан, `secret` |
 
 Tracking URL принимает `utm_source`, `utm_medium`, `utm_campaign`, `utm_content` и `subid`.
@@ -138,6 +140,20 @@ Tracking URL принимает `utm_source`, `utm_medium`, `utm_campaign`, `utm
 - `costModel: "cpc"` + `cpc: 0.12` — фиксированная цена клика; `costFromParam: true` — брать из параметра `cost` (или переименованного), при отсутствии/ошибке — `cpc`.
 - Все отчёты отдают `cost`, `profit`, `roi`. `GET /stats/params?field=sub_id_1&campaign=&from=&to=` — отчёт по значениям параметра.
 - Макросы в URL оффера: `{sub_id_N}`, `{keyword}`, `{source}`, `{external_id}`, `{creative_id}`, `{ad_campaign_id}`, `{cost}`. Значения URL-кодируются.
+
+## Мониторинг офферов и лендингов
+
+`src/monitor.js` раз в `MONITOR_INTERVAL_MS` (по умолчанию 10 минут) проверяет каждый URL оффера, лендинга и потока «Прямой URL» в активных кампаниях: GET с обычным браузерным User-Agent, до 5 редиректов, таймаут 10 с на всю цепочку. Макросы подставляются пустыми, `{click_id}` и `{subid}` — значением `monitor-check`. Цель «не отвечает» после двух неудачных проверок подряд (ошибка сети, таймаут или итоговый статус ≥ 400) и снова «отвечает» после одной успешной.
+
+Настройка кампании `monitoring` (POST/PATCH, в редакторе — «Мониторинг офферов»):
+
+- `notify` (по умолчанию) — событие `monitor` в журнале (`campaign`, `stream`, `target` вида `offer:id` / `landing:id` / `url`, `url` без query string, `status`, `error`) и запись в «Историю» кампании от `system`; одно событие на каждое падение, без повторов, пока цель лежит;
+- `disable` — то же, плюс поток выключается (`enabled: false`, `disabledBy: "monitor"`, запись `disable_stream` в истории). Когда все цели потока снова отвечают, монитор включает его обратно (`enable_stream`). Потоки, выключенные вручную, монитор не трогает и не проверяет; включённый вручную поток с лежащим оффером не выключается повторно до следующего падения;
+- `off` — кампания не проверяется.
+
+`GET /api/monitor` → `{ enabled, intervalMs, targets: [{ url, ok, status, error, checkedAt, downSince, failures, campaigns: [{ campaign, name, stream, target, mode }] }] }`, состояние в памяти (после рестарта счётчик неудач начинается заново, `disabledBy` хранится в потоке). `POST /api/monitor/check` — проверить сразу (только владелец). На дашборде /admin блок «Не отвечают» со ссылками на кампании появляется, только пока что-то лежит.
+
+Защита от SSRF: только `http`/`https`; имя хоста резолвится, и если хоть один адрес приватный (loopback, 10/8, 172.16/12, 192.168/16, 169.254/16 и metadata, 100.64/10, IPv6 ULA/link-local, multicast) — запрос не делается, в том числе на любом шаге редиректа. Соединение идёт ровно на проверенный адрес (без повторного DNS). `MONITOR=0` выключает таймер (ручная проверка работает); тесты запускают сервер с `MONITOR=0`. `MONITOR_ALLOW_PRIVATE=127.0.0.1` — список адресов-исключений только для тестов, в production не задавать.
 
 ## Импорт офферов из Keitaro
 
