@@ -348,14 +348,14 @@ const SIM_AGENTS = [
 ];
 const CAP_REASON = { archived: 'в архиве', click_cap: 'кап кликов', conversion_cap: 'кап конверсий' };
 function simulateModal(campaignId) {
-  const q = { country: 'FR', ua: SIM_AGENTS[0][1], ip: '', language: 'fr', query: '', at: '' };
+  const q = { country: 'FR', ua: SIM_AGENTS[0][1], ip: '', language: 'fr', query: '', referrer: '', at: '' };
   const out = h('div', { 'aria-live': 'polite' });
   const input = (key, attrs = {}) => h('input', { class: 'input', value: q[key], oninput: (e) => { q[key] = e.target.value.trim(); }, ...attrs });
   const OUTCOME = { click: 'Клик засчитается', bot: 'Бот: уйдёт туда же, клик не засчитается', redirect: 'Редирект', blocked: 'Отказ', no_stream: 'Нет подходящего потока', not_found: 'Ответ 404', error: 'Ошибка' };
   const run = async () => {
     put(out, h('p', { class: 'muted' }, 'Считаю…'));
     try {
-      const r = await api('/api/simulate', { method: 'POST', body: { campaign: campaignId, country: q.country, userAgent: q.ua, ip: q.ip, language: q.language, query: q.query, at: q.at ? new Date(q.at).toISOString() : undefined } });
+      const r = await api('/api/simulate', { method: 'POST', body: { campaign: campaignId, country: q.country, userAgent: q.ua, ip: q.ip, language: q.language, query: q.query, referrer: q.referrer || undefined, at: q.at ? new Date(q.at).toISOString() : undefined } });
       const v = r.visitor || {};
       put(out,
         h('p', { class: 'muted' }, `Посетитель: ${v.country || 'страна ?'} · ${v.device} · ${v.os} · ${v.browser}${v.language ? ' · ' + v.language : ''}${v.isp ? ' · ' + v.isp : ''}${v.datacenter ? ' (дата-центр)' : ''}`),
@@ -364,7 +364,8 @@ function simulateModal(campaignId) {
           (st.streams || []).map((s) => h('div', { style: 'margin-top:6px' },
             h('span', { class: s.matches && s.enabled ? 'pos' : 'muted' }, `${s.matches && s.enabled ? '✓' : '✗'} ${s.name} (${typeLabel[s.type] || s.type})`),
             !s.enabled ? h('span', { class: 'muted' }, ' — выключен') : null,
-            s.checks.length ? h('span', { class: 'muted' }, ' — ' + s.checks.map((c) => `${c.condition}: ${c.actual ?? '?'} ${c.ok ? '∈' : '∉'} ${c.expected.join(', ')}`).join(s.mode === 'or' ? ' ИЛИ ' : '; ')) : h('span', { class: 'muted' }, ' — без условий'),
+            s.checks.length ? h('span', { class: 'muted' }, ' — ' + s.checks.map((c) => (c.op ? `${c.condition}${c.not ? ' НЕ' : ''}: ${c.actual ?? '?'} ${c.op} ${c.expected.join(', ')} ${c.ok ? '✓' : '✗'}`
+              : `${c.condition}: ${c.actual ?? '?'} ${c.ok !== Boolean(c.not) ? '∈' : '∉'} ${c.not ? 'НЕ ' : ''}${c.expected.join(', ')}${c.not ? (c.ok ? ' ✓' : ' ✗') : ''}`)).join(s.mode === 'or' ? ' ИЛИ ' : '; ')) : h('span', { class: 'muted' }, ' — без условий'),
             s.cappedOffers?.length ? h('span', { class: 'err' }, ` · кап: ${s.cappedOffers.map((o) => `${o.offerId} (${CAP_REASON[o.reason] || o.reason}${o.altOfferId ? ` → ${o.altOfferId}` : ''})`).join(', ')}`) : null)),
           st.chosen ? h('p', {}, 'Выбор: ', st.chosen.map((c) => `${c.stream} — ${String(c.share).replace('.', ',')}%`).join(', ')) : null)),
         h('div', { class: 'card' },
@@ -382,6 +383,7 @@ function simulateModal(campaignId) {
       field('Браузер', h('select', { class: 'select', onchange: (e) => { q.ua = e.target.value; } }, SIM_AGENTS.map(([l, ua]) => h('option', { value: ua }, l)))),
       field('Язык', input('language', { placeholder: 'fr', maxlength: 2 })),
       field('Параметры ссылки', input('query', { placeholder: 'fbclid=…&utm_campaign=…' }), 'Как в ссылке кампании, после «?».'),
+      field('Реферер', input('referrer', { placeholder: 'https://m.facebook.com/' }), 'Пусто — переход без реферера.'),
       field('Время визита', input('at', { type: 'datetime-local' }), 'Пусто — сейчас. Для расписания потоков.')),
     out),
     footer: [h('button', { class: 'btn primary', onclick: run }, 'Проверить')] });
@@ -693,22 +695,50 @@ function compactHours(hours = []) {
 }
 const DAY_NAMES = ['', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
 
+// Stream params condition as text: "sub_id_3=fb,tt; source=x".
+const paramsText = (params = {}) => Object.entries(params).map(([k, v]) => `${k}=${v.join(',')}`).join('; ');
+function parseParamsText(text) {
+  const out = {};
+  for (const part of String(text || '').split(/[;\n]+/)) {
+    const [k, v = ''] = part.split('=');
+    const values = v.split(',').map((x) => x.trim()).filter(Boolean);
+    if (k.trim() && values.length) out[k.trim()] = values;
+  }
+  return out;
+}
+const splitComma = (text) => String(text || '').split(/[,\n]+/).map((x) => x.trim()).filter(Boolean);
+
 function summarizeConditions(c = {}) {
   const parts = [];
-  if (c.countries?.length) parts.push('Страны: ' + c.countries.join(', '));
-  if (c.devices?.length) parts.push('Устройства: ' + c.devices.join(', '));
-  if (c.os?.length) parts.push('ОС: ' + c.os.join(', '));
-  if (c.browsers?.length) parts.push('Браузеры: ' + c.browsers.join(', '));
-  if (c.languages?.length) parts.push('Языки: ' + c.languages.join(', '));
-  if (c.isps?.length) parts.push('Провайдеры: ' + c.isps.join(', '));
-  if (c.days?.length) parts.push('Дни: ' + c.days.map((d) => DAY_NAMES[d]).join(', '));
-  if (c.hours?.length) parts.push(`Часы: ${compactHours(c.hours)} (${c.tz || 'UTC'})`);
+  const add = (key, label, text) => parts.push(`${label}${c.not?.includes(key) ? ' НЕ' : ''}: ${text}`);
+  if (c.countries?.length) add('countries', 'Страны', c.countries.join(', '));
+  if (c.devices?.length) add('devices', 'Устройства', c.devices.join(', '));
+  if (c.os?.length) add('os', 'ОС', c.os.join(', '));
+  if (c.browsers?.length) add('browsers', 'Браузеры', c.browsers.join(', '));
+  if (c.languages?.length) add('languages', 'Языки', c.languages.join(', '));
+  if (c.isps?.length) add('isps', 'Провайдеры', c.isps.join(', '));
+  if (c.referrers?.length) add('referrers', 'Реферер', c.referrers.join(', '));
+  if (typeof c.emptyReferrer === 'boolean') add('emptyReferrer', 'Пустой реферер', c.emptyReferrer ? 'да' : 'нет');
+  if (c.keywords?.length) add('keywords', 'Ключ. слова', c.keywords.join(', '));
+  for (const [k, v] of Object.entries(c.params || {})) add('params', k, v.join(', '));
+  if (c.ips?.length) add('ips', 'IP', c.ips.join(', '));
+  if (c.userAgents?.length) add('userAgents', 'User-Agent', c.userAgents.join(', '));
+  if (c.days?.length) add('days', 'Дни', c.days.map((d) => DAY_NAMES[d]).join(', '));
+  if (c.hours?.length) add('hours', 'Часы', `${compactHours(c.hours)} (${c.tz || 'UTC'})`);
+  if (c.dateFrom) add('dateFrom', 'С', c.dateFrom);
+  if (c.dateTo) add('dateTo', 'По', c.dateTo);
   return parts.length ? parts.join(c.mode === 'or' ? ' ИЛИ ' : ' · ') : 'Без фильтров';
 }
 
 function streamModal(stream, onApply, isNew = false, currentCampaignId = null) {
   const s = structuredClone(stream);
-  s.conditions = { countries: [], devices: [], os: [], browsers: [], languages: [], isps: [], days: [], hours: [], ...(s.conditions || {}) };
+  s.conditions = { countries: [], devices: [], os: [], browsers: [], languages: [], isps: [], days: [], hours: [], referrers: [], keywords: [], ips: [], userAgents: [], params: {}, not: [], ...(s.conditions || {}) };
+  // «НЕ» toggle next to a condition: the stream matches visitors who are NOT in the list.
+  const cfield = (key, label, control, hint) => h('div', { class: 'field' },
+    h('span', {}, label, h('label', { class: 'not-toggle', style: 'margin-left:10px;font-weight:400' },
+      h('input', { type: 'checkbox', 'aria-label': `${label}: НЕ`, checked: s.conditions.not.includes(key), onchange: (e) => {
+        s.conditions.not = e.target.checked ? [...new Set([...s.conditions.not, key])] : s.conditions.not.filter((k) => k !== key); } }), ' НЕ')),
+    control, hint ? h('span', { class: 'hint' }, hint) : null);
   s.action = s.action || 'offers';
   s.offers = s.offers || [];
   const err = h('p', { class: 'err' });
@@ -767,14 +797,24 @@ function streamModal(stream, onApply, isNew = false, currentCampaignId = null) {
         h('label', {}, h('input', { type: 'radio', name: 'smode', checked: s.conditions.mode !== 'or', onchange: () => { delete s.conditions.mode; } }), 'И — все фильтры'),
         h('label', {}, h('input', { type: 'radio', name: 'smode', checked: s.conditions.mode === 'or', onchange: () => { s.conditions.mode = 'or'; } }), 'ИЛИ — любой из фильтров')),
         'Пустой фильтр не учитывается.'),
-      field('Страны', h('input', { class: 'input', value: s.conditions.countries.join(', '), placeholder: 'FR, DE, US', oninput: (e) => { s.conditions.countries = splitList(e.target.value).map((x) => x.toUpperCase()); } }), 'ISO-коды через запятую. Без базы GeoIP страна неизвестна и такой фильтр не сработает.'),
-      field('Тип устройства', checkGroup(COND.devices, s.conditions.devices, (v) => { s.conditions.devices = v; })),
-      field('Операционные системы', checkGroup(COND.os, s.conditions.os, (v) => { s.conditions.os = v; })),
-      field('Браузеры', checkGroup(COND.browsers, s.conditions.browsers, (v) => { s.conditions.browsers = v; })),
-      field('Языки', h('input', { class: 'input', value: s.conditions.languages.join(', '), placeholder: 'fr, de', oninput: (e) => { s.conditions.languages = splitList(e.target.value).map((x) => x.toLowerCase()); } }), 'Два первых символа Accept-Language.'),
-      field('Провайдеры', h('input', { class: 'input', value: s.conditions.isps.join(', '), placeholder: 'orange, free mobile', oninput: (e) => { s.conditions.isps = splitList(e.target.value).map((x) => x.toLowerCase()); } }), 'Часть названия провайдера, как в отчёте «Провайдер». Без базы провайдеров условие не срабатывает.'),
-      field('Дни недели', checkGroup([[1, 'Пн'], [2, 'Вт'], [3, 'Ср'], [4, 'Чт'], [5, 'Пт'], [6, 'Сб'], [7, 'Вс']], s.conditions.days, (v) => { s.conditions.days = v.map(Number); }), 'Пусто — любой день.'),
-      field('Часы', h('input', { class: 'input', value: compactHours(s.conditions.hours), placeholder: '9-21', oninput: (e) => { s.conditions.hours = parseHours(e.target.value); } }), 'Например «9-21» или «0-6, 22-23». Пусто — круглосуточно.'),
+      cfield('countries', 'Страны', h('input', { class: 'input', 'aria-label': 'Страны', value: s.conditions.countries.join(', '), placeholder: 'FR, DE, US', oninput: (e) => { s.conditions.countries = splitList(e.target.value).map((x) => x.toUpperCase()); } }), 'ISO-коды через запятую. Без базы GeoIP страна неизвестна и такой фильтр не сработает (с «НЕ» — сработает).'),
+      cfield('devices', 'Тип устройства', checkGroup(COND.devices, s.conditions.devices, (v) => { s.conditions.devices = v; })),
+      cfield('os', 'Операционные системы', checkGroup(COND.os, s.conditions.os, (v) => { s.conditions.os = v; })),
+      cfield('browsers', 'Браузеры', checkGroup(COND.browsers, s.conditions.browsers, (v) => { s.conditions.browsers = v; })),
+      cfield('languages', 'Языки', h('input', { class: 'input', 'aria-label': 'Языки', value: s.conditions.languages.join(', '), placeholder: 'fr, de', oninput: (e) => { s.conditions.languages = splitList(e.target.value).map((x) => x.toLowerCase()); } }), 'Два первых символа Accept-Language.'),
+      cfield('isps', 'Провайдеры', h('input', { class: 'input', 'aria-label': 'Провайдеры', value: s.conditions.isps.join(', '), placeholder: 'orange, free mobile', oninput: (e) => { s.conditions.isps = splitComma(e.target.value).map((x) => x.toLowerCase()); } }), 'Часть названия провайдера, как в отчёте «Провайдер». Без базы провайдеров условие не срабатывает.'),
+      cfield('referrers', 'Реферер', h('input', { class: 'input', 'aria-label': 'Реферер', value: s.conditions.referrers.join(', '), placeholder: 'facebook.com, instagram.com/ads', oninput: (e) => { s.conditions.referrers = splitComma(e.target.value).map((x) => x.toLowerCase()); } }), 'Часть адреса источника перехода (домен и путь), без учёта регистра.'),
+      cfield('emptyReferrer', 'Пустой реферер', h('div', { class: 'radios' }, [[undefined, 'Не важно'], [true, 'Пустой'], [false, 'Не пустой']].map(([v, l]) => h('label', {},
+        h('input', { type: 'radio', name: 'semptyref', checked: s.conditions.emptyReferrer === v, onchange: () => { if (v === undefined) delete s.conditions.emptyReferrer; else s.conditions.emptyReferrer = v; } }), l)))),
+      cfield('keywords', 'Ключевые слова', h('input', { class: 'input', 'aria-label': 'Ключевые слова', value: s.conditions.keywords.join(', '), placeholder: 'ninja, blender', oninput: (e) => { s.conditions.keywords = splitComma(e.target.value).map((x) => x.toLowerCase()); } }), 'Часть значения параметра keyword (с учётом переименования в «Параметрах» кампании).'),
+      cfield('params', 'Параметры', h('input', { class: 'input', 'aria-label': 'Параметры', value: paramsText(s.conditions.params), placeholder: 'sub_id_3=fb,tt; source=push', oninput: (e) => { s.conditions.params = parseParamsText(e.target.value); } }), 'Точное совпадение. Поля: keyword, source, external_id, creative_id, ad_campaign_id, sub_id_1…sub_id_30. Должны совпасть все перечисленные.'),
+      cfield('ips', 'IP', h('input', { class: 'input', 'aria-label': 'IP', value: s.conditions.ips.join(', '), placeholder: '203.0.113.7, 10.0.0.0/8', oninput: (e) => { s.conditions.ips = splitList(e.target.value); } }), 'Адрес или диапазон IPv4 (CIDR).'),
+      cfield('userAgents', 'User-Agent', h('input', { class: 'input', 'aria-label': 'User-Agent', value: s.conditions.userAgents.join(', '), placeholder: 'iPhone OS 17, FBAN', oninput: (e) => { s.conditions.userAgents = splitComma(e.target.value).map((x) => x.toLowerCase()); } }), 'Часть строки User-Agent, без учёта регистра.'),
+      cfield('days', 'Дни недели', checkGroup([[1, 'Пн'], [2, 'Вт'], [3, 'Ср'], [4, 'Чт'], [5, 'Пт'], [6, 'Сб'], [7, 'Вс']], s.conditions.days, (v) => { s.conditions.days = v.map(Number); }), 'Пусто — любой день.'),
+      cfield('hours', 'Часы', h('input', { class: 'input', 'aria-label': 'Часы', value: compactHours(s.conditions.hours), placeholder: '9-21', oninput: (e) => { s.conditions.hours = parseHours(e.target.value); } }), 'Например «9-21» или «0-6, 22-23». Пусто — круглосуточно.'),
+      h('div', { class: 'field-row' },
+        cfield('dateFrom', 'Дата с', h('input', { class: 'input', type: 'date', 'aria-label': 'Дата с', value: s.conditions.dateFrom || '', oninput: (e) => { s.conditions.dateFrom = e.target.value; } })),
+        cfield('dateTo', 'Дата по', h('input', { class: 'input', type: 'date', 'aria-label': 'Дата по', value: s.conditions.dateTo || '', oninput: (e) => { s.conditions.dateTo = e.target.value; } }), 'Включительно.')),
       field('Часовой пояс расписания', h('select', { class: 'select', onchange: (e) => { s.conditions.tz = e.target.value; } },
         TIME_ZONES.map((tz) => h('option', { value: tz, selected: (s.conditions.tz || 'Europe/Paris') === tz }, tz)))))],
   ]);
@@ -791,8 +831,15 @@ function streamModal(stream, onApply, isNew = false, currentCampaignId = null) {
       s.landings = (s.landings || []).filter((l) => l.landingId);
       if (s.landings.some((l) => !(l.weight > 0))) { err.textContent = 'Веса лендингов должны быть больше нуля.'; return; }
       if (s.action !== 'offers' || !s.landings.length) delete s.landings;
-      if (!s.conditions.days.length && !s.conditions.hours.length) { delete s.conditions.days; delete s.conditions.hours; delete s.conditions.tz; }
-      else s.conditions.tz = s.conditions.tz || 'Europe/Paris';
+      const cond = s.conditions;
+      for (const k of ['referrers', 'keywords', 'ips', 'userAgents']) if (!cond[k].length) delete cond[k];
+      if (!Object.keys(cond.params).length) delete cond.params;
+      for (const k of ['dateFrom', 'dateTo']) if (!cond[k]) delete cond[k];
+      if (cond.dateFrom && cond.dateTo && cond.dateFrom > cond.dateTo) { err.textContent = 'Дата «с» позже даты «по».'; return; }
+      if (!cond.days.length && !cond.hours.length && !cond.dateFrom && !cond.dateTo) { delete cond.days; delete cond.hours; delete cond.tz; }
+      else cond.tz = cond.tz || 'Europe/Paris';
+      cond.not = cond.not.filter((k) => (k === 'emptyReferrer' ? typeof cond[k] === 'boolean' : k === 'params' ? cond.params : cond[k]?.length));
+      if (!cond.not.length) delete cond.not;
       if (s.action === 'offers') { delete s.action; delete s.url; delete s.campaignId; } else { delete s.offers; if (s.action !== 'url') delete s.url; if (s.action !== 'campaign') delete s.campaignId; }
       onApply(s); close();
     } }, 'Применить')],
