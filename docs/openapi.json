@@ -1561,7 +1561,7 @@
     "/api/settings": {
       "get": {
         "summary": "Get team settings",
-        "description": "Returns team-level settings such as buyerSharePct.",
+        "description": "Returns team-level settings: buyerSharePct and daily goals (dailyRevenueGoal, dailyProfitGoal) in the default currency, null when unset.",
         "operationId": "getSettings",
         "tags": ["settings"],
         "responses": {
@@ -1572,7 +1572,9 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "buyerSharePct": { "type": "number", "minimum": 0, "maximum": 100 }
+                    "buyerSharePct": { "type": "number", "minimum": 0, "maximum": 100 },
+                    "dailyRevenueGoal": { "type": ["number", "null"], "minimum": 0 },
+                    "dailyProfitGoal": { "type": ["number", "null"], "minimum": 0 }
                   }
                 }
               }
@@ -1582,7 +1584,7 @@
       },
       "patch": {
         "summary": "Update team settings",
-        "description": "Owner only. Updates buyerSharePct (0–100).",
+        "description": "Owner only. Partial update: buyerSharePct (0–100) and/or dailyRevenueGoal / dailyProfitGoal (number ≥ 0 or null).",
         "operationId": "updateSettings",
         "tags": ["settings"],
         "security": [{ "bearerAuth": [] }, { "cookieAuth": [] }],
@@ -1593,7 +1595,9 @@
               "schema": {
                 "type": "object",
                 "properties": {
-                  "buyerSharePct": { "type": "number", "minimum": 0, "maximum": 100 }
+                  "buyerSharePct": { "type": "number", "minimum": 0, "maximum": 100 },
+                    "dailyRevenueGoal": { "type": ["number", "null"], "minimum": 0 },
+                    "dailyProfitGoal": { "type": ["number", "null"], "minimum": 0 }
                 }
               }
             }
@@ -1614,7 +1618,7 @@
             }
           },
           "400": {
-            "description": "Invalid buyer share",
+            "description": "Invalid buyer share (invalid_buyer_share) or goal (invalid_goal)",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" }, "example": { "error": "invalid_buyer_share" } } }
           },
           "401": { "$ref": "#/components/responses/Unauthorized" },

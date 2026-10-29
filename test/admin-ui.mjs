@@ -557,6 +557,38 @@ try {
   assert.ok(!(await page.locator('body').innerText()).includes('[object'), 'no stringified DOM nodes on offers page');
   async function t10OffersArchived() { const o = (await (await fetch(server.url + '/api/offers')).json()).offers; return o['t10-o1'].archived && o['t10-o2'].archived; }
 
+  // D18: team daily goals (server-side /api/settings) → progress bars on «Доход» and «Прибыль» for «Сегодня».
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await api('/api/campaigns', { id: 'd18-goals', name: 'D18 Goals', streams: [{ name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] }] });
+  const d18Click = new URL((await fetch(server.url + '/r/d18-goals', { redirect: 'manual' })).headers.get('location')).searchParams.get('click_id');
+  await fetch(`${server.url}/postback?secret=conversion-test-secret&click_id=${d18Click}&revenue=25&currency=EUR`);
+  await page.goto(server.url + '/admin#/campaigns/d18-goals'); // the editor refreshes the cached campaign list (no reload: the key stays in memory)
+  await page.locator('.editor').waitFor();
+  await page.goto(server.url + '/admin#/dashboard');
+  await page.getByRole('heading', { name: 'Дашборд' }).waitFor();
+  await page.getByRole('combobox', { name: 'Период' }).selectOption('today');
+  await page.getByRole('combobox', { name: 'Валюта' }).selectOption('EUR');
+  await page.getByRole('button', { name: 'Цели', exact: true }).click();
+  const goalsDlg = page.getByRole('dialog', { name: 'Цели' });
+  await goalsDlg.getByLabel('План по доходу').fill('100');
+  await goalsDlg.getByLabel('План по прибыли').fill('20');
+  await goalsDlg.getByRole('button', { name: 'Сохранить' }).click();
+  await page.locator('#toast', { hasText: 'Цели сохранены' }).waitFor();
+  const d18Settings = await (await fetch(server.url + '/api/settings')).json();
+  assert.deepEqual([d18Settings.dailyRevenueGoal, d18Settings.dailyProfitGoal], [100, 20], 'goals stored on the server');
+  await page.getByRole('combobox', { name: 'Кампания' }).selectOption('d18-goals');
+  const d18Tile = (label) => page.locator('.kpi').filter({ has: page.locator('.k', { hasText: new RegExp(`^${label}$`) }) });
+  await d18Tile('Доход').locator('.goal-cap', { hasText: '25% плана' }).waitFor();
+  assert.equal(await d18Tile('Доход').locator('.goal-fill').evaluate((el) => el.style.width), '25%');
+  await d18Tile('Прибыль').locator('.goal.done .goal-cap', { hasText: 'план выполнен' }).waitFor();
+  await page.getByRole('combobox', { name: 'Валюта' }).selectOption('USD');
+  await d18Tile('Доход').locator('.v', { hasText: '31,25' }).waitFor();
+  assert.equal(await d18Tile('Доход').locator('.goal-cap').innerText(), '25% плана', 'goal converted into the selected currency');
+  await page.getByRole('combobox', { name: 'Период' }).selectOption('yesterday');
+  await d18Tile('Доход').locator('.v', { hasText: /^0,00/ }).waitFor();
+  assert.equal(await page.locator('.kpi .goal').count(), 0, 'no goal bar outside «Сегодня»');
+  await page.getByRole('combobox', { name: 'Период' }).selectOption('today');
+
   assert.deepEqual(errors, []);
   console.log('Admin UI browser test passed');
 } finally {
