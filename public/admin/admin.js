@@ -98,6 +98,10 @@ const isOwnerView = () => state.me?.user?.role === 'owner';
 const hideRev = () => Boolean(state.me?.user?.hideRevenue) && state.me.user.role !== 'owner';
 const REV_COLS = new Set(['revenue', 'profit', 'roi', 'epc', 'rpm', 'uepc', 'pendingRevenue', 'earn']);
 const ROLE_LABEL = { owner: 'Владелец', buyer: 'Баер', viewer: 'Только чтение' };
+// Offers, landings, sources and networks: a buyer changes only what they created (the server enforces it; the panel
+// only hides the controls). Without a signed-in user (ADMIN_TOKEN / fresh install) everything is editable.
+const canManage = (e) => !state.me?.user || state.me.user.role === 'owner' || (Boolean(e?.ownerId) && e.ownerId === state.me.user.id);
+const ownerBadge = (e) => (canManage(e) ? null : [' ', h('span', { class: 'badge', title: 'Только просмотр: изменить может создатель или владелец' }, e?.ownerId ? 'чужой' : 'командный')]);
 const userEmail = (id) => state.users.find((u) => u.id === id)?.email || (id ? 'удалённый пользователь' : '—');
 
 // ---------- period ----------
@@ -1125,8 +1129,10 @@ function streamModal(stream, onApply, isNew = false, currentCampaignId = null) {
   s.action = s.action || 'offers';
   s.offers = s.offers || [];
   const err = h('p', { class: 'err' });
-  const offerIds = Object.keys(state.offers);
-  const landingIds = Object.keys(state.landings);
+  // Buyers may put only team entities and their own into streams; ids already in the stream stay selectable.
+  const usable = (e) => canManage(e) || !e?.ownerId;
+  const offerIds = Object.keys(state.offers).filter((id) => usable(state.offers[id]) || s.offers.some((o) => o.offerId === id));
+  const landingIds = Object.keys(state.landings).filter((id) => usable(state.landings[id]) || (s.landings || []).some((l) => l.landingId === id));
   s.landings = s.landings || [];
   const landingsBox = h('div');
   const drawLandings = () => put(landingsBox,
@@ -1547,10 +1553,10 @@ async function pageSources() {
   const table = dataTable({
     id: 'sources', pageSize: 250,
     columns: [
-      { key: 'id', label: 'ID', fixed: true, render: (r) => h('a', { href: '#/sources', onclick: (e) => { e.preventDefault(); sourceModal(r.id, load); } }, r.id) },
+      { key: 'id', label: 'ID', fixed: true, render: (r) => (canManage(r) ? h('a', { href: '#/sources', onclick: (e) => { e.preventDefault(); sourceModal(r.id, load); } }, r.id) : r.id) },
       { key: 'menu', label: '', title: 'Меню', sortable: false, value: () => '', render: (r) => h('span', { class: 'row-actions' },
-        h('button', { title: 'Изменить', 'aria-label': 'Изменить', onclick: () => sourceModal(r.id, load) }, '✎')) },
-      { key: 'name', label: 'Название', cls: 'name', value: (r) => r.name || '', render: (r) => h('span', { title: r.name || '' }, r.name || '—') },
+        canManage(r) ? h('button', { title: 'Изменить', 'aria-label': 'Изменить', onclick: () => sourceModal(r.id, load) }, '✎') : null) },
+      { key: 'name', label: 'Название', cls: 'name', value: (r) => r.name || '', render: (r) => h('span', { title: r.name || '' }, r.name || '—', ownerBadge(r)) },
       { key: 'costModel', label: 'Модель', value: (r) => r.costModel === 'cpc' ? 'CPC' : 'Нет' },
       { key: 'cpc', label: 'CPC', num: true, render: (r) => (r.cpc ? money4(r.cpc) : '—') },
       { key: 'postback', label: 'Постбэк', value: (r) => (r.postbackUrl ? (r.postbackStatuses || []).join(', ') : '—') },
@@ -1694,8 +1700,8 @@ async function pageLandings() {
   const table = dataTable({
     id: 'landings', pageSize: 250,
     columns: [
-      { key: 'id', label: 'ID', fixed: true, render: (r) => h('a', { href: '#/landings', onclick: (e) => { e.preventDefault(); landingModal(r.id, load); } }, r.id) },
-      { key: 'name', label: 'Название', cls: 'name', value: (r) => r.name || '', render: (r) => r.name || '—' },
+      { key: 'id', label: 'ID', fixed: true, render: (r) => (canManage(r) ? h('a', { href: '#/landings', onclick: (e) => { e.preventDefault(); landingModal(r.id, load); } }, r.id) : r.id) },
+      { key: 'name', label: 'Название', cls: 'name', value: (r) => r.name || '', render: (r) => h('span', {}, r.name || '—', ownerBadge(r)) },
       { key: 'url', label: 'URL', cls: 'name', hidden: true },
       { key: 'clicks', label: 'Просмотры', title: 'Просмотры лендинга (клики, попавшие на лендинг)', num: true, render: (r) => num(r.clicks), total: (rs) => num(sum(rs, 'clicks')) },
       { key: 'lpClicks', label: 'Клики LP', title: 'Переходы с лендинга на оффер', num: true, render: (r) => num(r.lpClicks), total: (rs) => num(sum(rs, 'lpClicks')) },
@@ -1723,10 +1729,10 @@ async function pageLandings() {
 
 async function pageNetworks() {
   const table = dataTable({ id: 'networks', pageSize: 250, columns: [
-    { key: 'id', label: 'ID', fixed: true }, { key: 'name', label: 'Название', cls: 'name' },
+    { key: 'id', label: 'ID', fixed: true }, { key: 'name', label: 'Название', cls: 'name', render: (r) => h('span', {}, r.name || '—', ownerBadge(r)) },
     { key: 'clickIdParam', label: 'Click ID' }, { key: 'payoutParam', label: 'Payout' }, { key: 'offerParams', label: 'Параметры оффера', cls: 'name' },
     { key: 'notes', label: 'Заметки', cls: 'name' },
-    { key: 'actions', label: '', sortable: false, render: (r) => h('span', { class: 'row-actions' }, h('button', { onclick: () => networkModal(r, load) }, 'Изменить')) },
+    { key: 'actions', label: '', sortable: false, render: (r) => h('span', { class: 'row-actions' }, canManage(r) ? h('button', { onclick: () => networkModal(r, load) }, 'Изменить') : null) },
   ] });
   function networkModal(current, onSaved) {
     const n = { id: current?.id || '', name: current?.name || '', offerParams: current?.offerParams || '', clickIdParam: current?.clickIdParam || 'sub1', payoutParam: current?.payoutParam || 'payout', notes: current?.notes || '' };
@@ -1757,14 +1763,14 @@ async function pageOffers() {
   const table = dataTable({
     id: 'offers', selectable: true, pageSize: 250,
     columns: [
-      { key: 'id', label: 'ID', fixed: true, render: (r) => h('a', { href: '#/offers', onclick: (e) => { e.preventDefault(); offerModal(r.id, load); } }, r.id) },
+      { key: 'id', label: 'ID', fixed: true, render: (r) => (canManage(r) ? h('a', { href: '#/offers', onclick: (e) => { e.preventDefault(); offerModal(r.id, load); } }, r.id) : r.id) },
       { key: 'menu', label: '', title: 'Меню', sortable: false, value: () => '', render: (r) => h('span', { class: 'row-actions' },
-        h('button', { title: 'Изменить', 'aria-label': 'Изменить', onclick: () => offerModal(r.id, load) }, '✎'),
+        canManage(r) ? h('button', { title: 'Изменить', 'aria-label': 'Изменить', onclick: () => offerModal(r.id, load) }, '✎') : null,
         h('a', { href: '#/reports' + qs({ group: 'country', offer: r.id }), title: 'Отчёт', 'aria-label': 'Отчёт' }, '▥'),
         h('a', { href: '#/clicks' + qs({ offer: r.id }), title: 'Лог кликов', 'aria-label': 'Лог кликов' }, '☰'),
-        h('button', { title: 'Копировать', 'aria-label': 'Копировать', onclick: () => cloneEntity('offers', r.id, load) }, '⧉'),
-        archiveButton('offers', r, load)) },
-      { key: 'name', label: 'Название', cls: 'name', value: (r) => r.name || '', render: (r) => h('span', { title: r.name || '' }, r.name || '—') },
+        canManage(r) ? h('button', { title: 'Копировать', 'aria-label': 'Копировать', onclick: () => cloneEntity('offers', r.id, load) }, '⧉') : null,
+        canManage(r) ? archiveButton('offers', r, load) : null) },
+      { key: 'name', label: 'Название', cls: 'name', value: (r) => r.name || '', render: (r) => h('span', { title: r.name || '' }, r.name || '—', ownerBadge(r)) },
       { key: 'group', label: 'Группа', value: (r) => r.group || '', render: (r) => r.group || '—' },
       { key: 'url', label: 'URL', cls: 'name', hidden: true, render: (r) => h('span', { title: r.url }, r.url) },
       { key: 's2s', label: 'S2S', value: (r) => (r.postbackUrl ? 'да' : 'нет') },
