@@ -989,19 +989,23 @@ const GROUPS = [
 ];
 async function pageReports(params) {
   await loadRefs();
-  const f = { group: params.get('group') || 'campaign', campaign: params.get('campaign') || '', offer: params.get('offer') || '', country: params.get('country') || '', stream: params.get('stream') || '', subid: params.get('subid') || '' };
+  const f = { group: params.get('group') || 'campaign', campaign: params.get('campaign') || '', offer: params.get('offer') || '', country: params.get('country') || '', stream: params.get('stream') || '', subid: params.get('subid') || '', field: params.get('field') || '' };
   const note = h('p', { class: 'muted' });
   const holder = h('div');
   let table = null;
   const sync = () => { const next = '#/reports' + qs(f); if (location.hash !== next) history.replaceState(null, '', next); };
   const presets = h('div', { class: 'toolbar' });
-  const drawPresets = () => put(presets, GROUPS.map(([k, l]) => h('button', { class: 'chip-btn' + (f.group === k ? ' on' : ''), onclick: () => { f.group = k; drawPresets(); load(); } }, l)));
+  const PARAM_FIELDS = ['keyword', 'source', 'external_id', 'creative_id', 'ad_campaign_id', ...Array.from({ length: 30 }, (_, i) => `sub_id_${i + 1}`)];
+  const paramSel = h('select', { class: 'select', 'aria-label': 'Параметр', onchange: (e) => { f.field = e.target.value; drawPresets(); load(); } },
+    h('option', { value: '' }, 'Параметр'), PARAM_FIELDS.map((n) => h('option', { value: n, selected: f.field === n }, n)));
+  const drawPresets = () => put(presets, GROUPS.map(([k, l]) => h('button', { class: 'chip-btn' + (f.group === k && !f.field ? ' on' : ''), onclick: () => { f.group = k; f.field = ''; paramSel.value = ''; drawPresets(); load(); } }, l)));
   drawPresets();
   const sel = (key, label, options) => h('select', { class: 'select', 'aria-label': label, onchange: (e) => { f[key] = e.target.value; load(); } },
     h('option', { value: '' }, label), options.map(([v, l]) => h('option', { value: v, selected: f[key] === v }, l)));
   const txt = (key, label) => h('input', { class: 'input', value: f[key], placeholder: label, 'aria-label': label, style: 'width:130px', onchange: (e) => { f[key] = e.target.value.trim(); load(); } });
   put(view, h('h1', {}, 'Отчёт'), presets,
     h('div', { class: 'toolbar' },
+      paramSel,
       sel('campaign', 'Все кампании', Object.entries(state.campaigns).map(([id, c]) => [id, c.name || id])),
       sel('offer', 'Все офферы', Object.keys(state.offers).map((id) => [id, id])),
       txt('country', 'Страна'), txt('stream', 'Поток'), txt('subid', 'Sub ID'),
@@ -1017,7 +1021,11 @@ async function pageReports(params) {
     try {
       let rows; let drill = null;
       note.textContent = '';
-      if (prop) {
+      if (f.field) {
+        const s = await api('/stats/params' + qs({ field: f.field, campaign: f.campaign, from, to }));
+        rows = (s.rows || []).map((x) => ({ id: x.value || '(не передан)', clicks: x.clicks || 0, conversions: x.conversions || 0, revenue: x.revenue || 0, cost: x.cost || 0, profit: x.profit || 0, roi: x.roi || 0 }));
+        note.textContent = 'Для отчёта по параметру применяются только кампания и период.';
+      } else if (prop) {
         const s = await api('/stats' + qs({ from, to, campaign: f.campaign, offer: f.offer, country: f.country, stream: f.stream, subid: f.subid }));
         rows = groupRows(s[prop]);
         if (key === 'campaign') drill = (r) => ({ group: 'stream', campaign: r.id });
@@ -1041,7 +1049,7 @@ async function pageReports(params) {
       table = dataTable({
         id: 'report-' + key, pageSize: 100,
         rows,
-        columns: [{ key: 'id', label, fixed: true, cls: 'name', value: nameOf, render: (r) => (drill ? h('a', { href: '#/reports' + qs({ ...f, ...drill(r) }), title: 'Детализировать' }, nameOf(r)) : nameOf(r)) },
+        columns: [{ key: 'id', label: f.field ? 'Значение' : label, fixed: true, cls: 'name', value: nameOf, render: (r) => (drill ? h('a', { href: '#/reports' + qs({ ...f, ...drill(r) }), title: 'Детализировать' }, nameOf(r)) : nameOf(r)) },
           ...metricCols({ rpm: true })],
       });
       put(holder, table);
@@ -1069,6 +1077,15 @@ function pageLog(kind, params) {
     { key: 'stream', label: 'Поток' }, { key: 'offerId', label: 'Оффер' }, { key: 'country', label: 'Страна' },
     { key: 'referrer', label: 'Реферер', cls: 'name' }, { key: 'path', label: 'Путь', hidden: true },
     { key: 'userAgent', label: 'User Agent', cls: 'name', hidden: true },
+    { key: 'sub_id_1', label: 'Sub ID 1', hidden: true, value: (r) => r.params?.sub_id_1 || '', render: (r) => r.params?.sub_id_1 || '' },
+    { key: 'sub_id_2', label: 'Sub ID 2', hidden: true, value: (r) => r.params?.sub_id_2 || '', render: (r) => r.params?.sub_id_2 || '' },
+    { key: 'sub_id_3', label: 'Sub ID 3', hidden: true, value: (r) => r.params?.sub_id_3 || '', render: (r) => r.params?.sub_id_3 || '' },
+    { key: 'sub_id_4', label: 'Sub ID 4', hidden: true, value: (r) => r.params?.sub_id_4 || '', render: (r) => r.params?.sub_id_4 || '' },
+    { key: 'sub_id_5', label: 'Sub ID 5', hidden: true, value: (r) => r.params?.sub_id_5 || '', render: (r) => r.params?.sub_id_5 || '' },
+    { key: 'source', label: 'Source', hidden: true, value: (r) => r.params?.source || '', render: (r) => r.params?.source || '' },
+    { key: 'creative_id', label: 'Creative ID', hidden: true, value: (r) => r.params?.creative_id || '', render: (r) => r.params?.creative_id || '' },
+    { key: 'ad_campaign_id', label: 'Ad Campaign ID', hidden: true, value: (r) => r.params?.ad_campaign_id || '', render: (r) => r.params?.ad_campaign_id || '' },
+    { key: 'cost', label: 'Расход', num: true, hidden: true, value: (r) => r.cost ?? '', render: (r) => (r.cost != null ? money(r.cost) : '') },
   ] : [
     { key: 'at', label: 'Дата и время', fixed: true, render: (r) => dt(r.at) },
     { key: 'id', label: 'Click ID', cls: 'mono', render: (r) => h('span', { title: r.id }, r.id.slice(0, 13) + '…') },
