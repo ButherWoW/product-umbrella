@@ -1073,7 +1073,7 @@ const server = http.createServer(async (req, res) => {
       if (url.pathname === '/dashboard') { res.writeHead(302, { location: `${basePath}/admin` }); return res.end(); }
       return json(res, 401, { error: 'login_required' });
     }
-    if (url.pathname === '/stats' || url.pathname.startsWith('/stats/') || url.pathname === '/api/clicks' || url.pathname === '/api/conversions') {
+    if (url.pathname === '/stats' || url.pathname.startsWith('/stats/') || url.pathname === '/api/clicks' || url.pathname === '/api/conversions' || url.pathname === '/api/bots') {
       req.scope = campaignScope(req, url.searchParams.get('campaign') || null);
       if (req.scope.forbidden) return json(res, 403, { error: 'campaign_not_yours' });
     }
@@ -1332,6 +1332,43 @@ const server = http.createServer(async (req, res) => {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       return json(res, 200, await readEventLog({ kind: 'conversions', params: url.searchParams, eventsFile, db, allowedCampaigns: req.scope?.allowed || null,
         onFallback: (error) => console.warn('[db] conversion log fallback:', error.message) }));
+    }
+    if (url.pathname === '/api/bots' && req.method === 'GET') {
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      const botCampaign = url.searchParams.get('campaign') || null;
+      const botFrom = url.searchParams.get('from') || null;
+      const botTo = url.searchParams.get('to') || null;
+      const rawLimit = Number(url.searchParams.get('limit') || 100);
+      const limit = Number.isInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 1000) : 100;
+      if (botFrom && !/^\d{4}-\d{2}-\d{2}$/.test(botFrom)) return json(res, 400, { error: 'invalid_from_date' });
+      if (botTo && !/^\d{4}-\d{2}-\d{2}$/.test(botTo)) return json(res, 400, { error: 'invalid_to_date' });
+      try {
+        const lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+        const fromMs = botFrom ? Date.parse(`${botFrom}T00:00:00Z`) : null;
+        const toMs = botTo ? Date.parse(`${botTo}T23:59:59Z`) : null;
+        const bots = lines.filter((item) => {
+          if (item.type !== 'bot') return false;
+          if (botCampaign && item.campaign !== botCampaign) return false;
+          if (req.scope?.allowed && !req.scope.allowed.includes(item.campaign)) return false;
+          const t = item.at ? Date.parse(item.at) : null;
+          if (fromMs !== null && (t === null || t < fromMs)) return false;
+          if (toMs !== null && (t === null || t > toMs)) return false;
+          return true;
+        }).reverse().slice(0, limit).map((b) => ({
+          at: b.at ?? null,
+          campaign: b.campaign ?? null,
+          offerId: b.offerId ?? null,
+          stream: b.stream ?? null,
+          reason: b.reason ?? 'user_agent',
+          isp: b.isp ?? null,
+          userAgent: b.userAgent ? String(b.userAgent).slice(0, 200) : null,
+          ip: b.ip ?? null,
+        }));
+        return json(res, 200, { bots });
+      } catch (e) {
+        if (e.code === 'ENOENT') return json(res, 200, { bots: [] });
+        throw e;
+      }
     }
     if (url.pathname === '/lp/click' && req.method === 'GET') {
       const clickId = url.searchParams.get('click_id') || '';

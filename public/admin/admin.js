@@ -425,7 +425,7 @@ async function pageDashboard() {
     const { from, to } = periodRange();
     const campaign = campSel.value || null;
     try {
-      const [s, series, recent, team] = await Promise.all([api('/stats' + qs({ from, to, campaign })), timeseries({ campaign, from, to }), api('/api/clicks' + qs({ from, to, campaign, limit: 10 })).catch(() => ({ clicks: [] })), api('/api/settings').catch(() => ({ buyerSharePct: 35 }))]);
+      const [s, series, recent, team, botsData] = await Promise.all([api('/stats' + qs({ from, to, campaign })), timeseries({ campaign, from, to }), api('/api/clicks' + qs({ from, to, campaign, limit: 10 })).catch(() => ({ clicks: [] })), api('/api/settings').catch(() => ({ buyerSharePct: 35 })), api('/api/bots' + qs({ from, to, campaign, limit: 1000 })).catch(() => ({ bots: [] }))]);
       const sharePct = Number(team.buyerSharePct) || 0;
       const profit = (s.revenue || 0) - (s.cost || 0);
       // The buyer earns a share of positive net profit; a loss means 0, not a negative payout.
@@ -443,7 +443,9 @@ async function pageDashboard() {
       put(body, 
         h('div', { class: 'kpis' }, kpi('Клики', num(s.clicks), 'var(--k1)'), kpi('Уник. клики', num(s.uniqueClicks), 'var(--k2)'), kpi('Конверсии', num(s.conversions), 'var(--k3)'), kpi('CR', pct(ratio(s.conversions, s.clicks)), 'var(--k2)'),
           kpi('Доход', money(s.revenue), 'var(--k5)'), kpi('Расход', money(s.cost || 0), 'var(--k4)'), kpi('Прибыль', h('span', { class: profit >= 0 ? '' : 'neg' }, money(profit)), 'var(--k8)'), kpi('ROI', pct(ratio(profit, s.cost || 0)), 'var(--k9)'), earningsTile,
-          kpi('EPC', money4(ratio(s.revenue, s.clicks)), 'var(--k6)'), kpi('RPM', money(ratio(s.revenue * 1000, s.clicks)), 'var(--k7)')),
+          kpi('EPC', money4(ratio(s.revenue, s.clicks)), 'var(--k6)'), kpi('RPM', money(ratio(s.revenue * 1000, s.clicks)), 'var(--k7)'),
+          botsData.bots?.length > 0 ? h('a', { href: '#/botlog' + (campaign ? qs({ campaign }) : ''), style: 'text-decoration:none' },
+            h('div', { class: 'kpi', style: 'background:var(--bad)' }, h('div', { class: 'k' }, 'Боты'), h('div', { class: 'v' }, botsData.bots.length >= 1000 ? '1000+' : num(botsData.bots.length)))) : null),
         ratesNote(),
         h('div', { class: 'card', style: 'margin-bottom:14px' }, lineChart([
           { key: 'clicks', label: 'Клики', color: '#4d86f0', values: series.map((p) => p.clicks) },
@@ -1236,6 +1238,47 @@ async function pageUsers() {
   return () => table.detach();
 }
 
+// ---------- bot log ----------
+function pageBotLog(params) {
+  const f = { campaign: params.get('campaign') || '' };
+  const holder = h('div');
+  let table = null;
+  const sel = (key, label, options) => h('select', { class: 'select', 'aria-label': label, onchange: (e) => { f[key] = e.target.value; load(); } },
+    h('option', { value: '' }, label), options.map(([v, l]) => h('option', { value: v, selected: f[key] === v }, l)));
+  const toolbar = h('div', { class: 'toolbar' });
+  put(view, h('h1', {}, 'Лог ботов'), toolbar, holder);
+  const REASONS = { user_agent: 'Бот по User-Agent', datacenter: 'Дата-центр' };
+  const columns = [
+    { key: 'at', label: 'Дата и время', fixed: true, render: (r) => dt(r.at) },
+    { key: 'campaign', label: 'Кампания', cls: 'name', render: (r) => h('a', { href: '#/campaigns/' + encodeURIComponent(r.campaign || '') }, state.campaigns[r.campaign]?.name || r.campaign || '—') },
+    { key: 'reason', label: 'Причина', render: (r) => REASONS[r.reason] || r.reason || 'Бот по User-Agent' },
+    { key: 'isp', label: 'Провайдер' },
+    { key: 'userAgent', label: 'User-Agent', cls: 'name' },
+    { key: 'ip', label: 'IP' },
+    { key: 'offerId', label: 'Оффер', hidden: true },
+    { key: 'stream', label: 'Поток', hidden: true },
+  ];
+  loadRefs().then(() => {
+    put(toolbar,
+      sel('campaign', 'Все кампании', Object.entries(state.campaigns).map(([id, c]) => [id, c.name || id])),
+      periodControl(() => load()),
+      h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'),
+      h('button', { class: 'btn square', title: 'Колонки', 'aria-label': 'Колонки', onclick: () => table?.chooser() }, '⚙'));
+    load();
+  });
+  async function load() {
+    const next = '#/botlog' + qs(f);
+    if (location.hash !== next) history.replaceState(null, '', next);
+    try {
+      const r = await api('/api/bots' + qs({ ...f, ...periodRange(), limit: 1000 }));
+      table?.detach();
+      table = dataTable({ id: 'log-botlog', columns, rows: r.bots || [], serverPaging: null, pageSize: 100, empty: 'Ботов за период нет' });
+      put(holder, table);
+    } catch (e) { put(holder, h('p', { class: 'err' }, 'Ошибка загрузки: ' + e.message)); }
+  }
+  return () => table?.detach();
+}
+
 // ---------- router ----------
 let cleanup = null;
 async function route() {
@@ -1259,6 +1302,7 @@ async function route() {
     else if (section === 'landings') cleanup = await pageLandings();
     else if (section === 'reports') cleanup = await pageReports(params);
     else if (section === 'clicks' || section === 'conversions') cleanup = pageLog(section, params);
+    else if (section === 'botlog') cleanup = pageBotLog(params);
     else if (section === 'users') cleanup = await pageUsers();
     else cleanup = await pageDashboard();
   } catch (e) { put(view, h('p', { class: 'err' }, 'Ошибка: ' + e.message)); }
