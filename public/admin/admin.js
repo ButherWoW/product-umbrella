@@ -1130,6 +1130,37 @@ async function pageCampaignEditor(id) {
     finally { saveBtn.disabled = false; }
   }
 
+  // Keitaro «Очистка статистики»: owners (or the admin key) only; the campaign id typed by hand confirms it.
+  function dangerZone() {
+    const c = { mode: 'all', before: '', typed: '' };
+    const msg = h('p', { class: 'err', role: 'status' });
+    const dateInput = h('input', { class: 'input', type: 'date', 'aria-label': 'Удалить данные до даты', disabled: true, oninput: (e) => { c.before = e.target.value; } });
+    const btn = h('button', { class: 'btn danger', disabled: true, onclick: async () => {
+      msg.textContent = '';
+      if (c.mode === 'before' && !c.before) { msg.textContent = 'Укажите дату.'; return; }
+      btn.disabled = true;
+      try {
+        const r = await api('/api/campaigns/' + encodeURIComponent(d.id) + '/clear-stats', { method: 'POST', body: { confirm: c.typed, ...(c.mode === 'before' ? { before: c.before } : {}) } });
+        const x = r.removed || {};
+        toast(`Удалено: ${num(x.clicks)} кликов, ${num(x.conversions)} конверсий, ${num(x.bots)} ботов`);
+        confirmInput.value = ''; c.typed = '';
+        loadStreamStats();
+      } catch (e) { msg.textContent = ({ owner_only: 'Очищать статистику может только владелец.', confirm_mismatch: 'Идентификатор введён неверно.', invalid_before_date: 'Неверная дата.' })[e.message] || 'Не удалось: ' + e.message; }
+      finally { btn.disabled = c.typed !== d.id; }
+    } }, 'Очистить статистику');
+    const confirmInput = h('input', { class: 'input', 'aria-label': 'Идентификатор кампании для подтверждения', placeholder: d.id, autocomplete: 'off',
+      oninput: (e) => { c.typed = e.target.value.trim(); btn.disabled = c.typed !== d.id; } });
+    return h('section', { class: 'danger-zone', 'aria-label': 'Очистить статистику' },
+      h('h3', {}, 'Очистить статистику'),
+      h('p', { class: 'muted' }, 'Удаляет клики, конверсии, клики по лендингам и ботов этой кампании из журнала и PostgreSQL. Отменить нельзя — вернуть можно только из ночного бэкапа.'),
+      field('Что удалить', h('div', { class: 'radios' },
+        h('label', {}, h('input', { type: 'radio', name: 'cclear', checked: true, onchange: () => { c.mode = 'all'; dateInput.disabled = true; } }), 'Всё'),
+        h('label', {}, h('input', { type: 'radio', name: 'cclear', onchange: () => { c.mode = 'before'; dateInput.disabled = false; } }), 'Старше даты')), null),
+      field('Клики до даты (UTC)', dateInput, 'Удаляются клики раньше этой даты вместе с их конверсиями.'),
+      field(`Введите «${d.id}» для подтверждения`, confirmInput),
+      btn, msg);
+  }
+
   put(view, 
     h('div', { class: 'editor-head' }, nameInput,
       h('div', { class: 'toolbar', style: 'margin:0' }, saveBtn,
@@ -1141,7 +1172,7 @@ async function pageCampaignEditor(id) {
         h('a', { class: 'btn', href: '#/campaigns' }, 'К списку'))),
     err,
     h('div', { class: 'editor' },
-      h('div', { class: 'left' }, left),
+      h('div', { class: 'left' }, left, !isNew && (isOwnerView() || !state.me?.user) ? dangerZone() : null),
       h('div', { class: 'right' },
         h('div', { class: 'toolbar' },
           h('button', { class: 'btn primary', onclick: () => streamModal({ name: `Flow ${d.streams.length + 1}`, type: 'regular', weight: 1, conditions: {}, offers: [] }, (s) => { d.streams.push(s); mark(); drawStreams(); }, true, d.id) }, 'Создать поток'),

@@ -790,6 +790,34 @@ try {
   await d18Tile('Доход').locator('.v', { hasText: /^0,00/ }).waitFor();
   assert.equal(await page.locator('.kpi .goal').count(), 0, 'no goal bar outside «Сегодня»');
   await page.getByRole('combobox', { name: 'Период' }).selectOption('today');
+  // Danger zone «Очистить статистику»: typed campaign id unlocks the button; clears only this campaign.
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await api('/api/campaigns', { id: 'ui-clear', name: 'UI Clear', streams: [{ name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] }] });
+  for (let i = 0; i < 2; i++) await fetch(server.url + '/r/ui-clear', { redirect: 'manual' });
+  const flowsBefore = (await (await fetch(server.url + '/stats?campaign=ui-flows', { headers: { authorization: 'Bearer ' + TOKEN } })).json()).clicks;
+  await page.goto(server.url + '/admin#/campaigns/ui-clear');
+  const zone = page.getByRole('region', { name: 'Очистить статистику' });
+  await zone.waitFor();
+  const clearBtn = zone.getByRole('button', { name: 'Очистить статистику' });
+  assert.ok(await clearBtn.isDisabled(), 'locked until the id is typed');
+  await zone.getByLabel('Идентификатор кампании для подтверждения').fill('ui-clea');
+  assert.ok(await clearBtn.isDisabled(), 'a wrong id keeps it locked');
+  await zone.getByLabel('Идентификатор кампании для подтверждения').fill('ui-clear');
+  assert.ok(await clearBtn.isEnabled());
+  await clearBtn.click();
+  const clearKey = page.getByRole('dialog', { name: 'Ключ администратора' });
+  if (await clearKey.waitFor({ timeout: 1500 }).then(() => true, () => false)) {
+    await clearKey.locator('input[type=password]').fill(TOKEN);
+    await clearKey.getByRole('button', { name: 'Сохранить' }).click();
+    await clearBtn.click();
+  }
+  await page.locator('#toast', { hasText: 'Удалено: 2 кликов' }).waitFor();
+  const statsOf = async (id) => (await (await fetch(server.url + '/stats?campaign=' + id, { headers: { authorization: 'Bearer ' + TOKEN } })).json()).clicks;
+  assert.equal(await statsOf('ui-clear'), 0, 'campaign stats cleared');
+  assert.equal(await statsOf('ui-flows'), flowsBefore, 'other campaign untouched');
+  assert.equal(await zone.getByLabel('Идентификатор кампании для подтверждения').inputValue(), '', 'confirmation is reset');
+  assert.ok(await clearBtn.isDisabled());
+  assert.ok((await page.evaluate(() => document.documentElement.scrollWidth)) <= 1280, 'no horizontal scroll');
 
   assert.deepEqual(errors, []);
   console.log('Admin UI browser test passed');
