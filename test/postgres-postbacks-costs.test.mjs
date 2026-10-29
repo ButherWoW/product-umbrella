@@ -16,7 +16,7 @@ test('PostgreSQL: postback journals, S2S retries and manual cost updates', { ski
   const mock = await startNetworkMock(mockDir);
   const start = async () => {
     const dir = await mkdtemp(join(tmpdir(), 'umbrella-pgpb-')); dirs.push(dir);
-    return startTestServer(dir, { DATABASE_URL: databaseUrl, REQUIRE_POSTGRES: '1', ADMIN_TOKEN: TOKEN, S2S_RETRY_MS: '20', NODE_EXTRA_CA_CERTS: mock.cert });
+    return startTestServer(dir, { DATABASE_URL: databaseUrl, REQUIRE_POSTGRES: '1', ADMIN_TOKEN: TOKEN, S2S_RETRY_MS: '20', S2S_ALLOW_PRIVATE: '1', NODE_EXTRA_CA_CERTS: mock.cert });
   };
   t.after(async () => { await mock.stop(); for (const dir of dirs) await rm(dir, { recursive: true, force: true }); });
   const run = Date.now().toString(36);
