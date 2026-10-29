@@ -425,7 +425,7 @@ async function pageDashboard() {
     const { from, to } = periodRange();
     const campaign = campSel.value || null;
     try {
-      const [s, series, recent, team] = await Promise.all([api('/stats' + qs({ from, to, campaign })), timeseries({ campaign, from, to }), api('/api/clicks' + qs({ from, to, campaign, limit: 10 })).catch(() => ({ clicks: [] })), api('/api/settings').catch(() => ({ buyerSharePct: 35 }))]);
+      const [s, series, recent, team, bots] = await Promise.all([api('/stats' + qs({ from, to, campaign })), timeseries({ campaign, from, to }), api('/api/clicks' + qs({ from, to, campaign, limit: 10 })).catch(() => ({ clicks: [] })), api('/api/settings').catch(() => ({ buyerSharePct: 35 })), api('/stats/bots' + qs({ from, to, campaign })).catch(() => ({ total: 0, byCampaign: {} }))]);
       const sharePct = Number(team.buyerSharePct) || 0;
       const profit = (s.revenue || 0) - (s.cost || 0);
       // The buyer earns a share of positive net profit; a loss means 0, not a negative payout.
@@ -443,7 +443,8 @@ async function pageDashboard() {
       put(body, 
         h('div', { class: 'kpis' }, kpi('Клики', num(s.clicks), 'var(--k1)'), kpi('Уник. клики', num(s.uniqueClicks), 'var(--k2)'), kpi('Конверсии', num(s.conversions), 'var(--k3)'), kpi('CR', pct(ratio(s.conversions, s.clicks)), 'var(--k2)'),
           kpi('Доход', money(s.revenue), 'var(--k5)'), kpi('Расход', money(s.cost || 0), 'var(--k4)'), kpi('Прибыль', h('span', { class: profit >= 0 ? '' : 'neg' }, money(profit)), 'var(--k8)'), kpi('ROI', pct(ratio(profit, s.cost || 0)), 'var(--k9)'), earningsTile,
-          kpi('EPC', money4(ratio(s.revenue, s.clicks)), 'var(--k6)'), kpi('RPM', money(ratio(s.revenue * 1000, s.clicks)), 'var(--k7)')),
+          kpi('EPC', money4(ratio(s.revenue, s.clicks)), 'var(--k6)'), kpi('RPM', money(ratio(s.revenue * 1000, s.clicks)), 'var(--k7)'),
+          bots.total > 0 ? kpi('Боты', num(bots.total), 'var(--bad)') : null),
         ratesNote(),
         h('div', { class: 'card', style: 'margin-bottom:14px' }, lineChart([
           { key: 'clicks', label: 'Клики', color: '#4d86f0', values: series.map((p) => p.clicks) },
@@ -528,6 +529,8 @@ async function pageCampaigns() {
       { key: 'totalCap', label: 'Общий кап', num: true, hidden: true, render: (r) => r.totalCap ?? '—' },
       { key: 'revenueCap', label: 'Кап дохода', num: true, hidden: true, render: (r) => (r.revenueCap == null ? '—' : money(r.revenueCap)) },
       { key: 'botFilter', label: 'Бот-фильтр', hidden: true, value: (r) => (r.botFilter ? 'да' : 'нет') },
+      { key: 'bots', label: 'Боты', num: true, hidden: true, render: (r) => num(r.bots || 0), total: (rs) => num(rs.reduce((t, r) => t + (r.bots || 0), 0)) },
+      { key: 'botPct', label: 'Бот %', num: true, hidden: true, value: (r) => (r.clicks + (r.bots || 0) > 0 ? (r.bots || 0) / (r.clicks + (r.bots || 0)) : 0), render: (r) => { const t = r.clicks + (r.bots || 0); return pct(t > 0 ? (r.bots || 0) / t : 0); } },
       { key: 'geos', label: 'Гео', hidden: true, value: (r) => (r.allowGeos || []).join(', ') || 'все' },
       { key: 'devices', label: 'Устройства', hidden: true, value: (r) => (r.allowDevices || []).join(', ') || 'все' },
     ],
@@ -555,9 +558,9 @@ async function pageCampaigns() {
   async function load() {
     try {
       await loadRefs();
-      const s = await api('/stats' + qs(periodRange()));
+      const [s, bots] = await Promise.all([api('/stats' + qs(periodRange())), api('/stats/bots' + qs(periodRange())).catch(() => ({ total: 0, byCampaign: {} }))]);
       let rows = Object.entries(state.campaigns).map(([id, c]) => ({ id, ...c, name: c.name || id, streams: (c.streams || []).length,
-        clicks: s.byCampaign[id]?.clicks || 0, uniqueClicks: s.byCampaign[id]?.uniqueClicks || 0, cost: s.byCampaign[id]?.cost || 0, conversions: s.byCampaign[id]?.conversions || 0, revenue: s.byCampaign[id]?.revenue || 0 }));
+        clicks: s.byCampaign[id]?.clicks || 0, uniqueClicks: s.byCampaign[id]?.uniqueClicks || 0, cost: s.byCampaign[id]?.cost || 0, conversions: s.byCampaign[id]?.conversions || 0, revenue: s.byCampaign[id]?.revenue || 0, bots: bots.byCampaign[id] || 0 }));
       const f = stateFilter.value;
       if (f === 'active') rows = rows.filter((r) => r.active);
       if (f === 'inactive') rows = rows.filter((r) => !r.active);

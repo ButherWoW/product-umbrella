@@ -1642,6 +1642,34 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { paths });
       } catch (e) { if (e.code === 'ENOENT') return json(res, 200, { paths: [] }); throw e; }
     }
+    // Bot report: GET /stats/bots?campaign=&from=&to=
+    if (url.pathname === '/stats/bots' && req.method === 'GET') {
+      const botCampaign = url.searchParams.get('campaign') || null;
+      const botFrom = url.searchParams.get('from') || null;
+      const botTo = url.searchParams.get('to') || null;
+      if (botFrom && !/^\d{4}-\d{2}-\d{2}$/.test(botFrom)) return json(res, 400, { error: 'invalid_from_date' });
+      if (botTo && !/^\d{4}-\d{2}-\d{2}$/.test(botTo)) return json(res, 400, { error: 'invalid_to_date' });
+      try {
+        const lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map(JSON.parse);
+        const fromMs = botFrom ? Date.parse(`${botFrom}T00:00:00Z`) : null;
+        const toMs = botTo ? Date.parse(`${botTo}T23:59:59Z`) : null;
+        const bots = lines.filter((item) => {
+          if (item.type !== 'bot') return false;
+          if (botCampaign && item.campaign !== botCampaign) return false;
+          if (req.scope?.allowed && !req.scope.allowed.includes(item.campaign)) return false;
+          const t = item.at ? Date.parse(item.at) : null;
+          if (fromMs !== null && (t === null || t < fromMs)) return false;
+          if (toMs !== null && (t === null || t > toMs)) return false;
+          return true;
+        });
+        const byCampaign = {};
+        for (const b of bots) byCampaign[b.campaign] = (byCampaign[b.campaign] || 0) + 1;
+        return json(res, 200, { total: bots.length, byCampaign });
+      } catch (e) {
+        if (e.code === 'ENOENT') return json(res, 200, { total: 0, byCampaign: {} });
+        throw e;
+      }
+    }
     return json(res, 404, { error: 'not_found' });
   } catch (error) {
     return json(res, error.statusCode || 500, { error: error.statusCode ? error.message : 'internal_error' });
