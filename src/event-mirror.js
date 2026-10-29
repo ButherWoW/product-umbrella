@@ -15,15 +15,15 @@ export function createEventMirror({ query, onError = () => {} }) {
     const task = lock(payload.clickId, async () => {
       if (type === 'click') {
         await query(`INSERT INTO clicks
-          (click_id, campaign, offer_id, path, referrer, user_agent, subid, country, ip, stream, params, cost, landing_id, is_unique_campaign, is_unique_stream, is_unique_global, device, os, browser, language, asn, isp, datacenter, revenue, created_at)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25) ON CONFLICT DO NOTHING`,
+          (click_id, campaign, offer_id, path, referrer, user_agent, subid, country, ip, stream, params, cost, landing_id, is_unique_campaign, is_unique_stream, is_unique_global, device, os, browser, language, asn, isp, datacenter, connection, revenue, created_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26) ON CONFLICT DO NOTHING`,
         [payload.clickId, payload.campaign, payload.offerId, payload.path ?? null,
           payload.referrer ?? null, payload.userAgent ?? null, payload.subid ?? null,
           payload.country ?? null, payload.ip ?? null, payload.stream ?? null,
           payload.params ? JSON.stringify(payload.params) : null, payload.cost ?? 0, payload.landingId ?? null,
           payload.uniqueCampaign ?? true, payload.uniqueStream ?? true, payload.uniqueGlobal ?? true,
           payload.device ?? null, payload.os ?? null, payload.browser ?? null, payload.language ?? null,
-          payload.asn ?? null, payload.isp ?? null, payload.datacenter ?? null, payload.revenue ?? 0, at]);
+          payload.asn ?? null, payload.isp ?? null, payload.datacenter ?? null, payload.connection ?? null, payload.revenue ?? 0, at]);
       } else if (type === 'lp_click') {
         // First landing click wins; repeats keep the original time.
         await query('UPDATE clicks SET lp_clicked_at = COALESCE(lp_clicked_at, $2) WHERE click_id = $1', [payload.clickId, at]);

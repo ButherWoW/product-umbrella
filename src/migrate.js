@@ -91,6 +91,8 @@ for (const column of ['device', 'os', 'browser', 'language']) await db.query(`AL
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS asn INTEGER`);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS isp TEXT`);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS datacenter BOOLEAN`);
+// Connection type from the ASN: mobile | broadband | datacenter (NULL without GEOIP_ASN_DB).
+await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS connection TEXT`);
 for (const column of ['is_unique_campaign', 'is_unique_stream', 'is_unique_global']) await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS ${column} BOOLEAN NOT NULL DEFAULT true`);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS params JSONB`);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS cost NUMERIC(12,6) NOT NULL DEFAULT 0`);
