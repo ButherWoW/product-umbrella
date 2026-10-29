@@ -71,6 +71,21 @@ try {
   await page.locator('.editor-head .btn.primary').click();
   await page.locator('#toast', { hasText: 'Сохранено' }).waitFor();
 
+  // Offer conversion cap: cap, its time zone and the alternative offer from the offer dialog.
+  await api('/api/offers', { id: 'ui-alt', url: 'https://alt.example.net/', name: 'Alt offer' });
+  await page.goto(server.url + '/admin#/offers');
+  await page.locator('table.grid tbody tr', { hasText: 'offer-1' }).getByRole('button', { name: 'Изменить' }).click();
+  const offerDialog = page.getByRole('dialog', { name: 'Редактирование оффера' });
+  await offerDialog.getByRole('tab', { name: 'Настройки' }).click();
+  await offerDialog.getByLabel('Кап конверсий в день').fill('5');
+  await offerDialog.getByLabel('Часовой пояс капа').selectOption('Europe/Paris');
+  await offerDialog.getByLabel('Запасной оффер').selectOption('ui-alt');
+  await offerDialog.getByRole('button', { name: 'Сохранить' }).click();
+  await page.locator('#toast', { hasText: 'Сохранено' }).waitFor();
+  const savedOffer = (await (await fetch(server.url + '/api/offers')).json()).offers['offer-1'];
+  assert.deepEqual([savedOffer.conversionCap, savedOffer.capTz, savedOffer.altOfferId], [5, 'Europe/Paris', 'ui-alt']);
+  await api('/api/offers/offer-1', { conversionCap: null, altOfferId: null }, 'PATCH');
+
 
   // Currency switch on the dashboard: 25 USD = 20 EUR = 2000 RUB at the fixed test rates.
   await page.goto(server.url + '/admin#/dashboard');

@@ -156,7 +156,7 @@ function ratesNote() {
 
 // ---------- change history ----------
 const ACTION_LABEL = { create: 'Создание', update: 'Изменение', delete: 'Удаление', pause: 'Автопауза', login: 'Вход' };
-const FIELD_LABEL = { name: 'Название', active: 'Состояние', dailyCap: 'Дневной кап', totalCap: 'Общий кап', revenueCap: 'Кап дохода', capUrl: 'URL капа', streams: 'Потоки',
+const FIELD_LABEL = { conversionCap: 'Кап конверсий', capTz: 'Часовой пояс капа', altOfferId: 'Запасной оффер', name: 'Название', active: 'Состояние', dailyCap: 'Дневной кап', totalCap: 'Общий кап', revenueCap: 'Кап дохода', capUrl: 'URL капа', streams: 'Потоки',
   allowGeos: 'Страны', allowDevices: 'Устройства', allowOS: 'ОС', allowBrowsers: 'Браузеры', blockedIps: 'Черный список IP', allowedIps: 'Белый список IP', botFilter: 'Фильтр ботов', datacenterAsBot: 'Дата-центры = боты',
   dedupeWindow: 'Уникальность', conversionWindowDays: 'Окно конверсии', redirectMethod: 'Способ редиректа', paramMap: 'Параметры', costModel: 'Модель затрат', cpc: 'CPC',
   costFromParam: 'Расход из параметра', url: 'URL', postbackUrl: 'S2S постбэк', dailyCap_offer: 'Дневной кап', reason: 'Причина', email: 'Email', role: 'Роль' };
@@ -346,6 +346,7 @@ const SIM_AGENTS = [
   ['Mac · Safari', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15'],
   ['Бот (Googlebot)', 'Googlebot/2.1 (+http://www.google.com/bot.html)'],
 ];
+const CAP_REASON = { archived: 'в архиве', click_cap: 'кап кликов', conversion_cap: 'кап конверсий' };
 function simulateModal(campaignId) {
   const q = { country: 'FR', ua: SIM_AGENTS[0][1], ip: '', language: 'fr', query: '', at: '' };
   const out = h('div', { 'aria-live': 'polite' });
@@ -364,12 +365,12 @@ function simulateModal(campaignId) {
             h('span', { class: s.matches && s.enabled ? 'pos' : 'muted' }, `${s.matches && s.enabled ? '✓' : '✗'} ${s.name} (${typeLabel[s.type] || s.type})`),
             !s.enabled ? h('span', { class: 'muted' }, ' — выключен') : null,
             s.checks.length ? h('span', { class: 'muted' }, ' — ' + s.checks.map((c) => `${c.condition}: ${c.actual ?? '?'} ${c.ok ? '∈' : '∉'} ${c.expected.join(', ')}`).join(s.mode === 'or' ? ' ИЛИ ' : '; ')) : h('span', { class: 'muted' }, ' — без условий'),
-            s.cappedOffers?.length ? h('span', { class: 'err' }, ` · кап: ${s.cappedOffers.join(', ')}`) : null)),
+            s.cappedOffers?.length ? h('span', { class: 'err' }, ` · кап: ${s.cappedOffers.map((o) => `${o.offerId} (${CAP_REASON[o.reason] || o.reason}${o.altOfferId ? ` → ${o.altOfferId}` : ''})`).join(', ')}`) : null)),
           st.chosen ? h('p', {}, 'Выбор: ', st.chosen.map((c) => `${c.stream} — ${String(c.share).replace('.', ',')}%`).join(', ')) : null)),
         h('div', { class: 'card' },
           h('b', {}, `${OUTCOME[r.result.outcome] || r.result.outcome} · HTTP ${r.result.status}`), r.result.reason ? h('p', { class: 'muted' }, r.result.reason) : null,
           r.result.landing ? h('p', {}, 'Лендинг: ', h('code', {}, r.result.landing)) : null,
-          (r.result.destinations || []).map((d) => h('p', {}, d.offerId ? `${d.offerId} (${String(d.share).replace('.', ',')}%): ` : '', h('code', { style: 'word-break:break-all' }, d.url || '—'))),
+          (r.result.destinations || []).map((d) => h('p', {}, d.offerId ? `${d.offerId}${d.insteadOf ? ` вместо ${d.insteadOf}` : ''} (${String(d.share).replace('.', ',')}%): ` : '', h('code', { style: 'word-break:break-all' }, d.url || '—'))),
           r.result.url ? h('p', {}, h('code', { style: 'word-break:break-all' }, r.result.url)) : null));
     } catch (e) { put(out, h('p', { class: 'err' }, 'Не удалось: ' + e.message)); }
   };
@@ -1062,7 +1063,11 @@ async function pageSources() {
 
 function offerModal(id, onSaved) {
   const isNew = !id;
-  const o = isNew ? { id: '', name: '', url: '', postbackUrl: '', dailyCap: '' } : { id, ...state.offers[id], name: state.offers[id].name || '', postbackUrl: state.offers[id].postbackUrl || '', dailyCap: state.offers[id].dailyCap ?? '' };
+  const o = isNew ? { id: '', name: '', url: '', postbackUrl: '', dailyCap: '', conversionCap: '', capTz: 'UTC', altOfferId: '' }
+    : { id, ...state.offers[id], name: state.offers[id].name || '', postbackUrl: state.offers[id].postbackUrl || '', dailyCap: state.offers[id].dailyCap ?? '',
+      conversionCap: state.offers[id].conversionCap ?? '', capTz: state.offers[id].capTz || 'UTC', altOfferId: state.offers[id].altOfferId || '' };
+  const zones = TIME_ZONES.includes(o.capTz) ? ['UTC', ...TIME_ZONES.filter((z) => z !== 'UTC')] : [o.capTz, 'UTC', ...TIME_ZONES.filter((z) => z !== 'UTC')];
+  const others = Object.keys(state.offers || {}).filter((k) => k !== id && (!state.offers[k].archived || k === o.altOfferId)).sort();
   const err = h('p', { class: 'err' });
   const body = tabs([
     ['Основные', () => h('div', {},
@@ -1071,6 +1076,12 @@ function offerModal(id, onSaved) {
       field('URL', h('input', { class: 'input', type: 'url', value: o.url, placeholder: 'https://…', oninput: (e) => { o.url = e.target.value.trim(); } }), 'Макросы: {click_id} {subid} {campaign} {offer_id} {device} {country}. Если {click_id} нет — click_id добавится параметром.'))],
     ['Настройки', () => h('div', {},
       field('Дневной кап кликов', h('input', { class: 'input', type: 'number', min: 1, value: o.dailyCap, placeholder: 'нет', oninput: (e) => { o.dailyCap = e.target.value; } }), 'Считается по всем кампаниям; в потоках капнутый оффер пропускается.'),
+      field('Кап конверсий в день', h('input', { class: 'input', type: 'number', min: 1, value: o.conversionCap, placeholder: 'нет', 'aria-label': 'Кап конверсий в день', oninput: (e) => { o.conversionCap = e.target.value; } }), 'Лиды + продажи за сутки по всем кампаниям (отклонённые не считаются). Пересчёт — до 30 секунд.'),
+      field('Часовой пояс капа', h('select', { class: 'select', 'aria-label': 'Часовой пояс капа', onchange: (e) => { o.capTz = e.target.value; } },
+        zones.map((z) => h('option', { value: z, selected: z === o.capTz }, z))), 'Сутки капа начинаются в полночь этого пояса.'),
+      field('Запасной оффер', h('select', { class: 'select', 'aria-label': 'Запасной оффер', onchange: (e) => { o.altOfferId = e.target.value; } },
+        h('option', { value: '', selected: !o.altOfferId }, '— нет —'), others.map((k) => h('option', { value: k, selected: k === o.altOfferId }, state.offers[k].name ? `${k} — ${state.offers[k].name}` : k))),
+        'Куда уходит трафик, когда кап конверсий достигнут (цепочка до 3 переходов). Без запасного оффер просто пропускается в потоке.'),
       field('S2S постбэк в партнёрку', h('input', { class: 'input', type: 'url', value: o.postbackUrl, placeholder: 'https://… (необязательно)', oninput: (e) => { o.postbackUrl = e.target.value.trim(); } }), 'Вызывается при конверсии. Макросы: {click_id} {revenue} {currency}.'))],
   ]);
   const close = openModal({
@@ -1082,9 +1093,11 @@ function offerModal(id, onSaved) {
       if (o.postbackUrl && !/^https:\/\//i.test(o.postbackUrl)) { err.textContent = 'S2S URL должен начинаться с https://'; return; }
       const cap = intOrNull(o.dailyCap);
       if (Number.isNaN(cap) || (cap !== null && cap < 1)) { err.textContent = 'Дневной кап — целое число больше нуля.'; return; }
+      const convCap = intOrNull(o.conversionCap);
+      if (Number.isNaN(convCap) || (convCap !== null && convCap < 1)) { err.textContent = 'Кап конверсий — целое число больше нуля.'; return; }
       if (isNew && state.offers[o.id]) { err.textContent = 'Оффер с таким ID уже есть.'; return; }
       try {
-        const body2 = { name: o.name.trim() || null, url: o.url, postbackUrl: o.postbackUrl || null, dailyCap: cap };
+        const body2 = { name: o.name.trim() || null, url: o.url, postbackUrl: o.postbackUrl || null, dailyCap: cap, conversionCap: convCap, capTz: o.capTz, altOfferId: o.altOfferId || null };
         await (isNew ? api('/api/offers', { method: 'POST', body: { id: o.id, ...body2 } }) : api('/api/offers/' + encodeURIComponent(o.id), { method: 'PATCH', body: body2 }));
         toast(isNew ? 'Оффер создан' : 'Сохранено'); close(); onSaved();
       } catch (e) { err.textContent = 'Не сохранено: ' + e.message; }
@@ -1187,6 +1200,7 @@ async function pageOffers() {
       { key: 'url', label: 'URL', cls: 'name', hidden: true, render: (r) => h('span', { title: r.url }, r.url) },
       { key: 's2s', label: 'S2S', value: (r) => (r.postbackUrl ? 'да' : 'нет') },
       { key: 'dailyCap', label: 'Дневной кап', num: true, render: (r) => r.dailyCap ?? '—' },
+      { key: 'conversionCap', label: 'Кап конверсий', num: true, hidden: true, render: (r) => (r.conversionCap ? `${r.conversionCap}${r.altOfferId ? ` → ${r.altOfferId}` : ''}` : '—') },
       ...metricCols(),
     ],
   });

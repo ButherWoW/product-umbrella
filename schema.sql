@@ -31,6 +31,9 @@ CREATE TABLE IF NOT EXISTS sources (
 ALTER TABLE offers ADD COLUMN IF NOT EXISTS network_id TEXT;
 ALTER TABLE offers ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE offers ADD COLUMN IF NOT EXISTS "group" TEXT NOT NULL DEFAULT '';
+ALTER TABLE offers ADD COLUMN IF NOT EXISTS conversion_cap INTEGER;
+ALTER TABLE offers ADD COLUMN IF NOT EXISTS cap_tz TEXT NOT NULL DEFAULT 'UTC';
+ALTER TABLE offers ADD COLUMN IF NOT EXISTS alt_offer_id TEXT;
 CREATE TABLE IF NOT EXISTS networks (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, offer_params TEXT NOT NULL DEFAULT '',
   click_id_param TEXT NOT NULL DEFAULT 'sub1', payout_param TEXT NOT NULL DEFAULT 'payout',
@@ -81,6 +84,7 @@ CREATE INDEX IF NOT EXISTS bots_campaign_created_idx ON bots(campaign, created_a
 
 CREATE INDEX IF NOT EXISTS clicks_campaign_created_idx ON clicks(campaign, created_at);
 CREATE INDEX IF NOT EXISTS clicks_created_idx ON clicks(created_at);
+CREATE INDEX IF NOT EXISTS conversions_created_idx ON conversions(created_at);
 
 CREATE TABLE IF NOT EXISTS users (
   id uuid PRIMARY KEY,
