@@ -1,0 +1,10 @@
+[Unit]
+Description=Product Umbrella restore test (latest dump into a throwaway database)
+OnFailure=umbrella-failed@%n.service
+After=postgresql.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/umbrella/app/deploy/restore-test.sh
+Nice=10
+IOSchedulingClass=idle
