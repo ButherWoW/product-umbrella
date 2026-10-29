@@ -1664,17 +1664,25 @@ async function pageReports(params) {
           put(subTd, h('p', { class: 'err' }, e.message));
         }
       };
+      const LP_CTR_WARN = 0.1; const LP_MIN_CLICKS = 100;
+      if (key === 'landing') rows.sort((a, b) => ratio(b.lpClicks, b.clicks) - ratio(a.lpClicks, a.clicks));
+      const lpCols = key === 'landing' ? [
+        { key: 'lpClicks', label: 'Клики LP', title: 'Переходы с лендинга на оффер', num: true, render: (r) => num(r.lpClicks), total: (rs) => num(sum(rs, 'lpClicks')) },
+        { key: 'lpCtr', label: 'LP CTR', num: true, value: (r) => ratio(r.lpClicks, r.clicks), render: (r) => pct(ratio(r.lpClicks, r.clicks)), total: (rs) => pct(ratio(sum(rs, 'lpClicks'), sum(rs, 'clicks'))) },
+        { key: 'crLp', label: 'CR (LP)', title: 'CR от лендинга = конверсии / клики LP', num: true, value: (r) => ratio(r.conversions, r.lpClicks), render: (r) => pct(ratio(r.conversions, r.lpClicks)), total: (rs) => pct(ratio(sum(rs, 'conversions'), sum(rs, 'lpClicks'))) },
+      ] : [];
       table?.detach();
       table = dataTable({
         id: 'report-' + key, pageSize: 100,
         rows,
+        rowClass: key === 'landing' ? (r) => (r.clicks >= LP_MIN_CLICKS && ratio(r.lpClicks, r.clicks) < LP_CTR_WARN ? 'row-warn' : '') : undefined,
         columns: [{ key: 'id', label: f.field ? 'Значение' : label, fixed: true, cls: 'name', value: nameOf,
           render: (r) => drill
             ? h('span', { style: 'display:inline-flex;align-items:center;gap:4px' },
                 h('button', { style: 'all:unset;cursor:pointer;font-size:10px;color:var(--fg-2,#999);user-select:none', 'aria-label': 'Развернуть', onclick: (e) => { e.stopPropagation(); expandRow(r, e.currentTarget); } }, '▸'),
                 nameOf(r))
             : nameOf(r) },
-          ...(prev ? withDeltas(metricCols({ rpm: true })) : metricCols({ rpm: true }))],
+          ...(prev ? withDeltas(metricCols({ rpm: true })) : metricCols({ rpm: true })), ...lpCols],
       });
       put(holder, table);
     } catch (e) { put(holder, h('p', { class: 'err' }, 'Ошибка отчёта: ' + e.message)); }
