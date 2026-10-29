@@ -290,3 +290,20 @@ test('unique clicks: repeat visitor within the window is not unique', { timeout:
     assert.equal((await (await fetch(url + '/api/campaigns')).json()).campaigns.uniq.uniquenessHours, 24);
   });
 });
+
+test('stream rotation by position: first matching regular stream wins', { timeout: 15000 }, async (t) => {
+  await withServer(t, {}, async ({ url, post, hit }) => {
+    await post('/api/offers', { id: 'pos-a', url: 'https://a.example.net/' });
+    await post('/api/offers', { id: 'pos-b', url: 'https://b.example.net/' });
+    await post('/api/campaigns', { id: 'pos', name: 'Pos', streamRotation: 'position', streams: [
+      { name: 'first', offers: [{ offerId: 'pos-a' }], weight: 1 },
+      { name: 'second', offers: [{ offerId: 'pos-b' }], weight: 1000 },
+    ] });
+    for (let i = 0; i < 10; i++) assert.equal(new URL((await hit('/r/pos')).headers.get('location')).host, 'a.example.net', 'weight is ignored by position');
+    await post('/api/campaigns/pos', { streamRotation: 'weight' }, 'PATCH');
+    const hosts = new Set();
+    for (let i = 0; i < 30; i++) hosts.add(new URL((await hit('/r/pos')).headers.get('location')).host);
+    assert.ok(hosts.has('b.example.net'), 'by weight the heavy stream gets traffic');
+    assert.equal((await (await fetch(url + '/api/campaigns')).json()).campaigns.pos.streamRotation, 'weight');
+  });
+});

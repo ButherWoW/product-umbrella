@@ -180,13 +180,14 @@ function streamMatches(stream, visitor) {
 // Keitaro order: first matching forced stream → weighted among matching regular → first matching fallback.
 // Offers in `excluded` (capped) are skipped; a stream with no remaining offers does not match.
 // Disabled streams are skipped; action streams (url / not_found) need no offers.
-function pickStream(streams, visitor = {}, excluded = new Set()) {
+function pickStream(streams, visitor = {}, excluded = new Set(), rotation = 'weight') {
   if (!streams || !streams.length) return null;
   const available = (s) => (s.action ? [s] : s.offers ? s.offers.filter((o) => !excluded.has(o.offerId)) : (excluded.has(s.offerId) ? [] : [s]));
   const matching = streams.filter((s) => s.enabled !== false && streamMatches(s, visitor) && available(s).length);
   const typeOf = (s) => s.type || 'regular';
   const stream = matching.find((s) => typeOf(s) === 'forced')
-    || weightedPick(matching.filter((s) => typeOf(s) === 'regular'))
+    // Keitaro «Ротация потоков»: by weight (default) or by position — the first matching regular stream wins.
+    || (rotation === 'position' ? matching.find((s) => typeOf(s) === 'regular') : weightedPick(matching.filter((s) => typeOf(s) === 'regular')))
     || matching.find((s) => typeOf(s) === 'fallback');
   if (!stream) return null;
   if (stream.action) return { stream, offerId: null };
@@ -472,6 +473,7 @@ function parseCampaign(id, value) {
     // Revenue cap: stop after earning revenueCap per day
     revenueCap: typeof value.revenueCap === 'number' && value.revenueCap > 0 ? value.revenueCap : null,
     botFilter: value.botFilter === true,
+    streamRotation: value.streamRotation === 'position' ? 'position' : 'weight',
     uniquenessHours: Number.isInteger(value.uniquenessHours) && value.uniquenessHours >= 1 && value.uniquenessHours <= 720 ? value.uniquenessHours : 24,
     ownerId: /^[0-9a-f-]{36}$/i.test(String(value.ownerId || '')) ? String(value.ownerId).toLowerCase() : null,
     redirectMethod: REDIRECT_METHODS.includes(value.redirectMethod) ? value.redirectMethod : 'http',
@@ -1126,7 +1128,7 @@ const server = http.createServer(async (req, res) => {
         const c = campaigns.get(campaignId);
         if (!c || !c.active) return json(res, 404, { error: 'campaign_not_found_or_inactive' });
         if (!c.streams?.length) return json(res, 404, { error: 'no_streams_configured' });
-        const picked = pickStream(c.streams, visitor, await cappedOffers(c.streams));
+        const picked = pickStream(c.streams, visitor, await cappedOffers(c.streams), c.streamRotation);
         if (!picked) return json(res, 404, { error: 'no_matching_stream' });
         const countClick = picked.stream.countClicks !== false;
         const extra = visited.length ? { parentCampaign: visited[0] } : {};
@@ -1324,6 +1326,7 @@ const server = http.createServer(async (req, res) => {
         dedupeWindow: body.dedupeWindow === undefined ? cur.dedupeWindow : body.dedupeWindow,
         revenueCap: body.revenueCap === undefined ? cur.revenueCap : body.revenueCap,
         botFilter: body.botFilter === undefined ? cur.botFilter : body.botFilter,
+        streamRotation: body.streamRotation === undefined ? cur.streamRotation : body.streamRotation,
         uniquenessHours: body.uniquenessHours === undefined ? cur.uniquenessHours : body.uniquenessHours,
         ownerId: body.ownerId === undefined || req.user?.role === 'buyer' ? cur.ownerId : body.ownerId,
         redirectMethod: body.redirectMethod === undefined ? cur.redirectMethod : body.redirectMethod,

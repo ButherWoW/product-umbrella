@@ -709,6 +709,10 @@ async function pageCampaignEditor(id) {
       field('Срок уникальности, часов', h('input', { class: 'input', type: 'number', min: 1, max: 720, value: d.uniquenessHours ?? 24, oninput: bind('uniquenessHours', 'int') }), 'Повторный визит с тех же IP и браузера в этом окне считается, но не как уникальный.'),
       field('Не записывать повторные клики, минут', h('input', { class: 'input', type: 'number', min: 0, value: d.dedupeWindow || 0, oninput: bind('dedupeWindow', 'int') }), 'Повторный клик с того же IP в этом окне вообще не записывается. 0 — выключено.'),
       field('Фильтр ботов', h('label', { class: 'radios' }, h('input', { type: 'checkbox', checked: d.botFilter, onchange: (e) => { d.botFilter = e.target.checked; mark(); } }), 'Не считать клики ботов'), 'Боты уходят на тот же оффер, но не попадают в статистику.'),
+      field('Ротация потоков', h('div', { class: 'radios' },
+        h('label', {}, h('input', { type: 'radio', name: 'crot', checked: d.streamRotation !== 'position', onchange: () => { d.streamRotation = 'weight'; mark(); } }), 'По весу'),
+        h('label', {}, h('input', { type: 'radio', name: 'crot', checked: d.streamRotation === 'position', onchange: () => { d.streamRotation = 'position'; mark(); } }), 'По позиции')),
+        'По весу — обычные потоки делят трафик по весам. По позиции — клик забирает первый подходящий обычный поток сверху.'),
       field('Способ редиректа', h('div', { class: 'radios' }, [['http', 'HTTP 302'], ['meta', 'Meta refresh'], ['js', 'JavaScript']].map(([v, l]) => h('label', {},
         h('input', { type: 'radio', name: 'credir', checked: (d.redirectMethod || 'http') === v, onchange: () => { d.redirectMethod = v; mark(); } }), l))),
         'Как посетитель уходит на оффер. HTTP 302 — быстрее всего; meta и JS отдают страницу, которая сама переходит дальше.'),
@@ -777,7 +781,7 @@ async function pageCampaignEditor(id) {
     if (new Set(names).size !== names.length) { err.textContent = 'Названия потоков должны различаться — по ним строится статистика.'; return; }
     const body = { name: d.name.trim(), active: d.active, streams: d.streams, dailyCap: d.dailyCap, totalCap: d.totalCap, revenueCap: d.revenueCap, capUrl: d.capUrl, geoCapUrl: d.geoCapUrl,
       allowGeos: d.allowGeos, allowDevices: d.allowDevices, allowOS: d.allowOS, allowBrowsers: d.allowBrowsers, blockedIps: d.blockedIps, allowedIps: d.allowedIps,
-      dedupeWindow: d.dedupeWindow || 0, botFilter: d.botFilter, conversionWindowDays: d.conversionWindowDays, redirectMethod: d.redirectMethod || 'http', uniquenessHours: d.uniquenessHours ?? 24, ...(isOwnerView() ? { ownerId: d.ownerId || null } : {}) };
+      dedupeWindow: d.dedupeWindow || 0, botFilter: d.botFilter, conversionWindowDays: d.conversionWindowDays, redirectMethod: d.redirectMethod || 'http', uniquenessHours: d.uniquenessHours ?? 24, streamRotation: d.streamRotation || 'weight', ...(isOwnerView() ? { ownerId: d.ownerId || null } : {}) };
     saveBtn.disabled = true;
     try {
       const saved = isNew ? await api('/api/campaigns', { method: 'POST', body: { id: d.id, ...body } })
