@@ -103,5 +103,21 @@ await db.query(`CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id
 await db.query(`CREATE INDEX IF NOT EXISTS clicks_campaign_created_idx ON clicks(campaign, created_at)`);
 await db.query(`CREATE INDEX IF NOT EXISTS clicks_created_idx ON clicks(created_at)`);
 
+await db.query(`
+  CREATE TABLE IF NOT EXISTS sources (
+    id              TEXT        PRIMARY KEY,
+    name            TEXT,
+    param_map       JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    cost_model      TEXT        NOT NULL DEFAULT 'none',
+    cpc             NUMERIC(12,6) NOT NULL DEFAULT 0,
+    cost_from_param BOOLEAN     NOT NULL DEFAULT false,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+  )
+`);
+await db.query(`ALTER TABLE sources ADD COLUMN IF NOT EXISTS param_map JSONB NOT NULL DEFAULT '{}'::jsonb`);
+await db.query(`ALTER TABLE sources ADD COLUMN IF NOT EXISTS cost_model TEXT NOT NULL DEFAULT 'none'`);
+await db.query(`ALTER TABLE sources ADD COLUMN IF NOT EXISTS cpc NUMERIC(12,6) NOT NULL DEFAULT 0`);
+await db.query(`ALTER TABLE sources ADD COLUMN IF NOT EXISTS cost_from_param BOOLEAN NOT NULL DEFAULT false`);
+
 console.log('[migrate] All tables ready');
 await db.end();
