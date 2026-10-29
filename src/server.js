@@ -1324,7 +1324,9 @@ async function audit(req, action, entity, id, before = null, after = null) {
 }
 
 // Team settings (owner-editable). buyerSharePct: the buyer's share of net profit shown on the dashboard.
-const SETTINGS_DEFAULTS = { buyerSharePct: 35 };
+// dailyRevenueGoal / dailyProfitGoal: the team's daily plan in the default currency (null = no goal).
+const SETTINGS_DEFAULTS = { buyerSharePct: 35, dailyRevenueGoal: null, dailyProfitGoal: null };
+const GOAL_KEYS = ['dailyRevenueGoal', 'dailyProfitGoal'];
 let settings = { ...SETTINGS_DEFAULTS };
 async function loadSettings() {
   try { settings = { ...SETTINGS_DEFAULTS, ...JSON.parse(await readFile(settingsFile, 'utf8')) }; }
@@ -1815,10 +1817,21 @@ const server = http.createServer(async (req, res) => {
       const body = await readJson(req);
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       if (req.user && req.user.role !== 'owner') return json(res, 403, { error: 'owner_only' });
-      const pct = Number(body.buyerSharePct);
-      if (!Number.isFinite(pct) || pct < 0 || pct > 100) return json(res, 400, { error: 'invalid_buyer_share' });
+      const patch = {};
+      if ('buyerSharePct' in body || !GOAL_KEYS.some((key) => key in body)) {
+        const pct = Number(body.buyerSharePct);
+        if (!Number.isFinite(pct) || pct < 0 || pct > 100) return json(res, 400, { error: 'invalid_buyer_share' });
+        patch.buyerSharePct = Math.round(pct * 100) / 100;
+      }
+      for (const key of GOAL_KEYS) {
+        if (!(key in body)) continue;
+        if (body[key] === null || body[key] === '') { patch[key] = null; continue; }
+        const goal = typeof body[key] === 'number' || typeof body[key] === 'string' ? Number(body[key]) : NaN;
+        if (!Number.isFinite(goal) || goal < 0) return json(res, 400, { error: 'invalid_goal', field: key });
+        patch[key] = Math.round(goal * 100) / 100;
+      }
       const before = { ...settings };
-      settings = { ...settings, buyerSharePct: Math.round(pct * 100) / 100 };
+      settings = { ...settings, ...patch };
       await mkdir(dataDir, { recursive: true });
       await writeFile(settingsFile, JSON.stringify(settings, null, 2) + '\n');
       await audit(req, 'update', 'settings', 'team', before, settings);
