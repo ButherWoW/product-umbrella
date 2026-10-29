@@ -579,6 +579,9 @@ function parseOffer(raw) {
   const urlStr = typeof raw === 'string' ? raw : String(raw?.url || '');
   if (!/^https:\/\//i.test(urlStr)) return null;
   const postbackUrl = raw?.postbackUrl && /^https:\/\//i.test(String(raw.postbackUrl)) ? String(raw.postbackUrl).slice(0, 2048) : null;
+  const payoutType = raw?.payoutType === 'cpc' ? 'cpc' : 'cpa';
+  const payout = raw?.payout === null || raw?.payout === undefined || raw?.payout === '' ? null : (Number.isFinite(Number(raw.payout)) && Number(raw.payout) >= 0 ? Number(raw.payout) : null);
+  const payoutCurrency = /^[A-Z]{3}$/i.test(String(raw?.payoutCurrency || '')) ? String(raw.payoutCurrency).toUpperCase() : null;
   const dailyCap = Number.isInteger(raw?.dailyCap) && raw.dailyCap > 0 ? raw.dailyCap : null;
   const name = typeof raw?.name === 'string' && raw.name.trim() ? raw.name.trim().slice(0, 200) : null;
   const networkId = OFFER_ID_RE.test(String(raw?.networkId || '')) ? String(raw.networkId) : null;
@@ -586,7 +589,7 @@ function parseOffer(raw) {
   const conversionCap = Number.isInteger(raw?.conversionCap) && raw.conversionCap > 0 ? raw.conversionCap : null;
   const capTz = typeof raw?.capTz === 'string' && validTimeZone(raw.capTz) ? raw.capTz : 'UTC';
   const altOfferId = OFFER_ID_RE.test(String(raw?.altOfferId || '')) ? String(raw.altOfferId) : null;
-  return { url: urlStr, postbackUrl, dailyCap, name, networkId, archived: raw?.archived === true, group: typeof raw?.group === 'string' ? raw.group.trim().slice(0, 60) : '',
+  return { url: urlStr, postbackUrl, payoutType, payout, payoutCurrency, dailyCap, name, networkId, archived: raw?.archived === true, group: typeof raw?.group === 'string' ? raw.group.trim().slice(0, 60) : '',
     conversionCap, capTz, altOfferId };
 }
 
@@ -1504,8 +1507,13 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/postback' && req.method === 'GET') {
       if (postbackSecret && !safeEqual(url.searchParams.get('secret'), postbackSecret)) return json(res, 401, { error: 'invalid_postback_secret' });
       try {
-        const result = await recordPostback({ clickId: url.searchParams.get('click_id'),
-          revenue: url.searchParams.get('revenue'), currency: url.searchParams.get('currency'), status: url.searchParams.get('status') });
+        const clickId = url.searchParams.get('click_id');
+        const click = await getClickData(clickId);
+        const offer = click ? offers.get(click.offerId) : null;
+        const suppliedRevenue = url.searchParams.get('revenue') || url.searchParams.get('payout');
+        const fallbackRevenue = suppliedRevenue || (offer?.payout != null && offer.payoutType === 'cpa' ? String(offer.payout) : null);
+        const result = await recordPostback({ clickId, revenue: fallbackRevenue,
+          currency: url.searchParams.get('currency') || offer?.payoutCurrency, status: url.searchParams.get('status') });
         return json(res, 200, result);
       } catch (error) {
         if (!error.statusCode) throw error;
@@ -1691,7 +1699,7 @@ const server = http.createServer(async (req, res) => {
       if (body.networkId !== undefined && body.networkId !== null && !networks.has(String(body.networkId))) return json(res, 400, { error: 'network_not_found' });
       const capError = conversionCapError(String(body.id), body);
       if (capError) return json(res, 400, { error: capError });
-      const offer = parseOffer({ url: String(body.url), postbackUrl: body.postbackUrl, dailyCap: body.dailyCap, name: body.name, networkId: body.networkId, archived: body.archived, group: body.group,
+      const offer = parseOffer({ url: String(body.url), postbackUrl: body.postbackUrl, payoutType: body.payoutType, payout: body.payout, payoutCurrency: body.payoutCurrency, dailyCap: body.dailyCap, name: body.name, networkId: body.networkId, archived: body.archived, group: body.group,
         conversionCap: body.conversionCap, capTz: body.capTz, altOfferId: body.altOfferId });
       if (!offer) return json(res, 400, { error: 'id_and_https_url_required' });
       offers.set(String(body.id), offer);
@@ -1719,7 +1727,7 @@ const server = http.createServer(async (req, res) => {
       if (body.networkId !== undefined && body.networkId !== null && !networks.has(String(body.networkId))) return json(res, 400, { error: 'network_not_found' });
       const capError = conversionCapError(id, body);
       if (capError) return json(res, 400, { error: capError });
-      const updated = parseOffer({ url: newUrl, postbackUrl: newPostbackUrl, dailyCap: newDailyCap, name: body.name !== undefined ? body.name : cur.name, networkId: body.networkId !== undefined ? body.networkId : cur.networkId, archived: body.archived !== undefined ? body.archived : cur.archived, group: body.group !== undefined ? body.group : cur.group,
+      const updated = parseOffer({ url: newUrl, postbackUrl: newPostbackUrl, payoutType: body.payoutType !== undefined ? body.payoutType : cur.payoutType, payout: body.payout !== undefined ? body.payout : cur.payout, payoutCurrency: body.payoutCurrency !== undefined ? body.payoutCurrency : cur.payoutCurrency, dailyCap: newDailyCap, name: body.name !== undefined ? body.name : cur.name, networkId: body.networkId !== undefined ? body.networkId : cur.networkId, archived: body.archived !== undefined ? body.archived : cur.archived, group: body.group !== undefined ? body.group : cur.group,
         conversionCap: body.conversionCap !== undefined ? body.conversionCap : cur.conversionCap, capTz: body.capTz !== undefined ? body.capTz : cur.capTz, altOfferId: body.altOfferId !== undefined ? body.altOfferId : cur.altOfferId });
       if (!updated) return json(res, 400, { error: 'invalid_url' });
       offers.set(id, updated);
