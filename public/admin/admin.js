@@ -156,7 +156,7 @@ function ratesNote() {
 // ---------- change history ----------
 const ACTION_LABEL = { create: 'Создание', update: 'Изменение', delete: 'Удаление', pause: 'Автопауза', login: 'Вход' };
 const FIELD_LABEL = { name: 'Название', active: 'Состояние', dailyCap: 'Дневной кап', totalCap: 'Общий кап', revenueCap: 'Кап дохода', capUrl: 'URL капа', streams: 'Потоки',
-  allowGeos: 'Страны', allowDevices: 'Устройства', allowOS: 'ОС', allowBrowsers: 'Браузеры', blockedIps: 'Черный список IP', allowedIps: 'Белый список IP', botFilter: 'Фильтр ботов',
+  allowGeos: 'Страны', allowDevices: 'Устройства', allowOS: 'ОС', allowBrowsers: 'Браузеры', blockedIps: 'Черный список IP', allowedIps: 'Белый список IP', botFilter: 'Фильтр ботов', datacenterAsBot: 'Дата-центры = боты',
   dedupeWindow: 'Уникальность', conversionWindowDays: 'Окно конверсии', redirectMethod: 'Способ редиректа', paramMap: 'Параметры', costModel: 'Модель затрат', cpc: 'CPC',
   costFromParam: 'Расход из параметра', url: 'URL', postbackUrl: 'S2S постбэк', dailyCap_offer: 'Дневной кап', reason: 'Причина', email: 'Email', role: 'Роль' };
 const showValue = (v) => (v === null || v === undefined || v === '' ? '—' : v === true ? 'да' : v === false ? 'нет' : String(v));
@@ -717,7 +717,7 @@ async function pageCampaignEditor(id) {
   const src = isNew ? null : state.campaigns[id];
   if (!isNew && !src) { put(view, h('p', { class: 'err' }, 'Кампания не найдена: ' + id), h('a', { href: '#/campaigns' }, '← К кампаниям')); return; }
   const d = isNew
-    ? { id: Math.random().toString(36).slice(2, 10), name: '', active: true, dailyCap: null, totalCap: null, revenueCap: null, capUrl: null, geoCapUrl: null, allowGeos: [], allowDevices: [], allowOS: [], allowBrowsers: [], blockedIps: [], allowedIps: [], dedupeWindow: 0, botFilter: false, conversionWindowDays: null }
+    ? { id: Math.random().toString(36).slice(2, 10), name: '', active: true, dailyCap: null, totalCap: null, revenueCap: null, capUrl: null, geoCapUrl: null, allowGeos: [], allowDevices: [], allowOS: [], allowBrowsers: [], blockedIps: [], allowedIps: [], dedupeWindow: 0, botFilter: false, datacenterAsBot: false, conversionWindowDays: null }
     : { id, ...structuredClone(src) };
   d.streams = editableStreams(src?.streams);
   let dirty = false;
@@ -743,6 +743,7 @@ async function pageCampaignEditor(id) {
       field('Срок уникальности, часов', h('input', { class: 'input', type: 'number', min: 1, max: 720, value: d.uniquenessHours ?? 24, oninput: bind('uniquenessHours', 'int') }), 'Повторный визит с тех же IP и браузера в этом окне считается, но не как уникальный.'),
       field('Не записывать повторные клики, минут', h('input', { class: 'input', type: 'number', min: 0, value: d.dedupeWindow || 0, oninput: bind('dedupeWindow', 'int') }), 'Повторный клик с того же IP в этом окне вообще не записывается. 0 — выключено.'),
       field('Фильтр ботов', h('label', { class: 'radios' }, h('input', { type: 'checkbox', checked: d.botFilter, onchange: (e) => { d.botFilter = e.target.checked; mark(); } }), 'Не считать клики ботов'), 'Боты уходят на тот же оффер, но не попадают в статистику.'),
+      field('Дата-центры', h('label', { class: 'radios' }, h('input', { type: 'checkbox', checked: d.datacenterAsBot, onchange: (e) => { d.datacenterAsBot = e.target.checked; mark(); } }), 'Трафик дата-центров считать ботами'), 'Клики из облаков и хостингов (AWS, Google Cloud, OVH…) уходят на тот же оффер, но не попадают в статистику.'),
       field('Ротация потоков', h('div', { class: 'radios' },
         h('label', {}, h('input', { type: 'radio', name: 'crot', checked: d.streamRotation !== 'position', onchange: () => { d.streamRotation = 'weight'; mark(); } }), 'По весу'),
         h('label', {}, h('input', { type: 'radio', name: 'crot', checked: d.streamRotation === 'position', onchange: () => { d.streamRotation = 'position'; mark(); } }), 'По позиции')),
@@ -818,7 +819,7 @@ async function pageCampaignEditor(id) {
     if (new Set(names).size !== names.length) { err.textContent = 'Названия потоков должны различаться — по ним строится статистика.'; return; }
     const body = { name: d.name.trim(), active: d.active, streams: d.streams, dailyCap: d.dailyCap, totalCap: d.totalCap, revenueCap: d.revenueCap, capUrl: d.capUrl, geoCapUrl: d.geoCapUrl,
       allowGeos: d.allowGeos, allowDevices: d.allowDevices, allowOS: d.allowOS, allowBrowsers: d.allowBrowsers, blockedIps: d.blockedIps, allowedIps: d.allowedIps,
-      dedupeWindow: d.dedupeWindow || 0, botFilter: d.botFilter, conversionWindowDays: d.conversionWindowDays, redirectMethod: d.redirectMethod || 'http', domain: d.domain || null, uniquenessHours: d.uniquenessHours ?? 24, streamRotation: d.streamRotation || 'weight', ...(isOwnerView() ? { ownerId: d.ownerId || null } : {}) };
+      dedupeWindow: d.dedupeWindow || 0, botFilter: d.botFilter, datacenterAsBot: Boolean(d.datacenterAsBot), conversionWindowDays: d.conversionWindowDays, redirectMethod: d.redirectMethod || 'http', domain: d.domain || null, uniquenessHours: d.uniquenessHours ?? 24, streamRotation: d.streamRotation || 'weight', ...(isOwnerView() ? { ownerId: d.ownerId || null } : {}) };
     saveBtn.disabled = true;
     try {
       const saved = isNew ? await api('/api/campaigns', { method: 'POST', body: { id: d.id, ...body } })
@@ -981,7 +982,7 @@ async function pageOffers() {
 
 const GROUPS = [
   ['campaign', 'Кампания', 'byCampaign'], ['offer', 'Оффер', 'byOffer'], ['stream', 'Поток', 'byStream'], ['landing', 'Лендинг', 'byLanding'], ['country', 'Страна', 'byCountry'],
-  ['device', 'Устройство', null], ['os', 'ОС', null], ['browser', 'Браузер', null], ['language', 'Язык', null],
+  ['device', 'Устройство', null], ['os', 'ОС', null], ['browser', 'Браузер', null], ['language', 'Язык', null], ['isp', 'Провайдер', null],
   ['day', 'День', null], ['hour', 'Час', null], ['referrer', 'Реферер', null], ['path', 'Путь', null],
 ];
 async function pageReports(params) {
@@ -1020,7 +1021,7 @@ async function pageReports(params) {
         if (key === 'campaign') drill = (r) => ({ group: 'stream', campaign: r.id });
         if (key === 'offer') drill = (r) => ({ group: 'country', offer: r.id });
         if (key === 'stream') drill = (r) => ({ group: 'offer', stream: r.id });
-      } else if (['device', 'os', 'browser', 'language'].includes(key)) {
+      } else if (['device', 'os', 'browser', 'language', 'isp'].includes(key)) {
         const r = await api('/stats/params' + qs({ field: key, campaign: f.campaign, from, to }));
         rows = (r.rows || []).map((x) => ({ id: x.value || '(неизвестно)', clicks: x.clicks || 0, conversions: x.conversions || 0, revenue: x.revenue || 0, cost: x.cost || 0 }));
         if (f.offer || f.country || f.stream || f.subid) note.textContent = 'Для этой группировки применяются только кампания и период.';

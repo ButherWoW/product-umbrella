@@ -40,6 +40,9 @@ CREATE TABLE IF NOT EXISTS clicks (
   os text,
   browser text,
   language text,
+  asn integer,
+  isp text,
+  datacenter boolean,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 

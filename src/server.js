@@ -63,6 +63,26 @@ if (process.env.GEOIP_DB) {
     console.log('[geo] GeoIP2 database loaded');
   } catch (e) { console.warn('[geo] GeoIP2 unavailable, geo checks disabled:', e.message); }
 }
+// Optional ISP lookup (DB-IP ASN Lite, CC BY 4.0) via GEOIP_ASN_DB.
+let asnReader = null;
+if (process.env.GEOIP_ASN_DB) {
+  try {
+    const { Reader } = await import('@maxmind/geoip2-node');
+    asnReader = await Reader.open(process.env.GEOIP_ASN_DB);
+    console.log('[geo] ASN database loaded');
+  } catch (e) { console.warn('[geo] ASN database unavailable, ISP lookup disabled:', e.message); }
+}
+// Hosting / cloud networks: real visitors do not browse from these; crawlers, scanners and review bots do.
+const DATACENTER_RE = /\b(amazon|google llc|google cloud|microsoft|azure|digitalocean|ovh|hetzner|linode|akamai|vultr|oracle|alibaba|tencent|cloudflare|leaseweb|contabo|scaleway|choopa|m247|datacamp|facebook|hostinger|ionos|hosting|servers?|data ?cent(er|re)s?|colocation)\b/i;
+function lookupAsn(ip) {
+  if (!asnReader || !ip) return null;
+  try {
+    const r = asnReader.asn(ip);
+    const isp = r.autonomousSystemOrganization || null;
+    return { asn: r.autonomousSystemNumber ?? null, isp, datacenter: Boolean(isp && DATACENTER_RE.test(isp)) };
+  } catch { return null; }
+}
+
 function lookupCountry(ip) {
   if (!geoReader || !ip) return null;
   try { return geoReader.country(ip)?.country?.isoCode || null; }
@@ -495,6 +515,7 @@ function parseCampaign(id, value) {
     // Revenue cap: stop after earning revenueCap per day
     revenueCap: typeof value.revenueCap === 'number' && value.revenueCap > 0 ? value.revenueCap : null,
     botFilter: value.botFilter === true,
+    datacenterAsBot: value.datacenterAsBot === true,
     domain: DOMAIN_RE.test(String(value.domain || '').toLowerCase()) ? String(value.domain).toLowerCase() : null,
     streamRotation: value.streamRotation === 'position' ? 'position' : 'weight',
     uniquenessHours: Number.isInteger(value.uniquenessHours) && value.uniquenessHours >= 1 && value.uniquenessHours <= 720 ? value.uniquenessHours : 24,
@@ -633,7 +654,7 @@ async function stats({ campaign = null, allowed = null, from = null, to = null, 
 
 // Clicks/conversions/revenue/cost grouped by one tracked parameter value ('' = not passed).
 // Click attributes stored as columns (not in params) that reports can group by.
-const DIMENSION_FIELDS = ['device', 'os', 'browser', 'language'];
+const DIMENSION_FIELDS = ['device', 'os', 'browser', 'language', 'isp'];
 async function paramReport({ field, campaign, allowed = null, from, to, currency = rates.defaultCurrency }) {
   const isColumn = DIMENSION_FIELDS.includes(field);
   if (db) {
@@ -869,7 +890,7 @@ function dashboard(res) {
     const p=new URLSearchParams(q);
     const [s,o,c,ts]=await Promise.all([fetch('/stats?'+p).then(r=>r.json()),fetch('/api/offers').then(r=>r.json()),fetch('/api/campaigns').then(r=>r.json()),fetch('/stats/timeseries?from='+new Date(Date.now()-6*86400000).toISOString().slice(0,10)).then(r=>r.json())]);
     lastStats=s;
-    const campRows=Object.entries(s.byCampaign).map(([name,v])=>'<tr><td>'+esc(name)+'</td><td>'+v.clicks+'</td><td>'+v.conversions+'</td><td>'+((v.conversions/Math.max(v.clicks,1))*100).toFixed(2)+'%</td><td>'+fmt(v.revenue)+'</td></tr>').join('');
+    const campRows=Object.entries(s.byCampaign).map(([name,v])=>'<tr><td><a href="?campaign='+encodeURIComponent(name)+'" style="color:#087f7b;text-decoration:none;font-weight:650">'+esc(name)+'</a></td><td>'+v.clicks+'</td><td>'+v.conversions+'</td><td>'+((v.conversions/Math.max(v.clicks,1))*100).toFixed(2)+'%</td><td>'+fmt(v.revenue)+'</td></tr>').join('');
     const ctryRows=Object.entries(s.byCountry||{}).sort((a,b)=>b[1].clicks-a[1].clicks).slice(0,15).map(([ctry,v])=>'<tr><td>'+ctry+'</td><td>'+v.clicks+'</td><td>'+v.conversions+'</td><td>'+fmt(v.revenue)+'</td></tr>').join('');
     const offerRows=Object.entries(s.byOffer||{}).sort((a,b)=>b[1].clicks-a[1].clicks).map(([id,v])=>'<tr><td>'+id+'</td><td>'+v.clicks+'</td><td>'+v.conversions+'</td><td>'+((v.conversions/Math.max(v.clicks,1))*100).toFixed(2)+'%</td><td>'+fmt(v.revenue)+'</td></tr>').join('');
     const streamRows=Object.entries(s.byStream||{}).sort((a,b)=>b[1].clicks-a[1].clicks).map(([name,v])=>'<tr><td>'+esc(name)+'</td><td>'+v.clicks+'</td><td>'+v.conversions+'</td><td>'+((v.cr||0)*100).toFixed(2)+'%</td><td>'+fmt(v.revenue)+'</td><td>'+fmt(v.epc)+'</td></tr>').join('');
@@ -1076,9 +1097,13 @@ const server = http.createServer(async (req, res) => {
       if (c.blockedIps?.some((r) => ipMatches(visitorIp, r))) return json(res, 403, { error: 'ip_blocked' });
       if (c.allowedIps?.length && !c.allowedIps.some((r) => ipMatches(visitorIp, r))) return json(res, 403, { error: 'ip_not_allowed' });
 
-      // Bot filter: bots get the same destination but are not counted as clicks.
-      if (c.botFilter && isBot(req.headers['user-agent'])) {
-        await event('bot', { campaign: campaignId, offerId, stream: streamName, userAgent: req.headers['user-agent'] || null, ip: clientIp(req) });
+      // Bot filter: bots (and, if enabled, data-center traffic) get the same destination but are not counted as clicks.
+      const network = lookupAsn(visitorIp);
+      const uaBot = c.botFilter && isBot(req.headers['user-agent']);
+      const dcBot = c.datacenterAsBot && network?.datacenter;
+      if (uaBot || dcBot) {
+        await event('bot', { campaign: campaignId, offerId, stream: streamName, userAgent: req.headers['user-agent'] || null, ip: clientIp(req),
+          reason: uaBot ? 'user_agent' : 'datacenter', isp: network?.isp ?? null });
         const dest = applyMacros(targetTemplate, { campaign: campaignId, offer_id: offerId });
         res.writeHead(302, { location: dest, 'cache-control': 'no-store' });
         return res.end();
@@ -1181,7 +1206,8 @@ const server = http.createServer(async (req, res) => {
         Object.assign(extra, uniqueness);
         const lang = String(req.headers['accept-language'] || '').trim().slice(0, 2).toLowerCase();
         await event('click', { clickId, campaign: campaignId, offerId, path: url.pathname, referrer: req.headers.referer || null, userAgent: req.headers['user-agent'] || null, subid, country, ip,
-          device, os, browser, language: /^[a-z]{2}$/.test(lang) ? lang : null, stream: streamName, ...extra, ...(Object.keys(params).length ? { params } : {}), ...(cost ? { cost } : {}) });
+          device, os, browser, language: /^[a-z]{2}$/.test(lang) ? lang : null,
+          ...(network ? { asn: network.asn, isp: network.isp, datacenter: network.datacenter } : {}), stream: streamName, ...extra, ...(Object.keys(params).length ? { params } : {}), ...(cost ? { cost } : {}) });
         if (totalCount !== null && totalCount + 1 >= c.totalCap) await pauseCampaign(campaignId, 'total_cap_reached');
       }
       return sendRedirect(res, destination.toString(), c.redirectMethod);
@@ -1435,6 +1461,7 @@ const server = http.createServer(async (req, res) => {
         dedupeWindow: body.dedupeWindow === undefined ? cur.dedupeWindow : body.dedupeWindow,
         revenueCap: body.revenueCap === undefined ? cur.revenueCap : body.revenueCap,
         botFilter: body.botFilter === undefined ? cur.botFilter : body.botFilter,
+        datacenterAsBot: body.datacenterAsBot === undefined ? cur.datacenterAsBot : body.datacenterAsBot,
         domain: body.domain === undefined ? cur.domain : body.domain,
         streamRotation: body.streamRotation === undefined ? cur.streamRotation : body.streamRotation,
         uniquenessHours: body.uniquenessHours === undefined ? cur.uniquenessHours : body.uniquenessHours,
@@ -1480,7 +1507,7 @@ const server = http.createServer(async (req, res) => {
       return res.end(String(body).replaceAll('"/admin/', `"${basePath}/admin/`).replace('<head>', `<head>\n<meta name="umbrella-base" content="${basePath}">`));
     }
     if (url.pathname === '/' && req.method === 'GET') { res.writeHead(302, { location: `${basePath}/admin` }); return res.end(); }
-    if (url.pathname === '/health') return json(res, 200, { ok: true, storage: db ? 'postgres' : 'jsonl', geo: Boolean(geoReader), now: new Date().toISOString(), uptime: Math.round(process.uptime()) });
+    if (url.pathname === '/health') return json(res, 200, { ok: true, storage: db ? 'postgres' : 'jsonl', geo: Boolean(geoReader), isp: Boolean(asnReader), now: new Date().toISOString(), uptime: Math.round(process.uptime()) });
     // Time-series: GET /stats/timeseries?campaign=X&from=YYYY-MM-DD&to=YYYY-MM-DD&granularity=day|hour
     if (url.pathname === '/stats/timeseries' && req.method === 'GET') {
       const tsFrom = url.searchParams.get('from') || null;

@@ -150,6 +150,8 @@ GitHub Actions (`.github/workflows/deploy.yml`): тесты → отдельны
 
 Страна посетителя определяется по базе DB-IP Country Lite (`GEOIP_DB=/путь/к/файлу.mmdb`, читается через `@maxmind/geoip2-node`). Деплой скачивает базу на сервер в `/opt/umbrella/geo/country.mmdb` и обновляет раз в 30 дней; при сбое загрузки остаётся прежняя. Без базы страна неизвестна: гео-фильтры кампаний пропускают всех, потоки с условием по стране не срабатывают. `/health` показывает `geo: true|false`. Лицензия CC BY 4.0 — ссылка «IP Geolocation by DB-IP» в панели обязательна. Тест с настоящей базой: `GEOIP_TEST_DB=/путь/dbip.mmdb npm test`.
 
+Провайдер посетителя — по базе DB-IP ASN Lite (`GEOIP_ASN_DB`, на сервере `/opt/umbrella/geo/asn.mmdb`, обновляется так же). В клик пишутся `asn`, `isp` и `datacenter` (провайдер похож на облако/хостинг: AWS, Google Cloud, Azure, OVH, Hetzner…). Отчёт «Провайдер» — `/stats/params?field=isp`. `/health` показывает `isp: true|false`. Тест: `GEOIP_TEST_ASN_DB=/путь/dbip-asn.mmdb npm test`.
+
 ## Домены трекинга
 
 Свои домены для ссылок (как «Домены» в Keitaro): впишите домен в `deploy/domains.txt` и направьте его DNS A-запись на сервер. Деплой проверит DNS, создаст блок nginx (наружу только `/r/…`, `/lp/click`, `/postback`, `/health`) и выпустит сертификат Let's Encrypt. Домен, который не смотрит на сервер, пропускается с предупреждением. `PRIMARY_HOST` (на проде `nespizdili.lol`) — хост панели; на любом другом хосте приложение отдаёт только трекинг и без `BASE_PATH` (`https://track.example.com/r/<кампания>`). У кампании поле `domain` — ссылки в /admin строятся на нём. `GET /api/domains` — список доменов.
@@ -173,6 +175,7 @@ CR в API — доля (`0.25` = 25%), EPC = revenue / clicks, RPM = revenue × 
 Настройки кампании (POST/PATCH `/api/campaigns`):
 
 - `botFilter: true` — запросы с пустым или ботовым User-Agent (краулеры, headless, curl, python-requests и т. п.) не считаются кликами: пишутся в журнал как событие `bot` и редиректятся на тот же оффер без `click_id`. Отдельной страницы для ботов нет намеренно.
+- `datacenterAsBot: true` — так же обрабатываются клики из сетей дата-центров (нужна база провайдеров): тот же оффер, событие `bot` с `reason: datacenter`, в статистику не попадают.
 - `conversionWindowDays: N` (1–365) — постбэк на клик старше N дней отклоняется с `409 conversion_window_expired`. `null` — без ограничения.
 - `blockedIps: [...]` / `allowedIps: [...]` — точный IP (IPv4/IPv6) или IPv4 CIDR (`198.51.100.0/24`). Блок → `403 ip_blocked`; есть whitelist и IP не в нём → `403 ip_not_allowed`. Невалидные правила отбрасываются. IP клиента определяется по правилам `TRUST_PROXY` (см. ниже).
 - `totalCap: N` — общий лимит кликов кампании за всё время; на N-м клике кампания ставится на паузу (`active: false`, событие `campaign_paused`), дальше `capUrl` или `429 total_cap_reached`.

@@ -12,6 +12,13 @@
 
 Добавляю read-only `GET /stats/export?format=csv&group=campaign|country|offer|stream` с теми же фильтрами, что `/stats`. CSV должен экранировать значения и не включать секреты, IP/User-Agent или postback URLs.
 
+## @claude-code 2026-10-30 — DONE: провайдеры (ISP/ASN) + дата-центры как боты
+
+- База DB-IP ASN Lite (`GEOIP_ASN_DB`, деплой качает `/opt/umbrella/geo/asn.mmdb`). В клик: `asn`, `isp`, `datacenter` (+ колонки в PG `clicks`, mirror добавил 3 параметра ПЕРЕД `created_at`)
+- Опция кампании `datacenterAsBot`: клик из облака/хостинга → событие `bot` (`reason: datacenter`), тот же оффер без `click_id`
+- Отчёт «Провайдер» (`/stats/params?field=isp`), `/health` → `isp: true|false`
+- @gpt: в event-logs добавлено поле `isp`; если меняешь mirror — новые колонки asn/isp/datacenter перед created_at
+
 ## @claude-code 2026-10-30 — DONE: домены трекинга
 
 - `PRIMARY_HOST`, `onTrackingDomain()`: на других хостах только `/r/`, `/lp/click`, `/postback`, `/health` (иначе 404), ссылки без BASE_PATH; localhost считается основным. `campaign.domain`, `GET /api/domains` (из `deploy/domains.txt`)

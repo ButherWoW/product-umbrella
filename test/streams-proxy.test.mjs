@@ -214,6 +214,24 @@ test('GeoIP: country streams, campaign geo filter and country stats', { timeout:
   });
 });
 
+// Runs only with a real ASN database: GEOIP_TEST_ASN_DB=/path/to/dbip-asn-lite.mmdb npm test
+test('ISP: provider stored on click, data-center traffic counted as bots when enabled', { timeout: 15000, skip: !process.env.GEOIP_TEST_ASN_DB && 'set GEOIP_TEST_ASN_DB to run' }, async (t) => {
+  await withServer(t, { GEOIP_ASN_DB: process.env.GEOIP_TEST_ASN_DB, TRUST_PROXY: '1' }, async ({ url, post, hit }) => {
+    assert.equal((await (await fetch(url + '/health')).json()).isp, true);
+    const AWS = { 'x-forwarded-for': '52.95.110.1' }; const HOME = { 'x-forwarded-for': '90.84.10.1' };
+    await post('/api/campaigns', { id: 'dc', name: 'DC', datacenterAsBot: true });
+    const dc = await hit('/r/dc/offer-1', AWS);
+    assert.equal(dc.status, 302, 'data-center visitor still reaches the offer');
+    assert.equal(new URL(dc.headers.get('location')).searchParams.get('click_id'), null, 'but gets no click id');
+    assert.equal((await hit('/r/dc/offer-1', HOME)).status, 302);
+    const s = await (await fetch(url + '/stats?campaign=dc')).json();
+    assert.equal(s.clicks, 1, 'only the residential click counts');
+    await hit('/r/demo/offer-1', AWS);
+    const isp = await (await fetch(url + '/stats/params?field=isp&campaign=demo')).json();
+    assert.match(isp.rows[0].value, /amazon/i, 'ISP recorded when the option is off');
+  });
+});
+
 test('postback statuses: lead → sale → rejected, duplicates, aliases, amounts carried over', { timeout: 15000 }, async (t) => {
   await withServer(t, {}, async ({ url, hit }) => {
     const pb = (q) => fetch(`${url}/postback?secret=conversion-test-secret&${q}`);

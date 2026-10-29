@@ -65,6 +65,9 @@ await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS lp_clicked_at TIMEST
 await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'sale'`);
 await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ`);
 for (const column of ['device', 'os', 'browser', 'language']) await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS ${column} TEXT`);
+await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS asn INTEGER`);
+await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS isp TEXT`);
+await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS datacenter BOOLEAN`);
 for (const column of ['is_unique_campaign', 'is_unique_stream', 'is_unique_global']) await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS ${column} BOOLEAN NOT NULL DEFAULT true`);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS params JSONB`);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS cost NUMERIC(12,6) NOT NULL DEFAULT 0`);
