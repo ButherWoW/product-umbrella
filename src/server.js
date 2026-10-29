@@ -245,6 +245,87 @@ function pickStream(streams, visitor = {}, excluded = new Set(), rotation = 'wei
   return { stream, offerId, landingId };
 }
 
+// Traffic simulation (Keitaro «Симуляция трафика»): where would this visitor go and why. Records nothing.
+const CONDITION_LABELS = { countries: 'страна', devices: 'устройство', os: 'ОС', browsers: 'браузер', languages: 'язык', isps: 'провайдер', days: 'день недели', hours: 'час' };
+function explainStream(stream, visitor) {
+  const c = stream.conditions || {};
+  const local = c.days?.length || c.hours?.length ? localDayHour(c.tz || 'UTC', visitor.now || new Date()) : {};
+  const actual = { countries: visitor.country, devices: visitor.device, os: visitor.os, browsers: visitor.browser, languages: visitor.language, isps: visitor.isp, days: local.day, hours: local.hour };
+  const checks = Object.keys(CONDITION_LABELS).filter((k) => c[k]?.length).map((k) => ({
+    condition: CONDITION_LABELS[k], expected: c[k], actual: actual[k] ?? null,
+    ok: k === 'isps' ? Boolean(visitor.isp) && c.isps.some((i) => visitor.isp.toLowerCase().includes(i)) : c[k].includes(actual[k]) }));
+  return { checks, matches: streamMatches(stream, visitor), mode: c.mode === 'or' ? 'or' : 'and' };
+}
+
+async function simulateClick(input, canSee) {
+  const ip = normalizeIp(String(input.ip || '').trim()) || null;
+  const ua = String(input.userAgent || '');
+  const network = ip ? lookupAsn(ip) : null;
+  const lang = String(input.language || '').trim().slice(0, 2).toLowerCase();
+  const at = input.at ? new Date(input.at) : new Date();
+  if (Number.isNaN(at.getTime())) return { error: 'invalid_at' };
+  const visitor = { device: detectDevice(ua), os: detectOS(ua), browser: detectBrowser(ua), language: /^[a-z]{2}$/.test(lang) ? lang : null,
+    country: /^[A-Za-z]{2}$/.test(input.country || '') ? input.country.toUpperCase() : (ip ? lookupCountry(ip) : null),
+    isp: input.isp ? String(input.isp).slice(0, 120) : network?.isp || null, now: at };
+  const query = new URLSearchParams(String(input.query || '').replace(/^\?/, ''));
+  const steps = [];
+  const finish = (result) => ({ visitor: { ...visitor, now: at.toISOString(), datacenter: network?.datacenter ?? null }, steps, result });
+  let campaignId = String(input.campaign || '');
+  const visited = [];
+  for (;;) {
+    const c = campaigns.get(campaignId);
+    if (!c || !canSee(c)) return finish({ outcome: 'error', status: 404, reason: `кампания ${campaignId} не найдена` });
+    const step = { campaign: campaignId, name: c.name, checks: [] };
+    steps.push(step);
+    if (!c.active) step.checks.push({ check: 'кампания включена', ok: false, note: 'на живом трафике будет 404' });
+    if (ip && c.blockedIps?.some((r) => ipMatches(ip, r))) return finish({ outcome: 'blocked', status: 403, reason: 'IP в чёрном списке кампании' });
+    if (ip && c.allowedIps?.length && !c.allowedIps.some((r) => ipMatches(ip, r))) return finish({ outcome: 'blocked', status: 403, reason: 'IP не в белом списке кампании' });
+    if (c.allowDevices?.length && !c.allowDevices.includes(visitor.device)) return finish({ outcome: 'blocked', status: 403, reason: `устройство ${visitor.device} не разрешено кампанией` });
+    if (c.allowOS?.length && !c.allowOS.includes(visitor.os)) return finish({ outcome: 'blocked', status: 403, reason: `ОС ${visitor.os} не разрешена кампанией` });
+    if (c.allowBrowsers?.length && !c.allowBrowsers.includes(visitor.browser)) return finish({ outcome: 'blocked', status: 403, reason: `браузер ${visitor.browser} не разрешён кампанией` });
+    if (c.allowGeos?.length && visitor.country && !c.allowGeos.includes(visitor.country)) {
+      return finish(c.geoCapUrl ? { outcome: 'redirect', status: 302, url: c.geoCapUrl, reason: `страна ${visitor.country} не разрешена → URL для чужого гео` }
+        : { outcome: 'blocked', status: 403, reason: `страна ${visitor.country} не разрешена кампанией` });
+    }
+    const capped = await cappedOffers(c.streams || []);
+    step.streams = (c.streams || []).map((st) => ({ name: st.name, type: st.type || 'regular', enabled: st.enabled !== false, ...explainStream(st, visitor),
+      cappedOffers: (st.offers || []).filter((o) => capped.has(o.offerId)).map((o) => o.offerId) }));
+    const matching = (c.streams || []).filter((st) => st.enabled !== false && streamMatches(st, visitor)
+      && (st.action || (st.offers ? st.offers.some((o) => !capped.has(o.offerId)) : !capped.has(st.offerId))));
+    const typeOf = (st) => st.type || 'regular';
+    const forced = matching.find((st) => typeOf(st) === 'forced');
+    const regular = matching.filter((st) => typeOf(st) === 'regular');
+    let candidates;
+    if (forced) candidates = [{ stream: forced, share: 1 }];
+    else if (regular.length) {
+      if (c.streamRotation === 'position') candidates = [{ stream: regular[0], share: 1 }];
+      else { const total = regular.reduce((t, st) => t + (st.weight || 1), 0); candidates = regular.map((st) => ({ stream: st, share: (st.weight || 1) / total })); }
+    } else { const fb = matching.find((st) => typeOf(st) === 'fallback'); candidates = fb ? [{ stream: fb, share: 1 }] : []; }
+    if (!candidates.length) return finish({ outcome: 'no_stream', status: 404, reason: 'ни один поток не подошёл (no_matching_stream)' });
+    step.chosen = candidates.map(({ stream: st, share }) => ({ stream: st.name, share: Math.round(share * 1000) / 10 }));
+    const top = candidates.sort((a, b) => b.share - a.share)[0].stream;
+    if (top.action === 'campaign') {
+      visited.push(campaignId);
+      if (visited.length > MAX_CAMPAIGN_HOPS || visited.includes(top.campaignId)) return finish({ outcome: 'error', status: 508, reason: 'зацикливание кампаний' });
+      campaignId = top.campaignId;
+      continue;
+    }
+    if (top.action === 'not_found') return finish({ outcome: 'not_found', status: 404, reason: `поток «${top.name}» отвечает 404` });
+    const bot = (c.botFilter && isBot(ua)) || (c.datacenterAsBot && network?.datacenter);
+    const params = {};
+    for (const field of TRACK_FIELDS) { const v = query.get(c.paramMap?.[field] || field); if (v) params[field] = v.slice(0, 255); }
+    const destinations = top.action === 'url' ? [{ url: top.url, share: 100 }]
+      : (() => { const live = (top.offers || [{ offerId: top.offerId, weight: 1 }]).filter((o) => !capped.has(o.offerId)); const total = live.reduce((t, o) => t + (o.weight || 1), 0);
+        return live.map((o) => ({ offerId: o.offerId, share: Math.round((o.weight || 1) / total * 1000) / 10, url: offers.get(o.offerId)?.url || null })); })();
+    const landing = top.landings?.length ? top.landings.map((l) => landings.get(l.landingId)?.url).filter(Boolean)[0] : null;
+    const vars = { ...params, click_id: 'SIMULATION', subid: query.get('subid') || '', campaign: campaignId, device: visitor.device, country: visitor.country || '', cost: '' };
+    return finish({ outcome: bot ? 'bot' : 'click', status: 302, stream: top.name,
+      ...(bot ? { reason: 'User-Agent бота или дата-центр при включённом фильтре' } : {}),
+      ...(landing ? { landing: applyMacros(landing, vars) } : {}),
+      destinations: destinations.map((d) => ({ ...d, url: d.url ? applyMacros(d.url, { ...vars, offer_id: d.offerId || '' }) : null })) });
+  }
+}
+
 const BOT_UA_RE = /bot\b|bot\/|crawl|spider|slurp|facebookexternalhit|headless|phantomjs|selenium|puppeteer|playwright|lighthouse|pingdom|uptimerobot|scrapy|curl\/|wget\/|python-requests|python-urllib|aiohttp|go-http-client|java\/|okhttp|apache-httpclient|libwww-perl/i;
 
 function isBot(ua) {
@@ -1443,6 +1524,11 @@ const server = http.createServer(async (req, res) => {
       await audit(req, 'update', 'settings', 'team', before, settings);
       return json(res, 200, settings);
     }
+    if (url.pathname === '/api/simulate' && req.method === 'POST') {
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      const result = await simulateClick(await readJson(req), (c) => canEditCampaign(req, c));
+      return json(res, result.error ? 400 : 200, result);
+    }
     if (url.pathname === '/api/audit' && req.method === 'GET') {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const entity = url.searchParams.get('entity') || null;
@@ -1566,7 +1652,7 @@ const server = http.createServer(async (req, res) => {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const body = await readJson(req);
       if (!/^[a-z0-9_-]{2,80}$/i.test(String(body.id || ''))) return json(res, 400, { error: 'valid_id_required' });
-      if (body.sourceId !== undefined && body.sourceId !== null && !sources.has(String(body.sourceId))) return json(res, 400, { error: 'source_not_found' });
+      if (OFFER_ID_RE.test(String(body.sourceId ?? '')) && !sources.has(String(body.sourceId))) return json(res, 400, { error: 'source_not_found' });
       if (campaigns.has(String(body.id)) && !canEditCampaign(req, campaigns.get(String(body.id)))) return json(res, 403, { error: 'campaign_not_yours' });
       // A buyer's new campaign is always theirs; the owner may assign it to someone.
       const ownerId = isBuyer(req) ? req.user.id : (body.ownerId ?? req.user?.id ?? null);
@@ -1591,7 +1677,7 @@ const server = http.createServer(async (req, res) => {
       if (!campaigns.has(id)) return json(res, 404, { error: 'campaign_not_found' });
       if (!canEditCampaign(req, campaigns.get(id))) return json(res, 403, { error: 'campaign_not_yours' });
       const body = await readJson(req);
-      if (body.sourceId !== undefined && body.sourceId !== null && !sources.has(String(body.sourceId))) return json(res, 400, { error: 'source_not_found' });
+      if (OFFER_ID_RE.test(String(body.sourceId ?? '')) && !sources.has(String(body.sourceId))) return json(res, 400, { error: 'source_not_found' });
       const cur = campaigns.get(id);
       campaigns.set(id, parseCampaign(id, {
         name: body.name === undefined ? cur.name : body.name,
