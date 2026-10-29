@@ -71,6 +71,21 @@ try {
   await page.locator('.editor-head .btn.primary').click();
   await page.locator('#toast', { hasText: 'Сохранено' }).waitFor();
 
+  // Stream filters with «НЕ»: everything except US, from Facebook, sub_id_3=fb.
+  await page.locator('.stream .title').first().click();
+  const filters = page.getByRole('dialog', { name: 'Редактирование потока' });
+  await filters.getByRole('tab', { name: 'Фильтры' }).click();
+  await filters.getByLabel('Страны', { exact: true }).fill('us');
+  await filters.getByLabel('Страны: НЕ', { exact: true }).check();
+  await filters.getByLabel('Реферер', { exact: true }).fill('facebook.com');
+  await filters.getByLabel('Параметры', { exact: true }).fill('sub_id_3=fb, tt');
+  await filters.getByRole('button', { name: 'Применить' }).click();
+  await page.locator('.stream', { hasText: 'Страны НЕ: US · Реферер: facebook.com · sub_id_3: fb, tt' }).waitFor();
+  await page.locator('.editor-head .btn.primary').click();
+  await page.locator('#toast', { hasText: 'Сохранено' }).waitFor();
+  const filtered = (await (await fetch(server.url + '/api/campaigns')).json()).campaigns['ui-flows'].streams[0].conditions;
+  assert.deepEqual([filtered.countries, filtered.not, filtered.referrers, filtered.params], [['US'], ['countries'], ['facebook.com'], { sub_id_3: ['fb', 'tt'] }]);
+
   // Offer conversion cap: cap, its time zone and the alternative offer from the offer dialog.
   await api('/api/offers', { id: 'ui-alt', url: 'https://alt.example.net/', name: 'Alt offer' });
   await page.goto(server.url + '/admin#/offers');
@@ -276,6 +291,26 @@ try {
   const attentionText = await attentionCard.innerText();
   assert.ok(/D13 Bad ROI|d13-bad/.test(attentionText) && /ROI/.test(attentionText), `attention block has campaign info, got: ${attentionText.slice(0, 100)}`);
 
+  // D15: compare two campaigns
+  await api('/api/campaigns', { id: 'd15-alpha', name: 'D15 Alpha', streams: [{ name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] }] });
+  await api('/api/campaigns', { id: 'd15-beta', name: 'D15 Beta', streams: [{ name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] }] });
+  for (let i = 0; i < 3; i++) await fetch(server.url + '/r/d15-alpha', { redirect: 'manual' });
+  await fetch(server.url + '/r/d15-beta', { redirect: 'manual' });
+  await page.goto(server.url + '/admin#/campaigns');
+  await page.locator('table.grid tbody tr', { hasText: 'D15 Alpha' }).waitFor();
+  await page.locator('table.grid tbody tr', { hasText: 'D15 Alpha' }).locator('input[type=checkbox]').check();
+  await page.locator('table.grid tbody tr', { hasText: 'D15 Beta' }).locator('input[type=checkbox]').check();
+  await page.locator('button', { hasText: 'Сравнить' }).waitFor();
+  await page.locator('button', { hasText: 'Сравнить' }).click();
+  const cmpDialog = page.getByRole('dialog', { name: 'Сравнение кампаний' });
+  await cmpDialog.waitFor();
+  const cmpText = await cmpDialog.innerText();
+  assert.ok(cmpText.includes('D15 Alpha'), `compare dialog should show first campaign, got: ${cmpText.slice(0, 200)}`);
+  assert.ok(cmpText.includes('D15 Beta'), 'compare dialog should show second campaign');
+  assert.ok(cmpText.includes('Клики'), 'compare dialog should show metrics');
+  const cmpRows = await cmpDialog.locator('table.grid tbody tr').count();
+  assert.equal(cmpRows, 9, `compare table should have 9 metric rows, got ${cmpRows}`);
+  await page.keyboard.press('Escape');
   // D17: CSV export from reports
   await page.goto(server.url + '/admin#/reports?group=campaign');
   await page.getByRole('heading', { name: 'Отчёт' }).waitFor();
@@ -317,6 +352,42 @@ try {
     await dlg.locator('input[type=password]').fill('buyer-password-1');
     await dlg.getByRole('button', { name: 'Создать' }).click();
     await p2.locator('table.grid tbody tr', { hasText: 'buyer@example.com' }).waitFor();
+    await p2.locator('.ip-allowlist', { hasText: 'Ограничения нет' }).waitFor();
+
+    // API keys: the secret is shown once with a copy button, the list shows only the last 4 characters,
+    // deletion needs a second click on the same row button (no confirm()).
+    await p2.locator('[data-nav=keys]').click();
+    await p2.getByRole('heading', { name: 'API-ключи' }).waitFor();
+    await p2.getByRole('button', { name: 'Создать', exact: true }).click();
+    const keyDlg = p2.getByRole('dialog', { name: 'Новый API-ключ' });
+    await keyDlg.getByLabel('Название').fill('UI script');
+    await keyDlg.getByRole('button', { name: 'Создать' }).click();
+    const secretDlg = p2.getByRole('dialog', { name: 'Ключ создан' });
+    const secret = await secretDlg.getByRole('textbox', { name: 'API-ключ' }).inputValue();
+    assert.match(secret, /^umb_[A-Za-z0-9_-]{43}$/);
+    assert.ok(await secretDlg.getByRole('button', { name: 'Копировать' }).isVisible());
+    assert.equal((await fetch(locked.url + '/api/auth/me', { headers: { authorization: 'Bearer ' + secret } }).then((r) => r.json())).user.email, 'owner@example.com', 'the shown key works');
+    await secretDlg.getByRole('button', { name: 'Готово' }).click();
+    const keyRow = p2.locator('table.grid tbody tr', { hasText: 'UI script' });
+    await keyRow.waitFor();
+    assert.ok((await keyRow.innerText()).includes('umb_…' + secret.slice(-4)));
+    assert.ok(!(await p2.locator('body').innerText()).includes(secret), 'the secret is gone after closing the dialog');
+    await p2.setViewportSize({ width: 390, height: 844 });
+    for (const hash of ['#/keys', '#/users']) {
+      await p2.goto(locked.url + '/admin' + hash);
+      await p2.locator('table.grid').waitFor();
+      const overflow = await p2.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+      assert.ok(overflow <= 1, `${hash} overflows by ${overflow}px at 390px`);
+    }
+    await p2.setViewportSize({ width: 1280, height: 900 });
+    await p2.goto(locked.url + '/admin#/keys');
+    const del = p2.locator('table.grid tbody tr', { hasText: 'UI script' }).getByRole('button', { name: 'Удалить ключ UI script' });
+    await del.click();
+    await p2.locator('table.grid tbody tr', { hasText: 'Удалить?' }).waitFor();
+    await del.click();
+    await p2.locator('#toast', { hasText: 'Ключ удалён' }).waitFor();
+    await p2.locator('table.grid tbody tr', { hasText: 'UI script' }).waitFor({ state: 'detached' });
+    assert.equal((await fetch(locked.url + '/api/auth/me', { headers: { authorization: 'Bearer ' + secret } })).status, 401, 'deleted key stops working');
     await p2.locator('[data-nav=dashboard]').click();
     await p2.getByRole('heading', { name: 'Баеры' }).waitFor();
 
@@ -393,6 +464,95 @@ try {
   await page.locator('.chip-btn', { hasText: 'День' }).click();
   assert.ok(await page.getByRole('checkbox', { name: 'Сравнить с предыдущим периодом' }).isDisabled(), 'compare disabled for day grouping');
   await page.evaluate(() => localStorage.removeItem('umbrella:reports:compare'));
+
+  // Task 7: groups of campaigns and offers (editor + offer modal with datalist, «Группа» column and filter), archive hidden by default.
+  await page.setViewportSize({ width: 1280, height: 900 });
+  const t7Stream = [{ name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] }];
+  await api('/api/campaigns', { id: 't7-camp-a', name: 'T7 Camp A', group: 'T7-old', streams: t7Stream });
+  await api('/api/campaigns', { id: 't7-camp-b', name: 'T7 Camp B', streams: t7Stream });
+  for (const id of ['t10-o1', 't10-o2', 't10-o3']) await api('/api/offers', { id, url: `https://example.com/${id}`, group: 'T10' });
+  await page.goto(server.url + '/admin#/campaigns/t7-camp-b');
+  await page.reload(); // the key from earlier steps was lost on reload; enter it explicitly
+  await page.locator('#token-btn').click();
+  const t7Key = page.getByRole('dialog', { name: 'Ключ администратора' });
+  await t7Key.locator('input[type=password]').fill(TOKEN);
+  await t7Key.getByRole('button', { name: 'Сохранить' }).click();
+  const t7GroupInput = page.locator('.editor').getByRole('combobox', { name: 'Группа' });
+  await t7GroupInput.waitFor();
+  const t7Datalist = await t7GroupInput.evaluate((el) => [...el.list.options].map((o) => o.value));
+  assert.ok(t7Datalist.includes('T7-old'), `campaign datalist offers existing groups, got: ${t7Datalist}`);
+  await t7GroupInput.fill('T7-new');
+  await page.locator('.editor-head .btn.primary').click();
+  await page.locator('#toast', { hasText: 'Сохранено' }).waitFor();
+  assert.equal((await (await fetch(server.url + '/api/campaigns')).json()).campaigns['t7-camp-b'].group, 'T7-new', 'campaign group saved from the editor');
+  await page.goto(server.url + '/admin#/campaigns');
+  await page.locator('table.grid tbody tr', { hasText: 'T7 Camp B' }).filter({ hasText: 'T7-new' }).waitFor();
+  const campGroupSel = page.getByLabel('Фильтр по группе');
+  await campGroupSel.locator('option[value="T7-new"]').waitFor({ state: 'attached' });
+  await campGroupSel.selectOption('T7-new');
+  await page.locator('table.grid tbody tr', { hasText: 'T7 Camp A' }).waitFor({ state: 'detached' });
+  assert.deepEqual(await page.locator('table.grid tbody tr td:nth-child(3)').allInnerTexts(), ['t7-camp-b'], 'group filter leaves only the campaigns of that group');
+  await campGroupSel.selectOption('');
+  await api('/api/campaigns/t7-camp-a', { archived: true }, 'PATCH');
+  await page.getByRole('button', { name: 'Обновить', exact: true }).click();
+  await page.locator('table.grid tbody tr', { hasText: 'T7 Camp B' }).waitFor();
+  await page.locator('table.grid tbody tr', { hasText: 'T7 Camp A' }).waitFor({ state: 'detached' });
+  await page.getByLabel('Состояние').selectOption('archived');
+  await page.locator('table.grid tbody tr', { hasText: 'T7 Camp A' }).waitFor();
+  assert.equal(await page.locator('table.grid tbody tr', { hasText: 'T7 Camp B' }).count(), 0, 'archive view shows only archived campaigns');
+  // Offer modal: group field with existing groups, value sent on save.
+  await page.goto(server.url + '/admin#/offers');
+  await page.locator('table.grid tbody tr', { hasText: 't10-o3' }).getByRole('button', { name: 'Изменить' }).click();
+  const t7OfferDlg = page.getByRole('dialog', { name: 'Редактирование оффера' });
+  const t7OfferGroup = t7OfferDlg.getByRole('combobox', { name: 'Группа' });
+  assert.equal(await t7OfferGroup.inputValue(), 'T10');
+  assert.ok((await t7OfferGroup.evaluate((el) => [...el.list.options].map((o) => o.value))).includes('T10'), 'offer datalist offers existing groups');
+  await t7OfferGroup.fill('T10-solo');
+  await t7OfferDlg.getByRole('button', { name: 'Сохранить' }).click();
+  await t7OfferDlg.waitFor({ state: 'detached' });
+  assert.equal((await (await fetch(server.url + '/api/offers')).json()).offers['t10-o3'].group, 'T10-solo', 'offer group saved from the modal');
+
+  // Task 10: bulk actions with selected offers — daily cap, group, archive (with in-page confirmation).
+  const offerRow = (id) => page.locator('table.grid tbody tr').filter({ has: page.getByRole('link', { name: id, exact: true }) });
+  const offersGroupSel = page.getByLabel('Фильтр по группе');
+  await offersGroupSel.locator('option[value="T10"]').waitFor({ state: 'attached' });
+  await offersGroupSel.selectOption('T10');
+  await offerRow('t10-o3').waitFor({ state: 'detached' });
+  assert.equal(await page.locator('table.grid tbody tr').count(), 2, 'offers group filter leaves the two T10 offers');
+  const selectT10 = async () => { for (const id of ['t10-o1', 't10-o2']) await offerRow(id).getByRole('checkbox', { name: 'Выбрать' }).check(); };
+  await selectT10();
+  await page.getByRole('button', { name: 'Задать дневной кап…' }).click();
+  const capDlg = page.getByRole('dialog', { name: 'Дневной кап для офферов' });
+  await capDlg.getByLabel('Дневной кап кликов').fill('7');
+  await capDlg.getByRole('button', { name: 'Применить' }).click();
+  await page.locator('#toast', { hasText: 'Кап задан: 2' }).waitFor();
+  let t10Offers = (await (await fetch(server.url + '/api/offers')).json()).offers;
+  assert.deepEqual([t10Offers['t10-o1'].dailyCap, t10Offers['t10-o2'].dailyCap, t10Offers['t10-o3'].dailyCap], [7, 7, null], 'bulk cap applied to the selected offers only');
+  await selectT10();
+  await page.getByRole('button', { name: 'Сменить группу…' }).click();
+  const grpDlg = page.getByRole('dialog', { name: 'Группа для офферов' });
+  await grpDlg.getByRole('combobox', { name: 'Группа' }).fill('T10-bulk');
+  await grpDlg.getByRole('button', { name: 'Применить' }).click();
+  await page.locator('#toast', { hasText: 'Группа изменена: 2' }).waitFor();
+  t10Offers = (await (await fetch(server.url + '/api/offers')).json()).offers;
+  assert.deepEqual([t10Offers['t10-o1'].group, t10Offers['t10-o2'].group], ['T10-bulk', 'T10-bulk']);
+  await offersGroupSel.locator('option[value="T10-bulk"]').waitFor({ state: 'attached' });
+  await offersGroupSel.selectOption('T10-bulk');
+  await offerRow('t10-o3').waitFor({ state: 'detached' });
+  await selectT10();
+  await page.getByRole('button', { name: 'В архив', exact: true }).click();
+  assert.ok(!(await t10OffersArchived()), 'first click only asks for confirmation');
+  await page.getByRole('button', { name: /В архив 2\? Нажмите ещё раз/ }).click();
+  await page.locator('#toast', { hasText: 'В архиве: 2' }).waitFor();
+  await offerRow('t10-o1').waitFor({ state: 'detached' });
+  assert.equal(await offerRow('t10-o2').count(), 0, 'archived offers are hidden from the list');
+  assert.ok(await t10OffersArchived(), 'bulk archive stored');
+  await page.getByLabel('Состояние').selectOption('archived');
+  await offerRow('t10-o1').waitFor();
+  await offerRow('t10-o2').waitFor();
+  assert.equal(await page.locator('#view .err[role=alert]').count(), 0, 'no per-offer errors');
+  assert.ok(!(await page.locator('body').innerText()).includes('[object'), 'no stringified DOM nodes on offers page');
+  async function t10OffersArchived() { const o = (await (await fetch(server.url + '/api/offers')).json()).offers; return o['t10-o1'].archived && o['t10-o2'].archived; }
 
   assert.deepEqual(errors, []);
   console.log('Admin UI browser test passed');
