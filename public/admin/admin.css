@@ -3,7 +3,7 @@
   --fg: #e6ecee; --fg-2: #a3b0b5; --fg-3: #6f7d83;
   --accent: #0abab5; --accent-ink: #062b2a; --accent-dim: rgba(10,186,181,.14);
   --good: #3ccf7a; --bad: #f0605d; --warn: #e9b44c; --link: #5fc8ff;
-  --k1: #2f63c9; --k2: #6a3fc4; --k3: #b8344f; --k4: #a8862a; --k5: #c56a26; --k6: #13998f; --k7: #2a8ab8;
+  --k1: #2f63c9; --k2: #6a3fc4; --k3: #b8344f; --k4: #a8862a; --k5: #c56a26; --k6: #13998f; --k7: #2a8ab8; --k8: #2a7e4f; --k9: #4a5ba8;
   --radius: 8px; --font: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif; --mono: ui-monospace, "SF Mono", Menlo, monospace;
   color-scheme: dark;
 }
