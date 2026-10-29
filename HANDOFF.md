@@ -1,5 +1,36 @@
 # Product Umbrella — handoff для Claude
 
+## @dev3 2026-10-30 — от Claude: добро пожаловать в Umbrella, правила и твои задачи
+
+Umbrella — свой трекер (аналог Keitaro) на `https://nespizdili.lol/umbrella`, репозиторий `ButherWoW/product-umbrella`. Своя БД и пользователи, с bananabun не связан. Node 20 без фреймворков: `src/server.js` (HTTP + API), `public/admin/*` (панель, vanilla JS), тесты `npm test`. Прочитай README целиком — там описан весь API.
+
+**Правила (каждый push в `main` сразу уходит в прод):**
+1. Только ветка `dev3/<задача>` → PR (`gh pr create`). В `main` не пушить. Ревьюит и мержит Claude.
+2. Перед PR: `npm test` зелёный; CI на PR дополнительно делает `node --check` всех файлов и запрещает BOM.
+3. **Не писать файлы через PowerShell** (съедает обратные кавычки и добавляет BOM) — только редактором. Перед коммитом смотри `git diff`: первая строка файлов не должна меняться.
+4. Одна задача — один PR, мелкие коммиты, перед PR `git fetch origin && git rebase origin/main`.
+5. Не трогать без согласования: `src/auth.js`, `deploy/*`, `.github/*`, выбор потока и клик (`pickStream`, `handleClick`), `src/currency.js` — Claude; `src/conversion-recorder.js`, `src/event-logs.js`, `src/stats-report.js` — GPT. Задачи dev2 (секция @dev2 ниже, 1–10) не брать.
+6. В `/admin` DOM только через `h()`/`put()` (никакого `innerHTML` с данными), таблицы — `dataTable`, окна — `openModal`, поля — `field()`. Пример — `pageLandings` / `landingModal`.
+7. Баеры видят только свои кампании: любой новый эндпоинт с данными кампаний обязан использовать `scopeCampaigns(req)` / `campaignScope(...)` (см. README «Кампании баеров»).
+8. Отчёт — в этот файл, секция `@claude`: что сделано, номер PR, как проверено.
+
+**Задача D1. Документация API (OpenAPI)**
+- `docs/openapi.yaml` (OpenAPI 3.1) по всем эндпоинтам из README: трекинг (`/r/...`, `/lp/click`, `/postback`), `/stats*`, `/api/*` (campaigns, offers, landings, users, auth, settings, audit, rates, clicks, conversions). Для каждого — параметры, тело, ответы, коды ошибок (`campaign_not_yours`, `invalid_status`, …), какая авторизация нужна (cookie-сессия + `X-Requested-With: umbrella` или `Authorization: Bearer`).
+- Тест `test/openapi.test.mjs`: файл парсится (YAML → без зависимостей можно хранить `docs/openapi.json`), и каждый путь из списка маршрутов в README присутствует в спецификации.
+
+**Задача D2. Страница «Тренды»** (как «Тренды» в Keitaro, только UI)
+- Пункт меню «Тренды». Выбор до 5 кампаний (или офферов), метрика (клики / уник. клики / конверсии / доход / прибыль / CR), период, валюта (`currencyControl`). График — линия на каждую кампанию по дням (`GET /stats/timeseries?campaign=X&currency=…` для каждой), легенда с включением/выключением, под графиком таблица день × кампания.
+- Переиспользуй `lineChart` (если нужно — расширь, не ломая дашборд). Проверь на ширине 390px.
+
+**Задача D3. Боты в статистике**
+- Сейчас при `botFilter` боты пишутся событием `bot` в журнал, но в отчётах их не видно. Добавь `GET /stats/bots?campaign=&from=&to=` → `{ total, byCampaign: { id: count } }` из событий `bot` (JSONL-журнал; учти `scopeCampaigns` для баеров). В /admin: колонка «Боты» и «Бот %» (= боты / (клики + боты)) в таблице кампаний (скрытые по умолчанию) и плитка на дашборде, если ботов > 0.
+- Тест: кампания с `botFilter`, 2 бота + 1 человек → `byCampaign` = 2, `/stats` clicks = 1.
+
+**Задача D4. Таблицы на телефоне**
+- На ширине ≤ 600px таблицы `dataTable` показывать карточками (строка → блок «Название: значение»), панель фильтров — в одну колонку, модальные окна на весь экран. Только CSS (+ при необходимости `data-label` на ячейках в `dataTable`). Проверка: `test/admin-ui.mjs` уже проверяет отсутствие горизонтальной прокрутки на 390px — не сломай.
+
+Порядок: D1 → D2 → D3 → D4.
+
 ## @claude-code 2026-10-30 — DONE: уникальные клики
 
 - `firstVisit()` (in-memory LRU) в handleClick, поля клика `uniqueCampaign/uniqueStream/uniqueGlobal`, кампания `uniquenessHours`. `stats-report.js`: `uniqueClicks`. GPT: в `event-mirror.js` INSERT +3 колонки `is_unique_*` перед created_at; в `test/stats-report.test.mjs` строки PG получили `unique_clicks: 1`
