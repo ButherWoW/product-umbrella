@@ -37,7 +37,10 @@
           "url": { "type": "string", "format": "uri" },
           "postbackUrl": { "type": ["string", "null"], "format": "uri" },
           "dailyCap": { "type": ["integer", "null"] },
-          "name": { "type": ["string", "null"] }
+          "name": { "type": ["string", "null"] },
+          "conversionCap": { "type": ["integer", "null"], "minimum": 1, "description": "Lead + sale conversions per local day in capTz" },
+          "capTz": { "type": "string", "default": "UTC", "description": "IANA time zone of the cap day" },
+          "altOfferId": { "type": ["string", "null"], "description": "Offer that takes the traffic when the conversion cap is reached (chain up to 3 hops)" }
         }
       },
       "Landing": {
@@ -330,6 +333,7 @@
                   "rate": { "value": { "error": "click_rate_limited" } },
                   "daily_cap": { "value": { "error": "daily_cap_reached", "dailyCap": 1000 } },
                   "offer_cap": { "value": { "error": "offer_cap_reached", "offerId": "offer-1", "dailyCap": 500 } },
+                  "offer_conversion_cap": { "value": { "error": "offer_conversion_cap_reached", "offerId": "offer-1", "conversionCap": 20 } },
                   "total_cap": { "value": { "error": "total_cap_reached", "totalCap": 10000 } },
                   "revenue_cap": { "value": { "error": "revenue_cap_reached", "revenueCap": 500 } }
                 }
@@ -915,7 +919,10 @@
                   "url": { "type": "string", "format": "uri" },
                   "postbackUrl": { "type": ["string", "null"] },
                   "dailyCap": { "type": ["integer", "null"] },
-                  "name": { "type": ["string", "null"] }
+                  "name": { "type": ["string", "null"] },
+                  "conversionCap": { "type": ["integer", "null"], "minimum": 1, "description": "Lead + sale conversions per local day in capTz" },
+                  "capTz": { "type": "string", "default": "UTC", "description": "IANA time zone of the cap day" },
+                  "altOfferId": { "type": ["string", "null"], "description": "Offer that takes the traffic when the conversion cap is reached (chain up to 3 hops)" }
                 }
               }
             }
@@ -952,7 +959,10 @@
                   "url": { "type": "string", "format": "uri" },
                   "postbackUrl": { "type": ["string", "null"] },
                   "dailyCap": { "type": ["integer", "null"] },
-                  "name": { "type": ["string", "null"] }
+                  "name": { "type": ["string", "null"] },
+                  "conversionCap": { "type": ["integer", "null"], "minimum": 1, "description": "Lead + sale conversions per local day in capTz" },
+                  "capTz": { "type": "string", "default": "UTC", "description": "IANA time zone of the cap day" },
+                  "altOfferId": { "type": ["string", "null"], "description": "Offer that takes the traffic when the conversion cap is reached (chain up to 3 hops)" }
                 }
               }
             }

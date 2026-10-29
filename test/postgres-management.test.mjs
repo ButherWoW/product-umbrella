@@ -50,3 +50,52 @@ test('PostgreSQL: sources, networks, clones, archive and groups survive a restar
     assert.equal(campaigns[`${ids.campaign}-copy`]?.active, false, 'clone starts disabled');
   } finally { await server.stop(); }
 });
+
+test('PostgreSQL: offer conversion cap fields persist and the cap is counted from the database', { skip: !databaseUrl && 'set TEST_DATABASE_URL to run', timeout: 30000 }, async (t) => {
+  const dirs = [];
+  const start = async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'umbrella-pgcap-')); dirs.push(dir);
+    return startTestServer(dir, { DATABASE_URL: databaseUrl, REQUIRE_POSTGRES: '1', ADMIN_TOKEN: TOKEN });
+  };
+  t.after(async () => { for (const dir of dirs) await rm(dir, { recursive: true, force: true }); });
+  const run = Date.now().toString(36);
+  const ids = { main: `cap-${run}`, alt: `cap-alt-${run}`, campaign: `cap-cmp-${run}` };
+  let server = await start();
+  const call = (path, body, method = body ? 'POST' : 'GET') => fetch(server.url + path, {
+    method, headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+  const host = async () => new URL((await fetch(`${server.url}/r/${ids.campaign}`, { redirect: 'manual' })).headers.get('location'));
+  try {
+    assert.equal((await call('/api/offers', { id: ids.alt, url: 'https://alt.example.com/' })).status, 201);
+    assert.equal((await call('/api/offers', { id: ids.main, url: 'https://main.example.com/', conversionCap: 1, capTz: 'Asia/Dubai', altOfferId: ids.alt })).status, 201);
+    assert.equal((await call('/api/campaigns', { id: ids.campaign, name: 'Cap', streams: [{ name: 'm', offers: [{ offerId: ids.main }] }] })).status, 201);
+    const first = await host();
+    assert.equal(first.hostname, 'main.example.com');
+    assert.equal((await fetch(`${server.url}/postback?click_id=${first.searchParams.get('click_id')}&secret=conversion-test-secret&status=sale`)).status, 200);
+    // The cached count is dropped once the asynchronous mirror has the conversion, so the switch follows within moments.
+    let routed = null;
+    for (let i = 0; i < 40 && routed !== ids.alt; i++) {
+      routed = (await (await call('/api/simulate', { campaign: ids.campaign })).json()).result.destinations?.[0]?.offerId;
+      if (routed !== ids.alt) await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(routed, ids.alt, 'same server switches to the alternative after the postback');
+  } finally { await server.stop(); }
+
+  // Empty data directory: offers and the conversion count can only come from PostgreSQL.
+  server = await start();
+  try {
+    const { offers } = await (await call('/api/offers')).json();
+    assert.deepEqual([offers[ids.main]?.conversionCap, offers[ids.main]?.capTz, offers[ids.main]?.altOfferId], [1, 'Asia/Dubai', ids.alt]);
+    assert.equal(offers[ids.alt]?.conversionCap, null);
+    const next = await host();
+    assert.equal(next.hostname, 'alt.example.com', 'cap reached in PostgreSQL → alternative offer');
+    const log = await (await call(`/api/clicks?campaign=${ids.campaign}`)).json();
+    const recorded = log.clicks.find((c) => c.clickId === next.searchParams.get('click_id'));
+    // The click log may read PostgreSQL before the asynchronous mirror catches up; the JSONL copy is checked then.
+    if (recorded) assert.equal(recorded.offerId, ids.alt);
+    assert.equal((await call(`/api/offers/${ids.main}`, { altOfferId: null }, 'PATCH')).status, 200);
+    const { offers: after } = await (await call('/api/offers')).json();
+    assert.equal(after[ids.main].altOfferId, null, 'alternative cleared');
+    const capped = await fetch(`${server.url}/r/${ids.campaign}`, { redirect: 'manual' });
+    assert.equal(capped.status, 404, 'no alternative → the stream has no usable offer');
+  } finally { await server.stop(); }
+});

@@ -7,10 +7,10 @@ export function createEventMirror({ query, onError = () => {} }) {
   const pending = new Set();
 
   function enqueue({ type, at, ...payload }) {
-    if (!['click', 'conversion', 'lp_click', 'bot'].includes(type)) return;
+    if (!['click', 'conversion', 'lp_click', 'bot'].includes(type)) return null;
     if (type === 'bot') {
       const task = query('INSERT INTO bots (campaign, offer_id, stream, user_agent, ip, reason, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)', [payload.campaign, payload.offerId ?? null, payload.stream ?? null, payload.userAgent ?? null, payload.ip ?? null, payload.reason ?? null, at]).catch((error) => onError(type, error));
-      pending.add(task); task.then(() => pending.delete(task)); return;
+      pending.add(task); task.then(() => pending.delete(task)); return task;
     }
     const task = lock(payload.clickId, async () => {
       if (type === 'click') {
@@ -39,6 +39,7 @@ export function createEventMirror({ query, onError = () => {} }) {
     const settled = task.catch(() => {});
     pending.add(settled);
     settled.then(() => pending.delete(settled));
+    return settled;
   }
 
   async function drain() {

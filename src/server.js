@@ -10,6 +10,7 @@ import { createRates, normalizeCurrency } from './currency.js';
 import { readEventLog } from './event-logs.js';
 import { createConversionRecorder, hasRecordedConversion, findRecordedConversion } from './conversion-recorder.js';
 import { createEventMirror } from './event-mirror.js';
+import { createConversionCapCounter, resolveOffer } from './conversion-cap.js';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const dataDir = process.env.DATA_DIR || join(root, 'data');
@@ -121,6 +122,8 @@ const STREAM_ACTIONS = ['offers', 'url', 'not_found', 'campaign'];
 const REDIRECT_METHODS = ['http', 'meta', 'js'];
 // Hops allowed through "send to campaign" streams before giving up (protects against A → B → A loops).
 const MAX_CAMPAIGN_HOPS = 3;
+// Alternative offers followed when an offer's conversion cap is reached (A → B → C → D at most).
+const MAX_ALT_HOPS = 3;
 
 function parseList(raw, normalize, valid) {
   return Array.isArray(raw) ? raw.map(normalize).filter(valid).slice(0, 50) : [];
@@ -287,9 +290,12 @@ async function simulateClick(input, canSee) {
       return finish(c.geoCapUrl ? { outcome: 'redirect', status: 302, url: c.geoCapUrl, reason: `страна ${visitor.country} не разрешена → URL для чужого гео` }
         : { outcome: 'blocked', status: 403, reason: `страна ${visitor.country} не разрешена кампанией` });
     }
-    const capped = await cappedOffers(c.streams || []);
+    const routing = await offerRouting(c.streams || []);
+    const capped = routing.excluded;
+    // Every offer that cannot take traffic itself: why, and which alternative takes it (conversion cap) if any.
     step.streams = (c.streams || []).map((st) => ({ name: st.name, type: st.type || 'regular', enabled: st.enabled !== false, ...explainStream(st, visitor),
-      cappedOffers: (st.offers || []).filter((o) => capped.has(o.offerId)).map((o) => o.offerId) }));
+      cappedOffers: (st.offers || (st.offerId ? [st] : [])).filter((o) => routing.reasons.has(o.offerId))
+        .map((o) => ({ offerId: o.offerId, reason: routing.reasons.get(o.offerId), altOfferId: routing.substitutes.get(o.offerId) || null })) }));
     const matching = (c.streams || []).filter((st) => st.enabled !== false && streamMatches(st, visitor)
       && (st.action || (st.offers ? st.offers.some((o) => !capped.has(o.offerId)) : !capped.has(st.offerId))));
     const typeOf = (st) => st.type || 'regular';
@@ -316,7 +322,8 @@ async function simulateClick(input, canSee) {
     for (const field of TRACK_FIELDS) { const v = query.get(c.paramMap?.[field] || field); if (v) params[field] = v.slice(0, 255); }
     const destinations = top.action === 'url' ? [{ url: top.url, share: 100 }]
       : (() => { const live = (top.offers || [{ offerId: top.offerId, weight: 1 }]).filter((o) => !capped.has(o.offerId)); const total = live.reduce((t, o) => t + (o.weight || 1), 0);
-        return live.map((o) => ({ offerId: o.offerId, share: Math.round((o.weight || 1) / total * 1000) / 10, url: offers.get(o.offerId)?.url || null })); })();
+        return live.map((o) => { const used = routing.substitutes.get(o.offerId) || o.offerId;
+          return { offerId: used, ...(used !== o.offerId ? { insteadOf: o.offerId } : {}), share: Math.round((o.weight || 1) / total * 1000) / 10, url: offers.get(used)?.url || null }; }); })();
     const landing = top.landings?.length ? top.landings.map((l) => landings.get(l.landingId)?.url).filter(Boolean)[0] : null;
     const vars = { ...params, click_id: 'SIMULATION', subid: query.get('subid') || '', campaign: campaignId, device: visitor.device, country: visitor.country || '', cost: '' };
     return finish({ outcome: bot ? 'bot' : 'click', status: 302, stream: top.name,
@@ -435,15 +442,38 @@ async function countTodayClicks(campaign) {
   return countClicks({ campaign, since: todayStart() });
 }
 
-// Offer ids from the campaign's streams whose offer-level dailyCap is reached today.
-async function cappedOffers(streams) {
-  const ids = new Set(streams.flatMap((s) => (s.offers ? s.offers.map((o) => o.offerId) : [s.offerId])));
-  const capped = new Set();
+const conversionCaps = createConversionCapCounter({ db, eventsFile,
+  onFallback: (error) => console.warn('[db] conversion cap fallback:', error.message) });
+
+// null when the offer can take traffic, otherwise why not: missing, archived, click_cap (dailyCap) or conversion_cap.
+async function offerState(id) {
+  const offer = offers.get(id);
+  if (!offer) return 'missing';
+  if (offer.archived) return 'archived';
+  if (offer.dailyCap && await countClicks({ offerId: id, since: todayStart() }) >= offer.dailyCap) return 'click_cap';
+  if (offer.conversionCap && await conversionCaps.count(id, offer.capTz) >= offer.conversionCap) return 'conversion_cap';
+  return null;
+}
+
+// For the campaign's stream offers: `excluded` (capped, archived, no usable alternative) are skipped in rotation,
+// `substitutes` maps a conversion-capped offer to the alternative that takes its traffic, `reasons` says why.
+async function offerRouting(streams) {
+  const ids = new Set(streams.flatMap((s) => (s.offers ? s.offers.map((o) => o.offerId) : s.offerId ? [s.offerId] : [])));
+  const states = new Map();
+  const stateOf = async (id) => { if (!states.has(id)) states.set(id, await offerState(id)); return states.get(id); };
+  const excluded = new Set(); const substitutes = new Map(); const reasons = new Map();
   for (const id of ids) {
-    const cap = offers.get(id)?.dailyCap;
-    if (offers.get(id)?.archived || (cap && await countClicks({ offerId: id, since: todayStart() }) >= cap)) capped.add(id);
+    const state = await stateOf(id);
+    // Unknown offers are left alone (the click answers 404 offer_not_found, as before).
+    if (!state || state === 'missing') continue;
+    reasons.set(id, state);
+    // Pre-compute states along the alternative chain, then resolve it synchronously.
+    for (let alt = offers.get(id)?.altOfferId, seen = new Set([id]); state === 'conversion_cap' && alt && seen.size <= MAX_ALT_HOPS && !seen.has(alt); seen.add(alt), alt = offers.get(alt)?.altOfferId) await stateOf(alt);
+    const route = resolveOffer(id, { stateOf: (x) => (states.has(x) ? states.get(x) : 'missing'), altOf: (x) => offers.get(x)?.altOfferId || null, maxHops: MAX_ALT_HOPS });
+    if (route.offerId) substitutes.set(id, route.offerId);
+    else excluded.add(id);
   }
-  return capped;
+  return { excluded, substitutes, reasons };
 }
 
 function ipv4ToInt(ip) {
@@ -552,14 +582,31 @@ function parseOffer(raw) {
   const dailyCap = Number.isInteger(raw?.dailyCap) && raw.dailyCap > 0 ? raw.dailyCap : null;
   const name = typeof raw?.name === 'string' && raw.name.trim() ? raw.name.trim().slice(0, 200) : null;
   const networkId = OFFER_ID_RE.test(String(raw?.networkId || '')) ? String(raw.networkId) : null;
-  return { url: urlStr, postbackUrl, dailyCap, name, networkId, archived: raw?.archived === true, group: typeof raw?.group === 'string' ? raw.group.trim().slice(0, 60) : '' };
+  // Conversion cap: lead + sale conversions per local day in capTz; when reached, traffic goes to altOfferId.
+  const conversionCap = Number.isInteger(raw?.conversionCap) && raw.conversionCap > 0 ? raw.conversionCap : null;
+  const capTz = typeof raw?.capTz === 'string' && validTimeZone(raw.capTz) ? raw.capTz : 'UTC';
+  const altOfferId = OFFER_ID_RE.test(String(raw?.altOfferId || '')) ? String(raw.altOfferId) : null;
+  return { url: urlStr, postbackUrl, dailyCap, name, networkId, archived: raw?.archived === true, group: typeof raw?.group === 'string' ? raw.group.trim().slice(0, 60) : '',
+    conversionCap, capTz, altOfferId };
+}
+
+// Validation of the conversion-cap fields in POST/PATCH /api/offers (absent fields are not checked).
+function conversionCapError(id, body) {
+  if (body.conversionCap !== undefined && body.conversionCap !== null && !(Number.isInteger(body.conversionCap) && body.conversionCap > 0)) return 'invalid_conversion_cap';
+  if (body.capTz !== undefined && body.capTz !== null && !(typeof body.capTz === 'string' && validTimeZone(body.capTz))) return 'invalid_cap_tz';
+  if (body.altOfferId !== undefined && body.altOfferId !== null && body.altOfferId !== '') {
+    if (String(body.altOfferId) === id) return 'alt_offer_is_self';
+    if (!offers.has(String(body.altOfferId))) return 'alt_offer_not_found';
+  }
+  return null;
 }
 
 async function loadOffers() {
   if (db) {
     try {
-      const { rows } = await db.query('SELECT id, url, postback_url, daily_cap, name, network_id, "group", archived FROM offers');
-      for (const row of rows) if (/^[a-z0-9_-]{2,80}$/i.test(row.id) && /^https:\/\//i.test(row.url)) offers.set(row.id, parseOffer({ url: row.url, postbackUrl: row.postback_url, dailyCap: row.daily_cap, name: row.name, networkId: row.network_id, group: row.group, archived: row.archived === true }));
+      const { rows } = await db.query('SELECT id, url, postback_url, daily_cap, name, network_id, "group", archived, conversion_cap, cap_tz, alt_offer_id FROM offers');
+      for (const row of rows) if (/^[a-z0-9_-]{2,80}$/i.test(row.id) && /^https:\/\//i.test(row.url)) offers.set(row.id, parseOffer({ url: row.url, postbackUrl: row.postback_url, dailyCap: row.daily_cap, name: row.name, networkId: row.network_id, group: row.group, archived: row.archived === true,
+        conversionCap: row.conversion_cap, capTz: row.cap_tz, altOfferId: row.alt_offer_id }));
       return;
     } catch (error) { console.warn('[db] offers load fallback:', error.message); }
   }
@@ -580,7 +627,7 @@ async function saveOffers() {
 
 async function persistOffer(id, value) {
   const offer = typeof value === 'string' ? { url: value, postbackUrl: null } : value;
-  if (db) await db.query('INSERT INTO offers (id, url, postback_url, daily_cap, name, network_id, "group", archived) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (id) DO UPDATE SET url = EXCLUDED.url, postback_url = EXCLUDED.postback_url, daily_cap = EXCLUDED.daily_cap, name = EXCLUDED.name, network_id = EXCLUDED.network_id, "group" = EXCLUDED."group", archived = EXCLUDED.archived', [id, offer.url, offer.postbackUrl, offer.dailyCap ?? null, offer.name ?? null, offer.networkId ?? null, offer.group ?? '', offer.archived === true]);
+  if (db) await db.query('INSERT INTO offers (id, url, postback_url, daily_cap, name, network_id, "group", archived, conversion_cap, cap_tz, alt_offer_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (id) DO UPDATE SET url = EXCLUDED.url, postback_url = EXCLUDED.postback_url, daily_cap = EXCLUDED.daily_cap, name = EXCLUDED.name, network_id = EXCLUDED.network_id, "group" = EXCLUDED."group", archived = EXCLUDED.archived, conversion_cap = EXCLUDED.conversion_cap, cap_tz = EXCLUDED.cap_tz, alt_offer_id = EXCLUDED.alt_offer_id', [id, offer.url, offer.postbackUrl, offer.dailyCap ?? null, offer.name ?? null, offer.networkId ?? null, offer.group ?? '', offer.archived === true, offer.conversionCap ?? null, offer.capTz || 'UTC', offer.altOfferId ?? null]);
   else await saveOffers();
 }
 
@@ -723,7 +770,8 @@ async function event(type, payload) {
   await mkdir(dataDir, { recursive: true });
   const record = { id: randomUUID(), type, at: new Date().toISOString(), ...payload };
   await appendFile(eventsFile, `${JSON.stringify(record)}\n`);
-  eventMirror?.enqueue(record);
+  // `mirrored` settles once PostgreSQL has the event (null without a database).
+  return { mirrored: eventMirror?.enqueue(record) ?? null };
 }
 
 async function stats({ campaign = null, allowed = null, from = null, to = null, subid = null, country = null, offer = null, stream = null, currency = rates.defaultCurrency } = {}) {
@@ -980,7 +1028,9 @@ const recordPostback = createConversionRecorder({
     onFallback: (error) => console.warn('[db] currentConversion fallback:', error.message) }),
   windowDaysForClick: (click) => campaigns.get(click.campaign)?.conversionWindowDays,
   record: (payload) => event('conversion', payload),
-  onRecorded: ({ click, clickId, revenue, currency, status }) => {
+  onRecorded: ({ click, clickId, revenue, currency, status, recorded }) => {
+    // Recount the offer's conversion cap now and again once PostgreSQL has the conversion.
+    if (click.offerId) conversionCaps.invalidate(click.offerId, recorded?.mirrored);
     const offer = offers.get(click.offerId);
     if (!offer?.postbackUrl) return;
     const s2sUrl = applyMacros(offer.postbackUrl, { click_id: clickId, revenue: revenue ?? '', currency: currency ?? '', status: status || 'sale' });
@@ -1406,7 +1456,10 @@ const server = http.createServer(async (req, res) => {
         const c = campaigns.get(campaignId);
         if (!c || !c.active) return json(res, 404, { error: 'campaign_not_found_or_inactive' });
         if (!c.streams?.length) return json(res, 404, { error: 'no_streams_configured' });
-        const picked = pickStream(c.streams, visitor, await cappedOffers(c.streams), c.streamRotation);
+        const routing = await offerRouting(c.streams);
+        const picked = pickStream(c.streams, visitor, routing.excluded, c.streamRotation);
+        // A conversion-capped offer hands the click to its alternative; the click is recorded with the offer actually used.
+        if (picked?.offerId && routing.substitutes.has(picked.offerId)) picked.offerId = routing.substitutes.get(picked.offerId);
         if (!picked) return json(res, 404, { error: 'no_matching_stream' });
         const countClick = picked.stream.countClicks !== false;
         const extra = visited.length ? { parentCampaign: visited[0] } : {};
@@ -1435,6 +1488,17 @@ const server = http.createServer(async (req, res) => {
       const [, campaignId, offerId] = match;
       const offer = offers.get(offerId);
       if (!offer || offer.archived) return json(res, 404, { error: 'offer_not_found' });
+      // Conversion cap on an explicit offer: its alternative if one is usable, otherwise capUrl / 429 like the click cap.
+      if (offer.conversionCap) {
+        const routing = await offerRouting([{ offerId }]);
+        const alt = routing.substitutes.get(offerId);
+        if (alt) return await handleClick(campaignId, alt, offers.get(alt).url);
+        const c = campaigns.get(campaignId);
+        if (routing.reasons.get(offerId) === 'conversion_cap' && c?.active) {
+          if (c.capUrl) { res.writeHead(302, { location: c.capUrl, 'cache-control': 'no-store' }); return res.end(); }
+          return json(res, 429, { error: 'offer_conversion_cap_reached', offerId, conversionCap: offer.conversionCap });
+        }
+      }
       return await handleClick(campaignId, offerId, offer.url);
     }
     if (url.pathname === '/postback' && req.method === 'GET') {
@@ -1625,7 +1689,10 @@ const server = http.createServer(async (req, res) => {
       const body = await readJson(req);
       if (!/^[a-z0-9_-]{2,80}$/i.test(String(body.id || '')) || !/^https:\/\//i.test(String(body.url || ''))) return json(res, 400, { error: 'id_and_https_url_required' });
       if (body.networkId !== undefined && body.networkId !== null && !networks.has(String(body.networkId))) return json(res, 400, { error: 'network_not_found' });
-      const offer = parseOffer({ url: String(body.url), postbackUrl: body.postbackUrl, dailyCap: body.dailyCap, name: body.name, networkId: body.networkId, archived: body.archived, group: body.group });
+      const capError = conversionCapError(String(body.id), body);
+      if (capError) return json(res, 400, { error: capError });
+      const offer = parseOffer({ url: String(body.url), postbackUrl: body.postbackUrl, dailyCap: body.dailyCap, name: body.name, networkId: body.networkId, archived: body.archived, group: body.group,
+        conversionCap: body.conversionCap, capTz: body.capTz, altOfferId: body.altOfferId });
       if (!offer) return json(res, 400, { error: 'id_and_https_url_required' });
       offers.set(String(body.id), offer);
       await persistOffer(String(body.id), offer);
@@ -1650,7 +1717,10 @@ const server = http.createServer(async (req, res) => {
       const newPostbackUrl = body.postbackUrl !== undefined ? body.postbackUrl : cur.postbackUrl;
       const newDailyCap = body.dailyCap !== undefined ? body.dailyCap : cur.dailyCap;
       if (body.networkId !== undefined && body.networkId !== null && !networks.has(String(body.networkId))) return json(res, 400, { error: 'network_not_found' });
-      const updated = parseOffer({ url: newUrl, postbackUrl: newPostbackUrl, dailyCap: newDailyCap, name: body.name !== undefined ? body.name : cur.name, networkId: body.networkId !== undefined ? body.networkId : cur.networkId, archived: body.archived !== undefined ? body.archived : cur.archived, group: body.group !== undefined ? body.group : cur.group });
+      const capError = conversionCapError(id, body);
+      if (capError) return json(res, 400, { error: capError });
+      const updated = parseOffer({ url: newUrl, postbackUrl: newPostbackUrl, dailyCap: newDailyCap, name: body.name !== undefined ? body.name : cur.name, networkId: body.networkId !== undefined ? body.networkId : cur.networkId, archived: body.archived !== undefined ? body.archived : cur.archived, group: body.group !== undefined ? body.group : cur.group,
+        conversionCap: body.conversionCap !== undefined ? body.conversionCap : cur.conversionCap, capTz: body.capTz !== undefined ? body.capTz : cur.capTz, altOfferId: body.altOfferId !== undefined ? body.altOfferId : cur.altOfferId });
       if (!updated) return json(res, 400, { error: 'invalid_url' });
       offers.set(id, updated);
       await persistOffer(id, updated);
