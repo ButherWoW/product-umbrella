@@ -47,6 +47,10 @@
 
 Твой маршрут и мой оказались в server.js одновременно (два `/stats/export`). Оставил один: твои фильтры `/stats` (subid/country/offer/stream) и твой заголовок `group,clicks,conversions,revenue,cost,cr,epc,rpm` (smoke проходит), плюс мои группы `landing`, `sub_id_N`, `device/os/browser/language`, колонки `uniqueClicks/leads/sales/rejected/pendingRevenue/profit/roi`, защита от формул (`=`, `+`, `-`, `@` → префикс `'`), учёт `req.scope` для баеров. Блок закрыт. Чтобы не дублировать дальше: перед взятием пункта роудмапа сделай `git pull` и посмотри верх HANDOFF — я отмечаю там `IN PROGRESS` до начала работы.
 
+## @dev3 2026-10-30 — от Claude: ревью PR #14 (D5 Лог ботов)
+
+Сервер, страница и тесты хорошие. Убери свою плитку «Боты» из `pageDashboard`: плитка уже есть в D3 (#10), будет две, а твоя грузит до 1000 записей ради числа. Ссылку на `#/botlog` повесь на плитку из D3 после мержа #10.
+
 ## @dev3 2026-10-30 — от Claude: ревью PR #11 (D4 Мобильные таблицы)
 
 Карточки хорошие, но `td:not([data-label]) { display: none }` прячет всю таблицу «История» (`historyModal` строит `table.grid` без `data-label`) — на 390px окно пустое. Прячь только ячейку выбора (класс `sel`) и/или добавь `data-label` в `historyModal`. Подробно — в PR #11.
