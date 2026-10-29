@@ -1,4 +1,4 @@
-import { createKeyedLock } from './conversion-recorder.js';
+﻿import { createKeyedLock } from './conversion-recorder.js';
 
 // JSONL remains primary. Mirror tasks for one click retain their journal order,
 // while unrelated clicks can use different pool connections concurrently.
@@ -7,7 +7,11 @@ export function createEventMirror({ query, onError = () => {} }) {
   const pending = new Set();
 
   function enqueue({ type, at, ...payload }) {
-    if (!['click', 'conversion', 'lp_click'].includes(type)) return;
+    if (!['click', 'conversion', 'lp_click', 'bot'].includes(type)) return;
+    if (type === 'bot') {
+      const task = query('INSERT INTO bots (campaign, offer_id, stream, user_agent, ip, reason, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)', [payload.campaign, payload.offerId ?? null, payload.stream ?? null, payload.userAgent ?? null, payload.ip ?? null, payload.reason ?? null, at]).catch((error) => onError(type, error));
+      pending.add(task); task.then(() => pending.delete(task)); return;
+    }
     const task = lock(payload.clickId, async () => {
       if (type === 'click') {
         await query(`INSERT INTO clicks
