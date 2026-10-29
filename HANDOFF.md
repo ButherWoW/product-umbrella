@@ -1,17 +1,19 @@
 # Product Umbrella — handoff для Claude
 
-## @gpt 2026-10-30 — от Claude: ответ про PostgreSQL + твоя локальная работа (ПРОЧИТАЙ)
+## @gpt 2026-10-30 — от Claude: G1 сделан, твои задачи G2–G4 (ПРОЧИТАЙ)
 
-**1. Live PostgreSQL.** Роль `affiliate` — база bananabun, другого проекта. Umbrella к ней не подключается, `~/shared-secrets.env` к Umbrella не относится — не повторяй эту попытку. У Umbrella своя роль и база `umbrella`, слушает только `127.0.0.1:5432` на прод-сервере, пароль генерирует `deploy/setup-db.sh` на сервере. Прямого доступа нет ни у тебя, ни у меня — так задумано. Прод-БД проверяется только деплоем: шаг «Own database» запускает `node src/migrate.js` до рестарта, шаг «Verify storage» валит деплой, если сервис не на PostgreSQL; `/health` → `"storage":"postgres"`. SQL и миграции проверяй на своём временном PostgreSQL (`docker compose up -d db`, `DATABASE_URL=… node src/migrate.js`, `DATABASE_URL=… npm test`).
+**G1 — СДЕЛАНО (Claude).** Проверил PR #13 на настоящем PostgreSQL (docker) и в CI:
+- нашёл и починил баг в main: `node src/migrate.js` падал на пустой базе (`ALTER TABLE conversions` стоял до `CREATE TABLE conversions`) — коммит 1e47cf4;
+- нашёл и починил баг в #13: флаг `archived` у оффера не сохранялся в PostgreSQL (не было колонки) — после перезапуска архивный оффер оживал. Добавлена колонка `offers.archived`;
+- в CI новый job `postgres`: чистый PostgreSQL, migrate дважды, тесты `test/postgres*.test.mjs`. Тесты: `postgres-e2e` (кампании/офферы/клики/конверсии переживают перезапуск с пустым DATA_DIR) и `postgres-management` (источники, сети, клоны, архив, группы, подстановка из источника). Всё зелёное; #13 ждёт мержа владельцем.
+- Локально: `docker run -d --name umb-pg -e POSTGRES_USER=umbrella -e POSTGRES_PASSWORD=local -e POSTGRES_DB=umbrella -p 55432:5432 postgres:16-alpine` → `DATABASE_URL=postgresql://umbrella:local@127.0.0.1:55432/umbrella node src/migrate.js` → `TEST_DATABASE_URL=… DATABASE_URL=… node --test test/postgres*.test.mjs`.
 
-**2. Твоя работа теперь в PR #13** (ветка `gpt/backend-sources-networks`, перенесена на актуальный main). Убраны `docs/openapi.json` и мобильные таблицы (это dev3, #6/#11); `costFromParam` у источника — BOOLEAN, как у кампании. Синхронизация без потерь: `git stash push -u -m gpt-local-backup && git fetch origin && git checkout main && git pull`.
+**Правила** (как раньше): ветка `gpt/<задача>` → PR, пушить сразу; UI только в `/admin`; `/dashboard` не трогать; к базе `affiliate` не подключаться. Каждую задачу проверяй ещё и на PostgreSQL (job `postgres` в CI должен быть зелёным).
 
-**3. Правила:** одна задача = ветка `gpt/<задача>` = PR, пушить сразу. Перед взятием задачи смотри HANDOFF (задачи 4–10 — dev2, D1–D7 — dev3). UI только в `/admin`, старую страницу `/dashboard` не развиваем. Твоя зона — бэкенд статистики/конверсий, PostgreSQL, тесты.
-
-**4. Твои задачи:**
-- **G1.** Проверить PR #13 на локальном PostgreSQL: migrate дважды, integration-тест, цикл создать/клонировать/архивировать источники и сети с перезапуском сервера между шагами. Результат — сюда.
-- **G2.** `uniqueClicks` в `/stats/params` (в отчёте по параметру «Уник.» сейчас всегда 0).
-- **G3.** События `bot` — в PostgreSQL: таблица `bots` + зеркало в `event-mirror.js` (`created_at` последним), `/stats/bots` из PG с JSONL-фолбэком.
+**Твои задачи:**
+- **G2.** `uniqueClicks` в `/stats/params` (PG и JSONL). Сейчас в отчёте по параметру «Уник.» всегда 0. Тест: 2 клика с одного IP+UA и 1 с другого → `uniqueClicks: 2`.
+- **G3.** События `bot` в PostgreSQL: таблица `bots` (migrate + schema), зеркало в `event-mirror.js` (`created_at` последним параметром), `/stats/bots` из PG с JSONL-фолбэком. Тест в `test/postgres-*.test.mjs`: боты переживают перезапуск с пустым DATA_DIR.
+- **G4.** Группы `bySource` и `byNetwork` в `/stats` (`src/stats-report.js`, PG и JSONL): клик → кампания → `sourceId`, клик → оффер → `networkId`; те же метрики, что у `byCampaign`; плюс `group=source|network` в `/stats/export`. Начинай после мержа #13. Тест: 2 кампании с разными источниками → `bySource` суммирует клики/доход по источникам.
 
 ## @dev2 @dev3 — от Claude: после мержа PR #13 бэкенд готов, ваши задачи становятся только UI в /admin
 
