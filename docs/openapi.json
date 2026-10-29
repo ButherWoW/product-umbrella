@@ -1768,12 +1768,34 @@
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["campaign", "from", "to", "amount"], "properties": {
           "campaign": { "type": "string" }, "from": { "type": "string", "format": "date" }, "to": { "type": "string", "format": "date" },
           "tz": { "type": "string", "default": "UTC" }, "amount": { "type": "number", "minimum": 0 }, "currency": { "type": "string", "description": "Default: DEFAULT_CURRENCY" },
-          "filters": { "type": "object", "description": "offer, stream, source, sub_id_1..sub_id_30 (exact values)", "additionalProperties": { "type": "string" } },
+          "filters": { "type": "object", "description": "offer, stream and any tracked parameter: source, keyword, external_id, creative_id, ad_campaign_id, sub_id_1..sub_id_30 (exact values)", "additionalProperties": { "type": "string" } },
           "uniqueOnly": { "type": "boolean", "default": false } } } } } },
         "responses": {
           "200": { "description": "{ ok, updated, perClick, cost, costCurrency, amount, currency, … }" },
           "400": { "description": "Invalid dates, tz, amount, currency or filter" },
           "403": { "description": "campaign_not_yours (buyer)" },
+          "404": { "description": "campaign_not_found" }
+        }
+      }
+    },
+    "/api/costs/import": {
+      "post": {
+        "summary": "Import spend rows (e.g. a Facebook Ads Manager CSV parsed in /admin)",
+        "description": "Each row is a cost update of the campaign(s) for one local day (tz), filtered by `param` = row id (e.g. sub_id_2 = ad set id). The amount is split over the matching clicks of all listed campaigns. Idempotent: the import key `campaigns|param|id|date` is stored with the update (cost_update.importKey; cost_imports table in PostgreSQL), and a re-import of the same key replaces the previous one — clicks it no longer matches are reset to 0. Rows with the same key in one request are summed. Rows without clicks are reported (`no_matching_clicks`), never silently dropped. Recorded in the audit log (action `import`).",
+        "operationId": "importCosts",
+        "tags": ["campaigns"],
+        "security": [{ "bearerAuth": [] }, { "cookieAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["campaign", "param", "rows"], "properties": {
+          "campaign": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" }, "maxItems": 50 }] },
+          "param": { "type": "string", "description": "Tracked parameter that holds the id in click URLs: source, keyword, external_id, creative_id, ad_campaign_id, sub_id_1..sub_id_30" },
+          "tz": { "type": "string", "default": "UTC" },
+          "uniqueOnly": { "type": "boolean", "default": false },
+          "rows": { "type": "array", "minItems": 1, "maxItems": 5000, "items": { "type": "object", "required": ["date", "id", "amount"], "properties": {
+            "date": { "type": "string", "format": "date" }, "id": { "type": "string" }, "amount": { "type": "number", "minimum": 0 }, "currency": { "type": "string", "description": "Default: DEFAULT_CURRENCY" } } } } } } } } },
+        "responses": {
+          "200": { "description": "{ ok, campaigns, param, tz, costCurrency, rows, applied, failed, clicks, cost, results: [{ row, date, id, amount, currency, clicks, cost, replaced?, merged?, error? }] }; error per row: invalid_date, invalid_id, invalid_amount, invalid_currency, no_matching_clicks" },
+          "400": { "description": "campaign_required, invalid_param, invalid_tz, rows_required or too_many_rows" },
+          "403": { "description": "campaign_not_yours (buyer) or read_only (viewer)" },
           "404": { "description": "campaign_not_found" }
         }
       }
