@@ -71,6 +71,9 @@ await db.query(`
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
   )
 `);
+// Postback to the traffic source (URL with macros and the statuses that trigger it).
+await db.query(`ALTER TABLE sources ADD COLUMN IF NOT EXISTS postback_url TEXT`);
+await db.query(`ALTER TABLE sources ADD COLUMN IF NOT EXISTS postback_statuses JSONB NOT NULL DEFAULT '["sale"]'::jsonb`);
 await db.query(`
   CREATE TABLE IF NOT EXISTS landings (
     id         TEXT        PRIMARY KEY,

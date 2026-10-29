@@ -960,6 +960,10 @@ async function pageCampaignEditor(id) {
           mark();
         } }, h('option', { value: '' }, 'Без источника'), Object.entries(state.sources).map(([sid, s]) => h('option', { value: sid, selected: (d.sourceId || '') === sid }, s.name || sid))),
         'При выборе источника его параметры копируются в кампанию.'),
+        field('Постбэк в источник', h('input', { class: 'input', type: 'url', value: d.sourcePostbackUrl || '', placeholder: 'пусто — URL из источника', 'aria-label': 'Постбэк в источник', oninput: bind('sourcePostbackUrl', 'url') }),
+          'Свой URL постбэка для этой кампании. ' + SOURCE_PB_MACROS),
+        fieldGroup('Статусы постбэка в источник', checkGroup(SOURCE_PB_STATUSES, d.sourcePostbackStatuses, (v) => { d.sourcePostbackStatuses = v; mark(); }), 'Ничего не отмечено — как в источнике.'),
+        canSourcePostback() ? postbackTestButton(() => d.sourcePostbackUrl || (d.sourceId && !state.sources[d.sourceId]?.postbackUrlMasked ? state.sources[d.sourceId]?.postbackUrl : '')) : null,
         field('Модель затрат', h('div', { class: 'radios' },
           h('label', {}, h('input', { type: 'radio', name: 'costModel', checked: d.costModel !== 'cpc', onchange: () => { d.costModel = 'none'; d.cpc = null; cpcField.hidden = true; costFromParamField.hidden = true; mark(); } }), 'Нет'),
           h('label', {}, h('input', { type: 'radio', name: 'costModel', checked: d.costModel === 'cpc', onchange: () => { d.costModel = 'cpc'; cpcField.hidden = false; costFromParamField.hidden = false; mark(); } }), 'CPC')), 'При CPC расход за клик записывается в статистику.'),
@@ -1047,7 +1051,8 @@ async function pageCampaignEditor(id) {
     if (new Set(names).size !== names.length) { err.textContent = 'Названия потоков должны различаться — по ним строится статистика.'; return; }
     const body = { name: d.name.trim(), group: (d.group || '').trim(), active: d.active, streams: d.streams, dailyCap: d.dailyCap, totalCap: d.totalCap, revenueCap: d.revenueCap, capUrl: d.capUrl, geoCapUrl: d.geoCapUrl,
       allowGeos: d.allowGeos, allowDevices: d.allowDevices, allowOS: d.allowOS, allowBrowsers: d.allowBrowsers, blockedIps: d.blockedIps, allowedIps: d.allowedIps,
-      dedupeWindow: d.dedupeWindow || 0, botFilter: d.botFilter, datacenterAsBot: Boolean(d.datacenterAsBot), conversionWindowDays: d.conversionWindowDays, redirectMethod: d.redirectMethod || 'http', domain: d.domain || null, uniquenessHours: d.uniquenessHours ?? 24, streamRotation: d.streamRotation || 'weight', ...(isOwnerView() ? { ownerId: d.ownerId || null } : {}), paramMap: d.paramMap || {}, costModel: d.costModel || 'none', cpc: d.cpc, costFromParam: d.costFromParam || false, sourceId: d.sourceId || null };
+      dedupeWindow: d.dedupeWindow || 0, botFilter: d.botFilter, datacenterAsBot: Boolean(d.datacenterAsBot), conversionWindowDays: d.conversionWindowDays, redirectMethod: d.redirectMethod || 'http', domain: d.domain || null, uniquenessHours: d.uniquenessHours ?? 24, streamRotation: d.streamRotation || 'weight', ...(isOwnerView() ? { ownerId: d.ownerId || null } : {}), paramMap: d.paramMap || {}, costModel: d.costModel || 'none', cpc: d.cpc, costFromParam: d.costFromParam || false, sourceId: d.sourceId || null,
+      sourcePostbackUrl: d.sourcePostbackUrl || null, sourcePostbackStatuses: d.sourcePostbackStatuses || [] };
     saveBtn.disabled = true;
     try {
       const saved = isNew ? await api('/api/campaigns', { method: 'POST', body: { id: d.id, ...body } })
@@ -1097,13 +1102,37 @@ async function pageCampaignEditor(id) {
   return () => window.removeEventListener('beforeunload', guard);
 }
 
+// Postback to the traffic source: statuses, owner check and the «Тестовый постбэк» button.
+const SOURCE_PB_STATUSES = [['lead', 'Лид (lead)'], ['sale', 'Продажа (sale)'], ['rejected', 'Отклонён (rejected)'], ['trash', 'Треш (trash)']];
+const SOURCE_PB_MACROS = 'Макросы: {click_id}, {external_id}, {sub_id_1}…{sub_id_30}, {status}, {revenue}, {payout}, {currency}, {campaign}, {offer_id}, {country}, {keyword}, {source}, {creative_id}, {ad_campaign_id}.';
+// Without a logged-in user (admin key / local mode) the server treats requests as the owner's.
+const canSourcePostback = () => isOwnerView() || !state.me?.user;
+// Like field(), but a div with role=group: checkboxes inside keep their own labels (no nested <label>).
+const fieldGroup = (label, control, hint) => h('div', { class: 'field', role: 'group', 'aria-label': label }, h('span', {}, label), control, hint ? h('span', { class: 'hint' }, hint) : null);
+function postbackTestButton(getUrl) {
+  const out = h('span', { class: 'muted', role: 'status', 'aria-label': 'Результат тестового постбэка' });
+  const btn = h('button', { type: 'button', class: 'btn', onclick: async () => {
+    const url = (getUrl() || '').trim();
+    if (!url) { out.textContent = 'Сначала укажите URL.'; return; }
+    btn.disabled = true; out.textContent = 'Отправка…';
+    try {
+      const r = await api('/api/sources/postback-test', { method: 'POST', body: { url } });
+      out.textContent = r.httpStatus ? `HTTP ${r.httpStatus}${r.ok ? ' — доставлено' : ''}` : `Не отправлено: ${r.error}`;
+    } catch (e) { out.textContent = 'Ошибка: ' + e.message; }
+    finally { btn.disabled = false; }
+  } }, 'Тестовый постбэк');
+  return h('div', { class: 'toolbar', style: 'align-items:center;gap:10px' }, btn, out);
+}
+
 function sourceModal(id, onSaved) {
   const isNew = !id;
   const SOURCE_PARAM_FIELDS = ['keyword', 'source', 'external_id', 'creative_id', 'ad_campaign_id', ...Array.from({ length: 30 }, (_, i) => `sub_id_${i + 1}`), 'cost'];
   const cur = isNew ? null : state.sources[id];
   const d = isNew
-    ? { id: '', name: '', paramMap: {}, costModel: 'none', cpc: '', costFromParam: false }
-    : { id, name: cur.name || '', paramMap: { ...(cur.paramMap || {}) }, costModel: cur.costModel || 'none', cpc: cur.cpc ?? '', costFromParam: !!cur.costFromParam };
+    ? { id: '', name: '', paramMap: {}, costModel: 'none', cpc: '', costFromParam: false, postbackUrl: '', postbackStatuses: ['sale'] }
+    : { id, name: cur.name || '', paramMap: { ...(cur.paramMap || {}) }, costModel: cur.costModel || 'none', cpc: cur.cpc ?? '', costFromParam: !!cur.costFromParam,
+      postbackUrl: cur.postbackUrl || '', postbackStatuses: cur.postbackStatuses || ['sale'] };
+  const pbEditable = canSourcePostback() && !cur?.postbackUrlMasked;
   const err = h('p', { class: 'err' });
   const cpcField = field('Стоимость клика', h('input', { class: 'input', type: 'number', min: 0, step: '0.0001', value: d.cpc, placeholder: '0.0000', oninput: (e) => { d.cpc = e.target.value; } }));
   cpcField.hidden = d.costModel !== 'cpc';
@@ -1129,6 +1158,13 @@ function sourceModal(id, onSaved) {
             h('thead', {}, h('tr', {}, h('th', {}, 'Поле'), h('th', {}, 'Параметр в ссылке'))),
             h('tbody', {}, ...rows))));
     }],
+    ['Постбэк', () => h('div', {},
+      h('p', { class: 'muted' }, 'Трекер сам отправит GET на этот URL, когда конверсия получит отмеченный статус (один раз на клик и статус). Кампания может задать свой URL.'),
+      field('URL постбэка в источник', h('input', { class: 'input', type: 'url', value: d.postbackUrl, placeholder: 'https://…?click_id={external_id}&status={status}&payout={payout}', readonly: !pbEditable,
+        'aria-label': 'URL постбэка в источник', oninput: (e) => { d.postbackUrl = e.target.value.trim(); } }), pbEditable ? SOURCE_PB_MACROS : 'Меняет только владелец; параметры URL скрыты.'),
+      fieldGroup('Отправлять при статусах', pbEditable ? checkGroup(SOURCE_PB_STATUSES, d.postbackStatuses, (v) => { d.postbackStatuses = v; })
+        : h('span', {}, d.postbackStatuses.join(', ')), 'По умолчанию — только продажа (sale).'),
+      pbEditable ? postbackTestButton(() => d.postbackUrl) : null)],
   ]);
   const close = openModal({
     title: isNew ? 'Создание источника' : 'Редактирование источника', body: h('div', {}, body, err),
@@ -1137,7 +1173,8 @@ function sourceModal(id, onSaved) {
       if (!ID_RE.test(d.id)) { err.textContent = 'ID: 2–80 символов, латиница, цифры, - и _.'; return; }
       if (isNew && state.sources[d.id]) { err.textContent = 'Источник с таким ID уже есть.'; return; }
       try {
-        const body2 = { name: d.name.trim() || null, paramMap: d.paramMap, costModel: d.costModel, cpc: d.cpc !== '' ? Number(d.cpc) : 0, costFromParam: d.costFromParam };
+        const body2 = { name: d.name.trim() || null, paramMap: d.paramMap, costModel: d.costModel, cpc: d.cpc !== '' ? Number(d.cpc) : 0, costFromParam: d.costFromParam,
+          ...(pbEditable ? { postbackUrl: d.postbackUrl || null, postbackStatuses: d.postbackStatuses.length ? d.postbackStatuses : ['sale'] } : {}) };
         await (isNew ? api('/api/sources', { method: 'POST', body: { id: d.id, ...body2 } }) : api('/api/sources/' + encodeURIComponent(d.id), { method: 'PATCH', body: body2 }));
         toast(isNew ? 'Источник создан' : 'Сохранено'); close(); onSaved();
       } catch (e) { err.textContent = 'Не сохранено: ' + e.message; }
@@ -1155,6 +1192,7 @@ async function pageSources() {
       { key: 'name', label: 'Название', cls: 'name', value: (r) => r.name || '', render: (r) => h('span', { title: r.name || '' }, r.name || '—') },
       { key: 'costModel', label: 'Модель', value: (r) => r.costModel === 'cpc' ? 'CPC' : 'Нет' },
       { key: 'cpc', label: 'CPC', num: true, render: (r) => (r.cpc ? money4(r.cpc) : '—') },
+      { key: 'postback', label: 'Постбэк', value: (r) => (r.postbackUrl ? (r.postbackStatuses || []).join(', ') : '—') },
     ],
   });
   put(view,
