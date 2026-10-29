@@ -165,3 +165,24 @@ test('buyers see and edit only their own campaigns; owner sees all and can reass
   assert.deepEqual(Object.keys((await call('/api/campaigns', { cookie: annC })).json.campaigns).sort(), ['ann-camp', 'bob-camp'], 'reassigned campaign appears for the new buyer');
   assert.deepEqual(Object.keys((await call('/api/campaigns', { cookie: bobC })).json.campaigns), []);
 });
+
+test('security headers: strict CSP and no framing on the panel, tracking redirects untouched', { timeout: 20000 }, async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'umbrella-headers-'));
+  const server = await startTestServer(dataDir, { BASE_PATH: '/umbrella' });
+  t.after(async () => { await server.stop(); await rm(dataDir, { recursive: true, force: true }); });
+  const admin = await fetch(server.url + '/admin');
+  const csp = admin.headers.get('content-security-policy');
+  assert.match(csp, /script-src 'self'/);
+  assert.match(csp, /frame-ancestors 'none'/);
+  assert.equal(admin.headers.get('x-frame-options'), 'DENY');
+  const html = await admin.text();
+  assert.ok(!/<script>/.test(html), 'no inline scripts in the panel shell');
+  assert.match(html, /<meta name="umbrella-base" content="\/umbrella">/);
+  const api = await fetch(server.url + '/api/campaigns');
+  assert.equal(api.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(api.headers.get('referrer-policy'), 'same-origin');
+  const click = await fetch(server.url + '/r/demo/offer-1', { redirect: 'manual' });
+  assert.equal(click.status, 302);
+  assert.equal(click.headers.get('referrer-policy'), null, 'tracking redirects keep the default referrer behaviour');
+  assert.equal(click.headers.get('content-security-policy'), null);
+});

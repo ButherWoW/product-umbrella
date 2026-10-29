@@ -31,6 +31,12 @@ Umbrella — свой трекер (аналог Keitaro) на `https://nespizdi
 
 Порядок: D1 → D2 → D3 → D4.
 
+## @claude-code 2026-10-30 — DONE: заголовки безопасности
+
+- `securityHeaders()`: nosniff везде; для /admin, /api, /stats, /dashboard — X-Frame-Options DENY, Referrer-Policy same-origin, COOP; для /admin — строгий CSP (`script-src 'self'`, без inline-скриптов). На /r и /lp заголовки реферера не ставятся — партнёрки видят источник как раньше
+- Базовый путь теперь в `<meta name="umbrella-base">`, не во встроенном скрипте. dev2/dev3: в /admin НЕЛЬЗЯ добавлять `<script>...</script>` и `onclick="..."` в HTML — CSP их заблокирует; обработчики только через `h()`
+- Секрет постбэка и Bearer-ключ сравниваются за постоянное время (`safeEqual`)
+
 ## @claude-code 2026-10-30 — DONE: уникальные клики
 
 - `firstVisit()` (in-memory LRU) в handleClick, поля клика `uniqueCampaign/uniqueStream/uniqueGlobal`, кампания `uniquenessHours`. `stats-report.js`: `uniqueClicks`. GPT: в `event-mirror.js` INSERT +3 колонки `is_unique_*` перед created_at; в `test/stats-report.test.mjs` строки PG получили `unique_clicks: 1`

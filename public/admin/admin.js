@@ -1,7 +1,7 @@
 // Umbrella admin UI — layout and workflows modelled on Keitaro, backed by the existing tracker API.
 const state = { token: null, offers: {}, campaigns: {}, landings: {}, users: [] };
 // Set by the server when the tracker runs under a path prefix (BASE_PATH, e.g. /umbrella behind nginx).
-const BASE = typeof window.UMBRELLA_BASE === 'string' ? window.UMBRELLA_BASE : '';
+const BASE = document.querySelector('meta[name="umbrella-base"]')?.getAttribute('content') || '';
 const view = document.getElementById('view');
 
 // ---------- utils ----------

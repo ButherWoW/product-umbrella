@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { randomUUID, createHash } from 'node:crypto';
+import { randomUUID, createHash, timingSafeEqual } from 'node:crypto';
 import { mkdir, appendFile, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -719,6 +719,26 @@ async function getClickData(clickId) {
   return null;
 }
 
+// Constant-time comparison so response timing does not leak how much of a secret matched.
+function safeEqual(a, b) {
+  const ha = createHash('sha256').update(String(a ?? '')).digest();
+  const hb = createHash('sha256').update(String(b ?? '')).digest();
+  return timingSafeEqual(ha, hb) && String(a ?? '') === String(b ?? '');
+}
+
+// Browser hardening for the panel and APIs. Tracking redirects keep the browser's default referrer
+// behaviour, because networks rely on it.
+const ADMIN_CSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'";
+function securityHeaders(res, path) {
+  res.setHeader('x-content-type-options', 'nosniff');
+  if (path === '/admin' || path.startsWith('/admin/') || path.startsWith('/api/') || path === '/stats' || path.startsWith('/stats/') || path === '/dashboard' || path.startsWith('/assets/')) {
+    res.setHeader('x-frame-options', 'DENY');
+    res.setHeader('referrer-policy', 'same-origin');
+    res.setHeader('cross-origin-opener-policy', 'same-origin');
+  }
+  if (path === '/admin' || path.startsWith('/admin/')) res.setHeader('content-security-policy', ADMIN_CSP);
+}
+
 function json(res, status, body) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(body));
@@ -746,7 +766,7 @@ const recordPostback = createConversionRecorder({
 });
 
 function bearerAuthorized(req) {
-  return Boolean(adminToken) && req.headers.authorization === `Bearer ${adminToken}`;
+  return Boolean(adminToken) && safeEqual(req.headers.authorization, `Bearer ${adminToken}`);
 }
 
 async function sessionUser(req) {
@@ -975,6 +995,7 @@ async function handleAuthRoute(req, res, url) {
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    securityHeaders(res, url.pathname);
     req.user = await sessionUser(req);
     if (requireLogin && isPrivatePath(url.pathname) && !req.user && !bearerAuthorized(req)) {
       if (url.pathname === '/dashboard') { res.writeHead(302, { location: `${basePath}/admin` }); return res.end(); }
@@ -1160,7 +1181,7 @@ const server = http.createServer(async (req, res) => {
       return await handleClick(campaignId, offerId, offer.url);
     }
     if (url.pathname === '/postback' && req.method === 'GET') {
-      if (postbackSecret && url.searchParams.get('secret') !== postbackSecret) return json(res, 401, { error: 'invalid_postback_secret' });
+      if (postbackSecret && !safeEqual(url.searchParams.get('secret'), postbackSecret)) return json(res, 401, { error: 'invalid_postback_secret' });
       try {
         const result = await recordPostback({ clickId: url.searchParams.get('click_id'),
           revenue: url.searchParams.get('revenue'), currency: url.searchParams.get('currency'), status: url.searchParams.get('status') });
@@ -1366,7 +1387,8 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'content-type': `${adminAsset[1]}; charset=utf-8`, 'cache-control': 'no-store' });
       const body = await readFile(join(root, 'public', 'admin', adminAsset[0]));
       if (adminAsset[0] !== 'index.html') return res.end(body);
-      return res.end(String(body).replaceAll('"/admin/', `"${basePath}/admin/`).replace('<head>', `<head>\n<script>window.UMBRELLA_BASE=${JSON.stringify(basePath)}</script>`));
+      // The base path goes into a meta tag (not an inline script) so the panel can run under a strict CSP.
+      return res.end(String(body).replaceAll('"/admin/', `"${basePath}/admin/`).replace('<head>', `<head>\n<meta name="umbrella-base" content="${basePath}">`));
     }
     if (url.pathname === '/' && req.method === 'GET') { res.writeHead(302, { location: `${basePath}/admin` }); return res.end(); }
     if (url.pathname === '/health') return json(res, 200, { ok: true, storage: db ? 'postgres' : 'jsonl', geo: Boolean(geoReader), now: new Date().toISOString(), uptime: Math.round(process.uptime()) });
