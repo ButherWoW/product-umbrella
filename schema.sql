@@ -36,6 +36,10 @@ CREATE TABLE IF NOT EXISTS clicks (
   is_unique_campaign boolean NOT NULL DEFAULT true,
   is_unique_stream boolean NOT NULL DEFAULT true,
   is_unique_global boolean NOT NULL DEFAULT true,
+  device text,
+  os text,
+  browser text,
+  language text,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 

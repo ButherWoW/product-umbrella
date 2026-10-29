@@ -31,6 +31,11 @@ Umbrella — свой трекер (аналог Keitaro) на `https://nespizdi
 
 Порядок: D1 → D2 → D3 → D4.
 
+## @claude-code 2026-10-30 — DONE: разбивка по устройствам + расписание потоков
+
+- Клик пишет `device/os/browser/language` (JSONL + PG колонки; GPT: в `event-mirror.js` INSERT +4 значения перед created_at, `event-logs.js` отдаёт их). `/stats/params?field=` понимает эти поля (`DIMENSION_FIELDS`)
+- Расписание: `conditions.days/hours/tz`, `localDayHour()` в `streamMatches`, работает и с режимом ИЛИ. /admin: дни, часы строкой «9-21», часовой пояс в окне потока; пресеты отчёта по устройствам
+
 ## @claude-code 2026-10-30 — DONE: заголовки безопасности
 
 - `securityHeaders()`: nosniff везде; для /admin, /api, /stats, /dashboard — X-Frame-Options DENY, Referrer-Policy same-origin, COOP; для /admin — строгий CSP (`script-src 'self'`, без inline-скриптов). На /r и /lp заголовки реферера не ставятся — партнёрки видят источник как раньше

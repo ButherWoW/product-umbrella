@@ -112,7 +112,27 @@ function parseConditions(raw = {}) {
     browsers: parseList(raw.browsers, lower, (b) => ['chrome', 'safari', 'firefox', 'edge', 'opera', 'samsung', 'other'].includes(b)),
     languages: parseList(raw.languages, (l) => String(l).toLowerCase().slice(0, 2), (l) => /^[a-z]{2}$/.test(l)),
     ...(raw.mode === 'or' ? { mode: 'or' } : {}),
+    ...scheduleConditions(raw),
   };
+}
+
+// Day parting (Keitaro «Расписание»): ISO weekdays 1 (Mon) … 7 (Sun) and hours 0–23 in an IANA time zone.
+// Only stored when set, so streams without a schedule keep their original shape.
+function validTimeZone(tz) {
+  try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); return true; } catch { return false; }
+}
+function scheduleConditions(raw) {
+  const days = [...new Set(parseList(raw.days, Number, (d) => Number.isInteger(d) && d >= 1 && d <= 7))].sort((a, b) => a - b);
+  const hours = [...new Set(parseList(raw.hours, Number, (h) => Number.isInteger(h) && h >= 0 && h <= 23))].sort((a, b) => a - b);
+  if (!days.length && !hours.length) return {};
+  const tz = typeof raw.tz === 'string' && validTimeZone(raw.tz) ? raw.tz : 'UTC';
+  return { ...(days.length ? { days } : {}), ...(hours.length ? { hours } : {}), tz };
+}
+const WEEKDAY = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 };
+function localDayHour(tz, date) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short', hour: 'numeric', hourCycle: 'h23' })
+    .formatToParts(date).map((p) => [p.type, p.value]));
+  return { day: WEEKDAY[parts.weekday], hour: Number(parts.hour) };
 }
 
 function parseOfferWeights(raw) {
@@ -170,7 +190,9 @@ function streamMatches(stream, visitor) {
   const c = stream.conditions;
   if (!c) return true;
   // Unknown country (no GEOIP_DB) never matches a country condition, so geo streams fall through to others.
-  const checks = [[c.countries, visitor.country], [c.devices, visitor.device], [c.os, visitor.os], [c.browsers, visitor.browser], [c.languages, visitor.language]]
+  const local = c.days?.length || c.hours?.length ? localDayHour(c.tz || 'UTC', visitor.now || new Date()) : {};
+  const checks = [[c.countries, visitor.country], [c.devices, visitor.device], [c.os, visitor.os], [c.browsers, visitor.browser], [c.languages, visitor.language],
+    [c.days, local.day], [c.hours, local.hour]]
     .filter(([values]) => values?.length)
     .map(([values, actual]) => values.includes(actual));
   if (!checks.length) return true;
@@ -609,17 +631,20 @@ async function stats({ campaign = null, allowed = null, from = null, to = null, 
 }
 
 // Clicks/conversions/revenue/cost grouped by one tracked parameter value ('' = not passed).
+// Click attributes stored as columns (not in params) that reports can group by.
+const DIMENSION_FIELDS = ['device', 'os', 'browser', 'language'];
 async function paramReport({ field, campaign, allowed = null, from, to, currency = rates.defaultCurrency }) {
+  const isColumn = DIMENSION_FIELDS.includes(field);
   if (db) {
     try {
-      const conditions = []; const values = [field];
+      const conditions = []; const values = isColumn ? [] : [field];
       if (campaign) { values.push(campaign); conditions.push(`c.campaign = $${values.length}`); }
       if (allowed) { values.push(allowed); conditions.push(`c.campaign = ANY($${values.length}::text[])`); }
       if (from) { values.push(`${from}T00:00:00Z`); conditions.push(`c.created_at >= $${values.length}`); }
       if (to) { values.push(`${to}T23:59:59Z`); conditions.push(`c.created_at <= $${values.length}`); }
       const fx = sqlFx(values, currency);
       const { rows } = await db.query(`
-        SELECT COALESCE(c.params->>$1, '') AS value, COUNT(c.click_id)::int AS clicks, ${SQL_CONVERSIONS}::int AS conversions,
+        SELECT ${isColumn ? `COALESCE(c.${field}, '')` : "COALESCE(c.params->>$1, '')"} AS value, COUNT(c.click_id)::int AS clicks, ${SQL_CONVERSIONS}::int AS conversions,
           ${fx.revenue}::float AS revenue, ${fx.cost}::float AS cost
         FROM clicks c LEFT JOIN conversions cv USING (click_id)
         ${conditions.length ? 'WHERE ' + conditions.join(' AND ') : ''}
@@ -638,7 +663,7 @@ async function paramReport({ field, campaign, allowed = null, from, to, currency
     if (click.type !== 'click' || (campaign && click.campaign !== campaign) || (allowed && !allowed.includes(click.campaign))) continue;
     const t = Date.parse(click.at);
     if ((fromMs !== null && t < fromMs) || (toMs !== null && t > toMs)) continue;
-    const key = click.params?.[field] ?? '';
+    const key = (isColumn ? click[field] : click.params?.[field]) ?? '';
     const g = groups.get(key) || { value: key, clicks: 0, conversions: 0, revenue: 0, cost: 0 };
     const cv = conv.get(click.clickId);
     g.clicks += 1; g.cost += (Number(click.cost) || 0) * rates.factor(rates.defaultCurrency, currency);
@@ -1133,7 +1158,9 @@ const server = http.createServer(async (req, res) => {
         const uniqueness = { uniqueCampaign: firstVisit(`c|${campaignId}|${visitor}`, windowMs), uniqueStream: firstVisit(`s|${campaignId}|${streamName || ''}|${visitor}`, windowMs),
           uniqueGlobal: firstVisit(`g|${visitor}`, windowMs) };
         Object.assign(extra, uniqueness);
-        await event('click', { clickId, campaign: campaignId, offerId, path: url.pathname, referrer: req.headers.referer || null, userAgent: req.headers['user-agent'] || null, subid, country, ip, stream: streamName, ...extra, ...(Object.keys(params).length ? { params } : {}), ...(cost ? { cost } : {}) });
+        const lang = String(req.headers['accept-language'] || '').trim().slice(0, 2).toLowerCase();
+        await event('click', { clickId, campaign: campaignId, offerId, path: url.pathname, referrer: req.headers.referer || null, userAgent: req.headers['user-agent'] || null, subid, country, ip,
+          device, os, browser, language: /^[a-z]{2}$/.test(lang) ? lang : null, stream: streamName, ...extra, ...(Object.keys(params).length ? { params } : {}), ...(cost ? { cost } : {}) });
         if (totalCount !== null && totalCount + 1 >= c.totalCap) await pauseCampaign(campaignId, 'total_cap_reached');
       }
       return sendRedirect(res, destination.toString(), c.redirectMethod);
@@ -1490,7 +1517,7 @@ const server = http.createServer(async (req, res) => {
     // Report by traffic-source parameter: GET /stats/params?field=sub_id_1&campaign=X&from=&to=
     if (url.pathname === '/stats/params' && req.method === 'GET') {
       const field = url.searchParams.get('field') || '';
-      if (!TRACK_FIELDS.includes(field)) return json(res, 400, { error: 'invalid_field', fields: TRACK_FIELDS });
+      if (!TRACK_FIELDS.includes(field) && !DIMENSION_FIELDS.includes(field)) return json(res, 400, { error: 'invalid_field', fields: [...TRACK_FIELDS, ...DIMENSION_FIELDS] });
       const pFrom = url.searchParams.get('from') || null;
       const pTo = url.searchParams.get('to') || null;
       if ((pFrom && !/^\d{4}-\d{2}-\d{2}$/.test(pFrom)) || (pTo && !/^\d{4}-\d{2}-\d{2}$/.test(pTo))) return json(res, 400, { error: 'invalid_date' });

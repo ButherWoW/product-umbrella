@@ -581,6 +581,30 @@ function checkGroup(options, values, onChange) {
 const field = (label, control, hint) => h('label', { class: 'field' }, h('span', {}, label), control, hint ? h('span', { class: 'hint' }, hint) : null);
 const intOrNull = (v) => (v === '' || v === null ? null : Number.isInteger(Number(v)) ? Number(v) : NaN);
 
+const TIME_ZONES = ['Europe/Paris', 'Europe/Berlin', 'Europe/London', 'Europe/Madrid', 'Europe/Rome', 'Europe/Warsaw', 'Europe/Kyiv', 'Europe/Moscow', 'Asia/Dubai', 'Asia/Bahrain', 'America/New_York', 'America/Chicago', 'America/Los_Angeles', 'UTC'];
+function parseHours(text) {
+  const out = new Set();
+  for (const part of String(text || '').split(/[\s,;]+/).filter(Boolean)) {
+    const m = part.match(/^(\d{1,2})(?:-(\d{1,2}))?$/);
+    if (!m) continue;
+    const a = Number(m[1]); const b = m[2] === undefined ? a : Number(m[2]);
+    if (a > 23 || b > 23) continue;
+    for (let h = a; ; h = (h + 1) % 24) { out.add(h); if (h === b) break; }
+  }
+  return [...out].sort((x, y) => x - y);
+}
+function compactHours(hours = []) {
+  const parts = []; let start = null; let prev = null;
+  for (const h of [...hours].sort((a, b) => a - b)) {
+    if (start === null) { start = h; prev = h; continue; }
+    if (h === prev + 1) { prev = h; continue; }
+    parts.push(start === prev ? `${start}` : `${start}-${prev}`); start = h; prev = h;
+  }
+  if (start !== null) parts.push(start === prev ? `${start}` : `${start}-${prev}`);
+  return parts.join(', ');
+}
+const DAY_NAMES = ['', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
+
 function summarizeConditions(c = {}) {
   const parts = [];
   if (c.countries?.length) parts.push('Страны: ' + c.countries.join(', '));
@@ -588,12 +612,14 @@ function summarizeConditions(c = {}) {
   if (c.os?.length) parts.push('ОС: ' + c.os.join(', '));
   if (c.browsers?.length) parts.push('Браузеры: ' + c.browsers.join(', '));
   if (c.languages?.length) parts.push('Языки: ' + c.languages.join(', '));
+  if (c.days?.length) parts.push('Дни: ' + c.days.map((d) => DAY_NAMES[d]).join(', '));
+  if (c.hours?.length) parts.push(`Часы: ${compactHours(c.hours)} (${c.tz || 'UTC'})`);
   return parts.length ? parts.join(c.mode === 'or' ? ' ИЛИ ' : ' · ') : 'Без фильтров';
 }
 
 function streamModal(stream, onApply, isNew = false, currentCampaignId = null) {
   const s = structuredClone(stream);
-  s.conditions = { countries: [], devices: [], os: [], browsers: [], languages: [], ...(s.conditions || {}) };
+  s.conditions = { countries: [], devices: [], os: [], browsers: [], languages: [], days: [], hours: [], ...(s.conditions || {}) };
   s.action = s.action || 'offers';
   s.offers = s.offers || [];
   const err = h('p', { class: 'err' });
@@ -656,7 +682,11 @@ function streamModal(stream, onApply, isNew = false, currentCampaignId = null) {
       field('Тип устройства', checkGroup(COND.devices, s.conditions.devices, (v) => { s.conditions.devices = v; })),
       field('Операционные системы', checkGroup(COND.os, s.conditions.os, (v) => { s.conditions.os = v; })),
       field('Браузеры', checkGroup(COND.browsers, s.conditions.browsers, (v) => { s.conditions.browsers = v; })),
-      field('Языки', h('input', { class: 'input', value: s.conditions.languages.join(', '), placeholder: 'fr, de', oninput: (e) => { s.conditions.languages = splitList(e.target.value).map((x) => x.toLowerCase()); } }), 'Два первых символа Accept-Language.'))],
+      field('Языки', h('input', { class: 'input', value: s.conditions.languages.join(', '), placeholder: 'fr, de', oninput: (e) => { s.conditions.languages = splitList(e.target.value).map((x) => x.toLowerCase()); } }), 'Два первых символа Accept-Language.'),
+      field('Дни недели', checkGroup([[1, 'Пн'], [2, 'Вт'], [3, 'Ср'], [4, 'Чт'], [5, 'Пт'], [6, 'Сб'], [7, 'Вс']], s.conditions.days, (v) => { s.conditions.days = v.map(Number); }), 'Пусто — любой день.'),
+      field('Часы', h('input', { class: 'input', value: compactHours(s.conditions.hours), placeholder: '9-21', oninput: (e) => { s.conditions.hours = parseHours(e.target.value); } }), 'Например «9-21» или «0-6, 22-23». Пусто — круглосуточно.'),
+      field('Часовой пояс расписания', h('select', { class: 'select', onchange: (e) => { s.conditions.tz = e.target.value; } },
+        TIME_ZONES.map((tz) => h('option', { value: tz, selected: (s.conditions.tz || 'Europe/Paris') === tz }, tz)))))],
   ]);
   const close = openModal({
     title: isNew ? 'Создание потока' : 'Редактирование потока', wide: true,
@@ -671,6 +701,8 @@ function streamModal(stream, onApply, isNew = false, currentCampaignId = null) {
       s.landings = (s.landings || []).filter((l) => l.landingId);
       if (s.landings.some((l) => !(l.weight > 0))) { err.textContent = 'Веса лендингов должны быть больше нуля.'; return; }
       if (s.action !== 'offers' || !s.landings.length) delete s.landings;
+      if (!s.conditions.days.length && !s.conditions.hours.length) { delete s.conditions.days; delete s.conditions.hours; delete s.conditions.tz; }
+      else s.conditions.tz = s.conditions.tz || 'Europe/Paris';
       if (s.action === 'offers') { delete s.action; delete s.url; delete s.campaignId; } else { delete s.offers; if (s.action !== 'url') delete s.url; if (s.action !== 'campaign') delete s.campaignId; }
       onApply(s); close();
     } }, 'Применить')],
@@ -944,6 +976,7 @@ async function pageOffers() {
 
 const GROUPS = [
   ['campaign', 'Кампания', 'byCampaign'], ['offer', 'Оффер', 'byOffer'], ['stream', 'Поток', 'byStream'], ['landing', 'Лендинг', 'byLanding'], ['country', 'Страна', 'byCountry'],
+  ['device', 'Устройство', null], ['os', 'ОС', null], ['browser', 'Браузер', null], ['language', 'Язык', null],
   ['day', 'День', null], ['hour', 'Час', null], ['referrer', 'Реферер', null], ['path', 'Путь', null],
 ];
 async function pageReports(params) {
@@ -982,6 +1015,10 @@ async function pageReports(params) {
         if (key === 'campaign') drill = (r) => ({ group: 'stream', campaign: r.id });
         if (key === 'offer') drill = (r) => ({ group: 'country', offer: r.id });
         if (key === 'stream') drill = (r) => ({ group: 'offer', stream: r.id });
+      } else if (['device', 'os', 'browser', 'language'].includes(key)) {
+        const r = await api('/stats/params' + qs({ field: key, campaign: f.campaign, from, to }));
+        rows = (r.rows || []).map((x) => ({ id: x.value || '(неизвестно)', clicks: x.clicks || 0, conversions: x.conversions || 0, revenue: x.revenue || 0, cost: x.cost || 0 }));
+        if (f.offer || f.country || f.stream || f.subid) note.textContent = 'Для этой группировки применяются только кампания и период.';
       } else if (key === 'day' || key === 'hour') {
         const ts = await api('/stats/timeseries' + qs({ campaign: f.campaign, from, to, granularity: key }));
         rows = ts.series.map((p) => ({ id: String(p.date ?? p.bucket).replace('T', ' ') + (key === 'hour' ? ':00' : ''), clicks: p.clicks || 0, conversions: p.conversions || 0, revenue: p.revenue || 0 }));

@@ -307,3 +307,29 @@ test('stream rotation by position: first matching regular stream wins', { timeou
     assert.equal((await (await fetch(url + '/api/campaigns')).json()).campaigns.pos.streamRotation, 'weight');
   });
 });
+
+test('device/os/browser/language reports and day-parting streams', { timeout: 15000 }, async (t) => {
+  await withServer(t, {}, async ({ url, post, hit }) => {
+    const IPHONE = { 'user-agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Safari/604.1', 'accept-language': 'fr-FR' };
+    const WIN = { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0) Chrome/126.0 Safari/537.36', 'accept-language': 'de-DE' };
+    await post('/api/campaigns', { id: 'dims', name: 'Dims' });
+    await hit('/r/dims/offer-1', IPHONE); await hit('/r/dims/offer-1', IPHONE); await hit('/r/dims/offer-1', WIN);
+    const os = await (await fetch(url + '/stats/params?field=os&campaign=dims')).json();
+    assert.deepEqual(os.rows.map((r) => [r.value, r.clicks]), [['ios', 2], ['windows', 1]]);
+    const lang = await (await fetch(url + '/stats/params?field=language&campaign=dims')).json();
+    assert.equal(lang.rows.find((r) => r.value === 'fr').clicks, 2);
+    assert.equal((await (await fetch(url + '/stats/params?field=device&campaign=dims')).json()).rows.find((r) => r.value === 'mobile').clicks, 2);
+
+    // Schedule: the current UTC hour matches, every other hour does not.
+    const nowHour = new Date().getUTCHours();
+    const otherHours = Array.from({ length: 24 }, (_, h) => h).filter((h) => h !== nowHour);
+    await post('/api/offers', { id: 'night', url: 'https://night.example.net/' });
+    await post('/api/campaigns', { id: 'sched', name: 'Sched', streams: [
+      { name: 'not-now', conditions: { hours: otherHours, tz: 'UTC' }, offers: [{ offerId: 'night' }] },
+      { name: 'now', conditions: { hours: [nowHour], days: [1, 2, 3, 4, 5, 6, 7], tz: 'Mars/Olympus' }, offers: [{ offerId: 'offer-1' }] },
+    ] });
+    const stored = (await (await fetch(url + '/api/campaigns')).json()).campaigns.sched.streams;
+    assert.equal(stored[1].conditions.tz, 'UTC', 'unknown time zone falls back to UTC');
+    for (let i = 0; i < 5; i++) assert.equal(new URL((await hit('/r/sched')).headers.get('location')).host, 'example.com');
+  });
+});
