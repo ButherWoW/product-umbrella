@@ -71,6 +71,35 @@ try {
   await page.locator('.editor-head .btn.primary').click();
   await page.locator('#toast', { hasText: 'Сохранено' }).waitFor();
 
+  // Partner networks: generated postback is visible/copyable, and offers can be linked to a network.
+  await page.goto(server.url + '/admin#/networks');
+  await page.getByRole('button', { name: 'Создать сеть' }).click();
+  const networkDialog = page.getByRole('dialog', { name: 'Новая сеть' });
+  await networkDialog.locator('input').nth(0).fill('net-ui');
+  await networkDialog.locator('input').nth(1).fill('Network UI');
+  await networkDialog.locator('input').nth(2).fill('sub1={click_id}');
+  await networkDialog.getByRole('button', { name: 'Сохранить' }).click();
+  await page.locator('table.grid tbody tr', { hasText: 'Network UI' }).waitFor();
+  await page.locator('table.grid tbody tr', { hasText: 'Network UI' }).getByRole('button', { name: 'Изменить' }).click();
+  const savedNetworkDialog = page.getByRole('dialog', { name: 'Редактирование сети' });
+  await savedNetworkDialog.getByDisplayValue(/click_id=\{click_id\}/).waitFor();
+  assert.match(await savedNetworkDialog.innerText(), /POSTBACK_SECRET/);
+  await savedNetworkDialog.getByRole('button', { name: 'Копировать' }).click();
+  await savedNetworkDialog.getByRole('button', { name: 'Отмена' }).click();
+
+  await page.goto(server.url + '/admin#/offers');
+  await page.getByRole('button', { name: 'Создать', exact: true }).click();
+  const offerDialog = page.getByRole('dialog', { name: 'Создание оффера' });
+  await offerDialog.locator('input').nth(0).fill('offer-ui');
+  await offerDialog.locator('input').nth(1).fill('UI offer');
+  await offerDialog.locator('input[type=url]').first().fill('https://offer.example.net/?x=1');
+  await offerDialog.getByRole('tab', { name: 'Настройки' }).click();
+  await offerDialog.getByLabel('Партнёрская сеть').selectOption('net-ui');
+  await offerDialog.getByRole('button', { name: 'Создать' }).click();
+  await page.locator('table.grid tbody tr', { hasText: 'UI offer' }).waitFor();
+  const createdOffers = await (await fetch(server.url + '/api/offers')).json();
+  assert.equal(createdOffers.offers['offer-ui'].networkId, 'net-ui', 'offer keeps selected partner network');
+
 
   // Currency switch on the dashboard: 25 USD = 20 EUR = 2000 RUB at the fixed test rates.
   await page.goto(server.url + '/admin#/dashboard');
