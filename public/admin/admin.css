@@ -75,6 +75,8 @@ textarea.input { width: 100%; min-height: 90px; font-family: var(--mono); font-s
 .legend button { background: none; border: 0; color: inherit; cursor: pointer; display: inline-flex; gap: 6px; align-items: center; }
 .legend button.off { opacity: .35; }
 .legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.trends-tag { display: inline-flex; align-items: center; gap: 4px; padding: 2px 6px; border-radius: 12px; border: 1px solid var(--c, var(--line)); font-size: 12px; background: var(--panel); }
+.trends-tag .icon-btn { font-size: 10px; line-height: 1; padding: 0 1px; opacity: .6; }
 
 .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
 table.grid { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }

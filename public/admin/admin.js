@@ -399,16 +399,16 @@ function lineChart(series, buckets) {
   return box;
 }
 
-async function timeseries({ campaign, from, to }) {
+async function timeseries({ campaign, offer, from, to }) {
   const single = from && from === to;
   const gran = single ? 'hour' : 'day';
-  const ts = await api('/stats/timeseries' + qs({ campaign, from, to, granularity: gran }));
+  const ts = await api('/stats/timeseries' + qs({ campaign, offer, from, to, granularity: gran }));
   const byKey = new Map(ts.series.map((p) => [String(p.date ?? p.bucket ?? '').slice(0, single ? 13 : 10), p]));
   let keys = [];
   if (single) keys = Array.from({ length: 24 }, (_, i) => `${from}T${String(i).padStart(2, '0')}`);
   else if (from && to) { for (let d = new Date(from + 'T00:00:00Z'); d <= new Date(to + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + 1)) keys.push(d.toISOString().slice(0, 10)); }
   else keys = [...byKey.keys()].sort();
-  return keys.map((k) => ({ key: k, label: single ? k.slice(11) + ':00' : k.slice(5).split('-').reverse().join('.'), clicks: byKey.get(k)?.clicks || 0, conversions: byKey.get(k)?.conversions || 0, revenue: byKey.get(k)?.revenue || 0 }));
+  return keys.map((k) => { const p = byKey.get(k); return { key: k, label: single ? k.slice(11) + ':00' : k.slice(5).split('-').reverse().join('.'), clicks: p?.clicks || 0, uniqueClicks: p?.uniqueClicks || 0, conversions: p?.conversions || 0, revenue: p?.revenue || 0, cost: p?.cost || 0 }; });
 }
 
 // ---------- pages ----------
@@ -1197,6 +1197,98 @@ async function pageUsers() {
   return () => table.detach();
 }
 
+// ---------- trends ----------
+async function pageTrends() {
+  await loadRefs();
+  const COLORS = ['#4d86f0', '#e0496a', '#e8913f', '#3dc98b', '#a25fe0'];
+  const METRICS = [
+    ['clicks', 'Клики', (p) => p.clicks, false],
+    ['uniqueClicks', 'Уник. клики', (p) => p.uniqueClicks, false],
+    ['conversions', 'Конверсии', (p) => p.conversions, false],
+    ['revenue', 'Доход', (p) => p.revenue, true],
+    ['profit', 'Прибыль', (p) => p.revenue - p.cost, true],
+    ['cr', 'CR', (p) => (p.clicks ? p.conversions / p.clicks : 0), false],
+  ];
+  let mode = store.get('trends:mode', 'campaign');
+  let selections = store.get('trends:sel:' + mode, []);
+  let metric = store.get('trends:metric', 'clicks');
+  const selList = h('div', { class: 'toolbar trends-sel', style: 'margin:0;flex-wrap:wrap;gap:4px;align-items:center' });
+  function getItems() { return mode === 'campaign' ? state.campaigns : state.offers; }
+  function getLabel(id) { return mode === 'campaign' ? (state.campaigns[id]?.name || id) : id; }
+  function renderSelections() {
+    const items = getItems();
+    selections = selections.filter((id) => id in items);
+    store.set('trends:sel:' + mode, selections);
+    const available = Object.keys(items).filter((id) => !selections.includes(id));
+    put(selList,
+      selections.map((id, i) => h('span', { class: 'trends-tag', style: `--c:${COLORS[i]}` },
+        h('i', { style: `background:${COLORS[i]};width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:4px` }),
+        getLabel(id),
+        h('button', { class: 'icon-btn', style: 'font-size:11px;padding:0 2px', 'aria-label': 'Удалить', onclick: () => { selections.splice(i, 1); renderSelections(); load(); } }, '✕'))),
+      selections.length < 5 && available.length > 0 ?
+        h('select', { class: 'select', 'aria-label': 'Добавить', onchange: (e) => { const v = e.target.value; if (v && !selections.includes(v)) { selections.push(v); renderSelections(); load(); } e.target.value = ''; } },
+          h('option', { value: '' }, '+ Добавить ' + (mode === 'campaign' ? 'кампанию' : 'оффер')),
+          available.map((id) => h('option', { value: id }, getLabel(id)))) : null);
+  }
+  const typeSelect = h('select', { class: 'select', 'aria-label': 'Тип', onchange: () => { mode = typeSelect.value; store.set('trends:mode', mode); selections = store.get('trends:sel:' + mode, []); renderSelections(); load(); } },
+    h('option', { value: 'campaign', selected: mode === 'campaign' }, 'Кампании'), h('option', { value: 'offer', selected: mode === 'offer' }, 'Офферы'));
+  const metricSel = h('select', { class: 'select', 'aria-label': 'Метрика', onchange: () => { metric = metricSel.value; store.set('trends:metric', metric); load(); } },
+    METRICS.map(([key, label]) => h('option', { value: key, selected: key === metric }, label)));
+  const chartHolder = h('div', { class: 'card', style: 'margin-bottom:14px' });
+  const tableHolder = h('div');
+  let tblCleanup = null;
+  renderSelections();
+  put(view,
+    h('div', { class: 'page-head' }, h('h1', {}, 'Тренды')),
+    h('div', { class: 'toolbar' }, typeSelect, selList, metricSel, periodControl(() => load()), currencyControl(() => load()),
+      h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻')),
+    chartHolder, tableHolder);
+  async function load() {
+    if (!selections.length) {
+      put(chartHolder, h('p', { class: 'muted', style: 'padding:16px' }, 'Выберите до 5 ' + (mode === 'campaign' ? 'кампаний' : 'офферов') + ' для сравнения.'));
+      if (tblCleanup) { tblCleanup(); tblCleanup = null; } put(tableHolder, '');
+      return;
+    }
+    const { from, to } = periodRange();
+    put(chartHolder, h('p', { class: 'muted', style: 'padding:16px' }, 'Загрузка…'));
+    try {
+      const allSeries = await Promise.all(selections.map((id) =>
+        timeseries({ campaign: mode === 'campaign' ? id : undefined, offer: mode === 'offer' ? id : undefined, from, to })));
+      const dateSet = new Set(allSeries.flatMap((s) => s.map((p) => p.key)));
+      const dates = [...dateSet].sort();
+      const labelOf = (k) => { const ref = allSeries.flat().find((p) => p.key === k); return ref?.label || k.slice(5).split('-').reverse().join('.'); };
+      const buckets = dates.map((k) => ({ key: k, label: labelOf(k) }));
+      const metricDef = METRICS.find(([k]) => k === metric) || METRICS[0];
+      const metricFn = metricDef[2]; const isRight = metricDef[3];
+      const chartSeries = selections.map((id, i) => {
+        const byDate = new Map(allSeries[i].map((p) => [p.key, p]));
+        return { key: id, label: getLabel(id), color: COLORS[i], right: isRight, values: dates.map((d) => { const p = byDate.get(d); return p ? metricFn(p) : 0; }) };
+      });
+      put(chartHolder, lineChart(chartSeries, buckets));
+      if (tblCleanup) { tblCleanup(); tblCleanup = null; }
+      const tblRows = dates.map((d) => {
+        const row = { id: d };
+        for (let i = 0; i < selections.length; i++) { const p = allSeries[i].find((x) => x.key === d); row['s' + i] = p ? metricFn(p) : 0; }
+        return row;
+      });
+      const fmtVal = isRight ? (v) => money(v) : metric === 'cr' ? (v) => pct(v) : (v) => num(v);
+      const tbl = dataTable({
+        id: 'trends-table', totals: true, rows: tblRows,
+        columns: [
+          { key: 'id', label: 'Дата', fixed: true, render: (r) => h('span', {}, labelOf(r.id)) },
+          ...selections.map((id, i) => ({ key: 's' + i, label: getLabel(id), render: (r) => fmtVal(r['s' + i]) })),
+        ],
+      });
+      tblCleanup = () => tbl.detach();
+      put(tableHolder, tbl);
+    } catch (e) {
+      put(chartHolder, h('p', { class: 'err', style: 'padding:16px' }, 'Ошибка загрузки: ' + e.message));
+    }
+  }
+  load();
+  return () => { if (tblCleanup) tblCleanup(); };
+}
+
 // ---------- router ----------
 let cleanup = null;
 async function route() {
@@ -1220,6 +1312,7 @@ async function route() {
     else if (section === 'landings') cleanup = await pageLandings();
     else if (section === 'reports') cleanup = await pageReports(params);
     else if (section === 'clicks' || section === 'conversions') cleanup = pageLog(section, params);
+    else if (section === 'trends') cleanup = await pageTrends();
     else if (section === 'users') cleanup = await pageUsers();
     else cleanup = await pageDashboard();
   } catch (e) { put(view, h('p', { class: 'err' }, 'Ошибка: ' + e.message)); }

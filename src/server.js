@@ -1518,6 +1518,7 @@ const server = http.createServer(async (req, res) => {
       const tsFrom = url.searchParams.get('from') || null;
       const tsTo = url.searchParams.get('to') || null;
       const tsCampaign = url.searchParams.get('campaign') || null;
+      const tsOffer = url.searchParams.get('offer') || null;
       const granularity = url.searchParams.get('granularity') === 'hour' ? 'hour' : 'day';
       const tsCurrency = reportCurrency(url.searchParams.get('currency'));
       if (tsFrom && !/^\d{4}-\d{2}-\d{2}$/.test(tsFrom)) return json(res, 400, { error: 'invalid_from_date' });
@@ -1526,6 +1527,7 @@ const server = http.createServer(async (req, res) => {
         try {
           const conds = [], params = [];
           if (tsCampaign) { params.push(tsCampaign); conds.push(`c.campaign = $${params.length}`); }
+          if (tsOffer) { params.push(tsOffer); conds.push(`c.offer_id = $${params.length}`); }
           if (req.scope?.allowed) { params.push(req.scope.allowed); conds.push(`c.campaign = ANY($${params.length}::text[])`); }
           if (tsFrom) { params.push(`${tsFrom}T00:00:00Z`); conds.push(`c.created_at >= $${params.length}`); }
           if (tsTo) { params.push(`${tsTo}T23:59:59Z`); conds.push(`c.created_at <= $${params.length}`); }
@@ -1536,14 +1538,16 @@ const server = http.createServer(async (req, res) => {
             SELECT
               DATE_TRUNC('${trunc}', c.created_at) AS bucket,
               COUNT(c.click_id)::int                AS clicks,
+              COUNT(c.click_id) FILTER (WHERE c.is_unique_campaign)::int AS unique_clicks,
               ${SQL_CONVERSIONS}::int               AS conversions,
-              ${fx.revenue}::float                  AS revenue
+              ${fx.revenue}::float                  AS revenue,
+              ${fx.cost}::float                     AS cost
             FROM clicks c
             LEFT JOIN conversions cv USING (click_id)
             ${where}
             GROUP BY bucket ORDER BY bucket
           `, params);
-          return json(res, 200, { granularity, currency: tsCurrency, series: rows.map((r) => ({ date: r.bucket.toISOString().slice(0, granularity === 'hour' ? 13 : 10), clicks: r.clicks, conversions: r.conversions, revenue: r.revenue })) });
+          return json(res, 200, { granularity, currency: tsCurrency, series: rows.map((r) => ({ date: r.bucket.toISOString().slice(0, granularity === 'hour' ? 13 : 10), clicks: r.clicks, uniqueClicks: r.unique_clicks, conversions: r.conversions, revenue: r.revenue, cost: r.cost })) });
         } catch (e) { console.warn('[db] timeseries fallback:', e.message); }
       }
       // JSONL fallback
@@ -1554,6 +1558,7 @@ const server = http.createServer(async (req, res) => {
         const allClicks = lines.filter((item) => item.type === 'click');
         const clicks = allClicks.filter((item) => {
           if (tsCampaign && item.campaign !== tsCampaign) return false;
+          if (tsOffer && item.offerId !== tsOffer) return false;
           if (req.scope?.allowed && !req.scope.allowed.includes(item.campaign)) return false;
           const t = item.at ? Date.parse(item.at) : null;
           if (fromMs !== null && (t === null || t < fromMs)) return false;
@@ -1566,8 +1571,10 @@ const server = http.createServer(async (req, res) => {
         const buckets = {};
         for (const click of clicks) {
           const b = (click.at || '').slice(0, granularity === 'hour' ? 13 : 10);
-          buckets[b] ||= { clicks: 0, conversions: 0, revenue: 0 };
+          buckets[b] ||= { clicks: 0, uniqueClicks: 0, conversions: 0, revenue: 0, cost: 0 };
           buckets[b].clicks += 1;
+          if (click.uniqueCampaign) buckets[b].uniqueClicks += 1;
+          buckets[b].cost += Number(click.cost) * rates.factor(rates.defaultCurrency, tsCurrency) || 0;
         }
         for (const conv of convs) {
           const b = clickBucket.get(conv.clickId) || '';
