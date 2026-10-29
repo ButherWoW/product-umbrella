@@ -42,8 +42,8 @@ async function* journalLines(eventsFile) {
   }
 }
 
-const EMPTY = () => ({ clicks: 0, conversions: 0, lpClicks: 0, bots: 0 });
-const COUNTER = { click: 'clicks', conversion: 'conversions', lp_click: 'lpClicks', bot: 'bots' };
+const EMPTY = () => ({ clicks: 0, conversions: 0, lpClicks: 0, bots: 0, postbacks: 0 });
+const COUNTER = { click: 'clicks', conversion: 'conversions', lp_click: 'lpClicks', bot: 'bots', postback_in: 'postbacks', postback_out: 'postbacks' };
 const before = (at, limitMs) => { const t = Date.parse(at); return Number.isFinite(t) && t < limitMs; };
 
 // Two passes over the journal: plan.observe(record) collects click ids, plan.drop(record) decides.
@@ -59,7 +59,7 @@ export async function filterJournal(eventsFile, plan, commit = async () => {}) {
   let chunk = '';
   try {
     for await (const [line, record] of journalLines(eventsFile)) {
-      if (record && COUNTER[record.type] && plan.drop(record)) { counts[COUNTER[record.type]] += 1; continue; }
+      if (record && plan.drop(record)) { if (COUNTER[record.type]) counts[COUNTER[record.type]] += 1; continue; }
       chunk += line + '\n';
       if (chunk.length > 1 << 20) { await out.write(chunk); chunk = ''; }
     }
@@ -76,15 +76,22 @@ export async function filterJournal(eventsFile, plan, commit = async () => {}) {
   return counts;
 }
 
-// One campaign: its clicks (all or created before `beforeMs`), their conversions and landing clicks, its bot events.
+// One campaign: its clicks (all or created before `beforeMs`), their conversions and landing clicks, its bot events,
+// its postback journal (in/out, by the postback's own time) and cost updates that only touched removed clicks —
+// the same rows clearCampaignRows deletes in PostgreSQL.
 export function campaignPlan(campaign, beforeMs = null) {
   const clickIds = new Set();
   const inRange = (at) => beforeMs === null || before(at, beforeMs);
   return {
     observe(e) { if (e.type === 'click' && e.campaign === campaign && inRange(e.at)) clickIds.add(e.clickId); },
     drop(e) {
-      if (e.type === 'bot') return e.campaign === campaign && inRange(e.at);
-      return clickIds.has(e.clickId);
+      if (e.type === 'bot' || e.type === 'postback_in' || e.type === 'postback_out') return e.campaign === campaign && inRange(e.at);
+      if (e.type === 'cost_update') {
+        const ids = [...(Array.isArray(e.clickIds) ? e.clickIds : []), ...(e.lastClickId ? [e.lastClickId] : [])];
+        return ids.length > 0 && ids.every((id) => clickIds.has(id));
+      }
+      if (e.type === 'click' || e.type === 'conversion' || e.type === 'lp_click') return clickIds.has(e.clickId);
+      return false;
     },
   };
 }
@@ -123,11 +130,14 @@ export function clearCampaignRows(db, campaign, beforeIso = null) {
   const params = beforeIso ? [campaign, beforeIso] : [campaign];
   return inTransaction(db, async (client) => {
     const conversions = await client.query(`DELETE FROM conversions WHERE click_id IN (SELECT click_id FROM clicks WHERE ${where})`, params);
+    // Cost imports whose clicks are all removed (their cost_update events leave the journal too).
+    await client.query(`DELETE FROM cost_imports WHERE cardinality(click_ids) > 0
+      AND click_ids <@ ARRAY(SELECT click_id::text FROM clicks WHERE ${where})`, params);
     const clicks = await client.query(`DELETE FROM clicks WHERE ${where} RETURNING lp_clicked_at`, params);
     const bots = await client.query(`DELETE FROM bots WHERE ${where}`, params);
     // Postback journal rows of the campaign (the JSONL copy goes with the campaign's click ids).
-    await client.query(`DELETE FROM postbacks WHERE ${where}`, params);
-    return { clicks: clicks.rowCount, conversions: conversions.rowCount, lpClicks: clicks.rows.filter((r) => r.lp_clicked_at).length, bots: bots.rowCount };
+    const postbacks = await client.query(`DELETE FROM postbacks WHERE ${where}`, params);
+    return { clicks: clicks.rowCount, conversions: conversions.rowCount, lpClicks: clicks.rows.filter((r) => r.lp_clicked_at).length, bots: bots.rowCount, postbacks: postbacks.rowCount };
   });
 }
 
@@ -136,6 +146,6 @@ export function retentionRows(db, cutoffIso) {
     const clicks = await client.query(`DELETE FROM clicks c WHERE c.created_at < $1
       AND NOT EXISTS (SELECT 1 FROM conversions v WHERE v.click_id = c.click_id) RETURNING lp_clicked_at`, [cutoffIso]);
     const bots = await client.query('DELETE FROM bots WHERE created_at < $1', [cutoffIso]);
-    return { clicks: clicks.rowCount, conversions: 0, lpClicks: clicks.rows.filter((r) => r.lp_clicked_at).length, bots: bots.rowCount };
+    return { clicks: clicks.rowCount, conversions: 0, lpClicks: clicks.rows.filter((r) => r.lp_clicked_at).length, bots: bots.rowCount, postbacks: 0 };
   });
 }

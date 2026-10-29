@@ -113,6 +113,8 @@ await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS status TEXT NOT
 await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ`);
 await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS tid TEXT NOT NULL DEFAULT ''`);
 await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS params JSONB`);
+// CPC offers earn per click: a postback amount on such an offer is stored but not counted in revenue.
+await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS revenue_ignored BOOLEAN NOT NULL DEFAULT false`);
 // Upsells (G6): one row per (click_id, tid); tid '' is the main conversion. The new unique index is created
 // before the old primary key on click_id is dropped, so uniqueness never lapses.
 await db.query(`CREATE UNIQUE INDEX IF NOT EXISTS conversions_click_tid_idx ON conversions(click_id, tid)`);
@@ -171,6 +173,34 @@ await db.query(`CREATE TABLE IF NOT EXISTS cost_imports (import_key TEXT PRIMARY
   cost NUMERIC(14,6) NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
 // Offer conversion cap counts today's conversions.
 await db.query(`CREATE INDEX IF NOT EXISTS conversions_created_idx ON conversions(created_at)`);
+
+// Event ids (journal record id) for idempotent replay by the reconciliation job (src/reconcile.js).
+// Unique indexes treat NULLs as distinct, so rows written before these columns existed stay valid.
+await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS event_id UUID`);
+await db.query(`ALTER TABLE bots ADD COLUMN IF NOT EXISTS event_id UUID`);
+await db.query(`ALTER TABLE postbacks ADD COLUMN IF NOT EXISTS event_id UUID`);
+await db.query(`CREATE UNIQUE INDEX IF NOT EXISTS bots_event_id_idx ON bots(event_id)`);
+await db.query(`CREATE UNIQUE INDEX IF NOT EXISTS postbacks_event_id_idx ON postbacks(event_id)`);
+await db.query(`CREATE INDEX IF NOT EXISTS bots_created_idx ON bots(created_at)`);
+await db.query(`CREATE INDEX IF NOT EXISTS postbacks_created_idx ON postbacks(created_at)`);
+
+// CHECK constraints that schema.sql has (databases created by this script did not). Added NOT VALID first so the
+// migration never fails on old rows, then validated; rows that do not pass keep the constraint NOT VALID
+// (new rows are still checked) and are reported.
+const checks = [
+  ['conversions', 'conversions_status_check', "CHECK (status IN ('lead', 'sale', 'rejected', 'trash'))"],
+  ['offers', 'offers_url_check', "CHECK (url ~* '^https://')"],
+  ['landings', 'landings_url_check', "CHECK (url ~* '^https://')"],
+];
+for (const [table, name, check] of checks) {
+  await db.query(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '${name}' AND conrelid = '${table}'::regclass) THEN
+      ALTER TABLE ${table} ADD CONSTRAINT ${name} ${check} NOT VALID;
+    END IF;
+  END $$`);
+  try { await db.query(`ALTER TABLE ${table} VALIDATE CONSTRAINT ${name}`); }
+  catch (error) { console.warn(`[migrate] ${table}.${name} stays NOT VALID (existing rows do not pass): ${error.message}`); }
+}
 
 console.log('[migrate] All tables ready');
 await db.end();

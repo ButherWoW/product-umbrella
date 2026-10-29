@@ -129,7 +129,7 @@
               "cpc"
             ],
             "default": "cpa",
-            "description": "cpa: payout per conversion (used when the postback has no revenue); cpc: payout earned by every click"
+            "description": "cpa: payout per conversion (used when the postback has no revenue); cpc: payout earned by every click, postback amounts are not counted as revenue"
           },
           "payout": {
             "type": [
@@ -792,7 +792,17 @@
           },
           "at": {
             "type": "string",
-            "format": "date-time"
+            "format": "date-time",
+            "description": "First postback of this conversion (from/to filter on it)"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Latest postback (status change) of this conversion"
+          },
+          "tid": {
+            "type": "string",
+            "description": "'' = main conversion, other values = upsells; one row per (clickId, tid)"
           },
           "revenue": {
             "type": [
@@ -813,7 +823,12 @@
               "sale",
               "rejected",
               "trash"
-            ]
+            ],
+            "description": "Latest status"
+          },
+          "revenueIgnored": {
+            "type": "boolean",
+            "description": "CPC offer: the postback amount is stored but not counted in revenue (the offer earns per click)"
           }
         }
       },
@@ -2323,7 +2338,7 @@
     "/api/conversions": {
       "get": {
         "summary": "Conversion log",
-        "description": "Paginated conversion log. Buyers see only their own campaigns' conversions. Requires admin authorization.",
+        "description": "Paginated conversion log: one row per conversion (click, tid) with its latest status, newest first by first postback time. Buyers see only their own campaigns' conversions. Requires admin authorization.",
         "operationId": "getConversions",
         "tags": [
           "logs"
@@ -2542,7 +2557,7 @@
                       "cpc"
                     ],
                     "default": "cpa",
-                    "description": "cpa: payout per conversion (used when the postback has no revenue); cpc: payout earned by every click"
+                    "description": "cpa: payout per conversion (used when the postback has no revenue); cpc: payout earned by every click, postback amounts are not counted as revenue"
                   },
                   "payout": {
                     "type": [
@@ -2691,7 +2706,7 @@
                       "cpc"
                     ],
                     "default": "cpa",
-                    "description": "cpa: payout per conversion (used when the postback has no revenue); cpc: payout earned by every click"
+                    "description": "cpa: payout per conversion (used when the postback has no revenue); cpc: payout earned by every click, postback amounts are not counted as revenue"
                   },
                   "payout": {
                     "type": [
