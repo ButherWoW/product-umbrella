@@ -373,7 +373,7 @@ function simulateModal(campaignId) {
       const r = await api('/api/simulate', { method: 'POST', body: { campaign: campaignId, country: q.country, userAgent: q.ua, ip: q.ip, language: q.language, query: q.query, referrer: q.referrer || undefined, at: q.at ? new Date(q.at).toISOString() : undefined } });
       const v = r.visitor || {};
       put(out,
-        h('p', { class: 'muted' }, `Посетитель: ${v.country || 'страна ?'} · ${v.device} · ${v.os} · ${v.browser}${v.language ? ' · ' + v.language : ''}${v.isp ? ' · ' + v.isp : ''}${v.datacenter ? ' (дата-центр)' : ''}`),
+        h('p', { class: 'muted' }, `Посетитель: ${v.country || 'страна ?'} · ${v.device} · ${v.os} · ${v.browser}${v.language ? ' · ' + v.language : ''}${v.isp ? ' · ' + v.isp : ''}${v.connection && v.connection !== 'datacenter' ? ' · ' + (CONNECTION_LABEL[v.connection] || v.connection) : ''}${v.datacenter ? ' (дата-центр)' : ''}`),
         ...r.steps.map((st) => h('div', { class: 'card', style: 'margin-bottom:10px' },
           h('b', {}, st.name || st.campaign), st.checks?.map((c) => h('p', { class: 'err' }, `${c.check}: ${c.note}`)),
           (st.streams || []).map((s) => h('div', { style: 'margin-top:6px' },
@@ -771,7 +771,9 @@ const COND = {
   devices: [['mobile', 'Мобильные'], ['tablet', 'Планшеты'], ['desktop', 'Десктоп']],
   os: [['android', 'Android'], ['ios', 'iOS'], ['windows', 'Windows'], ['macos', 'macOS'], ['linux', 'Linux'], ['other', 'Другие']],
   browsers: [['chrome', 'Chrome'], ['safari', 'Safari'], ['firefox', 'Firefox'], ['edge', 'Edge'], ['opera', 'Opera'], ['samsung', 'Samsung'], ['other', 'Другие']],
+  connections: [['mobile', 'Мобильный'], ['broadband', 'Wi-Fi / домашний'], ['datacenter', 'Дата-центр']],
 };
+const CONNECTION_LABEL = Object.fromEntries(COND.connections);
 function checkGroup(options, values, onChange) {
   const set = new Set(values || []);
   return h('div', { class: 'checks' }, options.map(([v, l]) => h('label', {}, h('input', { type: 'checkbox', checked: set.has(v), onchange: (e) => { e.target.checked ? set.add(v) : set.delete(v); onChange([...set]); } }), l)));
@@ -843,6 +845,7 @@ function summarizeConditions(c = {}) {
   if (c.browsers?.length) add('browsers', 'Браузеры', c.browsers.join(', '));
   if (c.languages?.length) add('languages', 'Языки', c.languages.join(', '));
   if (c.isps?.length) add('isps', 'Провайдеры', c.isps.join(', '));
+  if (c.connections?.length) add('connections', 'Соединение', c.connections.map((x) => CONNECTION_LABEL[x] || x).join(', '));
   if (c.referrers?.length) add('referrers', 'Реферер', c.referrers.join(', '));
   if (typeof c.emptyReferrer === 'boolean') add('emptyReferrer', 'Пустой реферер', c.emptyReferrer ? 'да' : 'нет');
   if (c.keywords?.length) add('keywords', 'Ключ. слова', c.keywords.join(', '));
@@ -858,7 +861,7 @@ function summarizeConditions(c = {}) {
 
 function streamModal(stream, onApply, isNew = false, currentCampaignId = null) {
   const s = structuredClone(stream);
-  s.conditions = { countries: [], devices: [], os: [], browsers: [], languages: [], isps: [], days: [], hours: [], referrers: [], keywords: [], ips: [], userAgents: [], params: {}, not: [], ...(s.conditions || {}) };
+  s.conditions = { countries: [], devices: [], os: [], browsers: [], languages: [], isps: [], connections: [], days: [], hours: [], referrers: [], keywords: [], ips: [], userAgents: [], params: {}, not: [], ...(s.conditions || {}) };
   // «НЕ» toggle next to a condition: the stream matches visitors who are NOT in the list.
   const cfield = (key, label, control, hint) => h('div', { class: 'field' },
     h('span', {}, label, h('label', { class: 'not-toggle', style: 'margin-left:10px;font-weight:400' },
@@ -929,6 +932,7 @@ function streamModal(stream, onApply, isNew = false, currentCampaignId = null) {
       cfield('browsers', 'Браузеры', checkGroup(COND.browsers, s.conditions.browsers, (v) => { s.conditions.browsers = v; })),
       cfield('languages', 'Языки', h('input', { class: 'input', 'aria-label': 'Языки', value: s.conditions.languages.join(', '), placeholder: 'fr, de', oninput: (e) => { s.conditions.languages = splitList(e.target.value).map((x) => x.toLowerCase()); } }), 'Два первых символа Accept-Language.'),
       cfield('isps', 'Провайдеры', h('input', { class: 'input', 'aria-label': 'Провайдеры', value: s.conditions.isps.join(', '), placeholder: 'orange, free mobile', oninput: (e) => { s.conditions.isps = splitComma(e.target.value).map((x) => x.toLowerCase()); } }), 'Часть названия провайдера, как в отчёте «Провайдер». Без базы провайдеров условие не срабатывает.'),
+      cfield('connections', 'Тип соединения', checkGroup(COND.connections, s.conditions.connections, (v) => { s.conditions.connections = v; }), 'По базе провайдеров (ASN), приблизительно: мобильными считаются только чисто мобильные сети (T-Mobile, Verizon Wireless, Free Mobile…), смешанные операторы (Orange, SFR, Bouygues) — домашний. Без базы условие не срабатывает.'),
       cfield('referrers', 'Реферер', h('input', { class: 'input', 'aria-label': 'Реферер', value: s.conditions.referrers.join(', '), placeholder: 'facebook.com, instagram.com/ads', oninput: (e) => { s.conditions.referrers = splitComma(e.target.value).map((x) => x.toLowerCase()); } }), 'Часть адреса источника перехода (домен и путь), без учёта регистра.'),
       cfield('emptyReferrer', 'Пустой реферер', h('div', { class: 'radios' }, [[undefined, 'Не важно'], [true, 'Пустой'], [false, 'Не пустой']].map(([v, l]) => h('label', {},
         h('input', { type: 'radio', name: 'semptyref', checked: s.conditions.emptyReferrer === v, onchange: () => { if (v === undefined) delete s.conditions.emptyReferrer; else s.conditions.emptyReferrer = v; } }), l)))),
@@ -1590,7 +1594,7 @@ async function pageOffers() {
 
 const GROUPS = [
   ['campaign', 'Кампания', 'byCampaign'], ['offer', 'Оффер', 'byOffer'], ['stream', 'Поток', 'byStream'], ['landing', 'Лендинг', 'byLanding'], ['country', 'Страна', 'byCountry'],
-  ['device', 'Устройство', null], ['os', 'ОС', null], ['browser', 'Браузер', null], ['language', 'Язык', null], ['isp', 'Провайдер', null],
+  ['device', 'Устройство', null], ['os', 'ОС', null], ['browser', 'Браузер', null], ['language', 'Язык', null], ['isp', 'Провайдер', null], ['connection', 'Тип соединения', null],
   ['day', 'День', null], ['hour', 'Час', null], ['referrer', 'Реферер', null], ['path', 'Путь', null],
 ];
 async function pageReports(params) {
@@ -1610,7 +1614,7 @@ async function pageReports(params) {
   drawPresets();
 
   // Period comparison: a second request for the equally long period right before the current one.
-  const COMPARE_GROUPS = new Set(['campaign', 'offer', 'stream', 'landing', 'country', 'device', 'os', 'browser', 'language', 'isp']);
+  const COMPARE_GROUPS = new Set(['campaign', 'offer', 'stream', 'landing', 'country', 'device', 'os', 'browser', 'language', 'isp', 'connection']);
   // Named via title, not <label>: a label containing «периодом» would also match lookups of the «Период» select by label.
   const compareBox = h('input', { type: 'checkbox', title: 'Сравнить с предыдущим периодом', checked: store.get('reports:compare', false), onchange: (e) => { store.set('reports:compare', e.target.checked); load(); } });
   const compareLabel = h('span', { class: 'muted', style: 'display:inline-flex;align-items:center;gap:4px;cursor:pointer', onclick: (e) => { if (e.target !== compareBox) compareBox.click(); } }, compareBox, h('span', { 'aria-hidden': 'true' }, 'Сравнить с предыдущим периодом'));
@@ -1838,12 +1842,13 @@ async function pageReports(params) {
         if (key === 'campaign') drill = (r) => ({ group: 'stream', campaign: r.id });
         if (key === 'offer') drill = (r) => ({ group: 'country', offer: r.id });
         if (key === 'stream') drill = (r) => ({ group: 'offer', stream: r.id });
-      } else if (['device', 'os', 'browser', 'language', 'isp'].includes(key)) {
+      } else if (['device', 'os', 'browser', 'language', 'isp', 'connection'].includes(key)) {
         const r = await api('/stats/params' + qs({ field: key, campaign: f.campaign, from, to }));
-        rows = (r.rows || []).map((x) => ({ id: x.value || '(неизвестно)', clicks: x.clicks || 0, conversions: x.conversions || 0, revenue: x.revenue || 0, cost: x.cost || 0 }));
+        const valueLabel = (v) => (key === 'connection' ? CONNECTION_LABEL[v] || v : v) || '(неизвестно)';
+        rows = (r.rows || []).map((x) => ({ id: valueLabel(x.value), clicks: x.clicks || 0, conversions: x.conversions || 0, revenue: x.revenue || 0, cost: x.cost || 0 }));
         if (prev) {
           const p = await api('/stats/params' + qs({ field: key, campaign: f.campaign, ...prev }));
-          const byId = new Map((p.rows || []).map((x) => [x.value || '(неизвестно)', x]));
+          const byId = new Map((p.rows || []).map((x) => [valueLabel(x.value), x]));
           rows.forEach((r) => { r.prev = byId.get(r.id) || null; });
         }
         if (f.offer || f.country || f.stream || f.subid) note.textContent = 'Для этой группировки применяются только кампания и период.';
@@ -2018,6 +2023,7 @@ function clickCard(r) {
     ['IP', r.ip], ['Страна', r.country],
     ['Устройство', r.device], ['ОС', r.os], ['Браузер', r.browser], ['Язык', r.language],
     r.isp ? ['Провайдер', r.isp] : null,
+    r.connection ? ['Тип соединения', CONNECTION_LABEL[r.connection] || r.connection] : null,
     ['Реферер', r.referrer], ['Путь', r.path],
     ['User Agent', r.userAgent],
     ['Subid', r.subid],

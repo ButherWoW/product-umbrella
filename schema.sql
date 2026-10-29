@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS clicks (
   asn integer,
   isp text,
   datacenter boolean,
+  connection text,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 

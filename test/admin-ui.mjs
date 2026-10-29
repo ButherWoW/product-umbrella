@@ -958,6 +958,27 @@ try {
   assert.match(d14Cells['Доход (ожидаемый)'] || '', /^0,00\s?\$$/, 'nothing pending');
   assert.ok((await page.locator('table.grid tfoot').innerText()).includes('1'), 'totals row');
 
+  // Connection type: stream filter checkboxes (with «НЕ») and the «Тип соединения» report grouping.
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await api('/api/campaigns', { id: 'conn-ui', name: 'Conn UI', streams: [{ name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] }] });
+  await fetch(server.url + '/r/conn-ui', { redirect: 'manual' });
+  await page.goto(server.url + '/admin#/campaigns/conn-ui');
+  await page.locator('.stream .title').first().click();
+  const connDlg = page.getByRole('dialog', { name: 'Редактирование потока' });
+  await connDlg.getByRole('tab', { name: 'Фильтры' }).click();
+  await connDlg.getByLabel('Мобильный', { exact: true }).check();
+  await connDlg.getByLabel('Дата-центр', { exact: true }).check();
+  await connDlg.getByLabel('Тип соединения: НЕ').check();
+  await connDlg.getByRole('button', { name: 'Применить' }).click();
+  await page.locator('.stream', { hasText: 'Соединение НЕ: Мобильный, Дата-центр' }).waitFor();
+  await page.locator('.editor-head .btn.primary').click();
+  await page.locator('#toast', { hasText: 'Сохранено' }).waitFor();
+  const connSaved = (await (await fetch(server.url + '/api/campaigns')).json()).campaigns['conn-ui'].streams[0].conditions;
+  assert.deepEqual([connSaved.connections, connSaved.not], [['mobile', 'datacenter'], ['connections']], 'connection filter saved');
+  await page.goto(server.url + '/admin#/reports?group=connection&campaign=conn-ui');
+  await page.locator('.chip-btn.on', { hasText: 'Тип соединения' }).waitFor();
+  await page.locator('table.grid tbody tr', { hasText: '(неизвестно)' }).waitFor();
+
   assert.deepEqual(errors, []);
   console.log('Admin UI browser test passed');
 } finally {
