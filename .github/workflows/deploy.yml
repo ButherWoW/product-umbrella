@@ -7,9 +7,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Checks run in parallel: each PR (and main) has its own group, a newer push to the same PR replaces the older run.
 concurrency:
-  group: deploy-umbrella
-  cancel-in-progress: false
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   HOST: 148.230.98.232
@@ -66,6 +67,10 @@ jobs:
 
   deploy:
     needs: [test, postgres, ui]
+    # Only one deploy at a time; a queued one waits instead of being dropped.
+    concurrency:
+      group: deploy-umbrella
+      cancel-in-progress: false
     # Pull requests only run tests; production deploys happen after merge into main.
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
