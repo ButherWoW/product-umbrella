@@ -68,6 +68,8 @@ textarea.input { width: 100%; min-height: 90px; font-family: var(--mono); font-s
 .kpi .v { padding: 8px; font-size: 18px; font-weight: 700; background: rgba(0,0,0,.18); font-variant-numeric: tabular-nums; }
 
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; min-width: 0; }
+.monitor-down { border-left: 3px solid var(--bad); }
+.monitor-down ul { margin: 0; padding-left: 18px; } .monitor-down li { margin: 4px 0; overflow-wrap: anywhere; }
 .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 14px; margin-bottom: 14px; }
 @media (max-width: 500px) { .grid-2 { grid-template-columns: 1fr; } }
 .chart { width: 100%; height: 220px; display: block; }
@@ -165,6 +167,12 @@ body.auth-mode .view { margin-left: 0; display: grid; place-items: start center;
 .kpi-edit { cursor: pointer; }
 .kpi-edit:hover { outline: 2px solid var(--fg-3); }
 .kpi .v .neg { color: #ffd2d0; }
+.kpi .goal { padding: 0 8px 6px; background: rgba(0,0,0,.18); }
+.kpi .goal-track { height: 4px; border-radius: 2px; background: rgba(0,0,0,.28); overflow: hidden; }
+.kpi .goal-fill { height: 100%; background: var(--fg); border-radius: 2px; }
+.kpi .goal-cap { margin-top: 3px; font-size: 11px; color: var(--fg); opacity: .85; }
+.kpi .goal.done .goal-fill { background: var(--good); }
+.kpi .goal.done .goal-cap { color: var(--good); opacity: 1; font-weight: 600; }
 
 @media (max-width: 600px) {
   /* Cards: each table row becomes a block */
@@ -197,3 +205,12 @@ body.auth-mode .view { margin-left: 0; display: grid; place-items: start center;
 .ip-allowlist h2 { margin: 0 0 8px; font-size: 16px; }
 .ip-allowlist p { margin: 6px 0; }
 .ip-allowlist code { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+.danger-zone { margin-top: 20px; padding: 14px; border: 1px solid var(--bad); border-radius: var(--radius); }
+.danger-zone h3 { margin: 0 0 6px; color: var(--bad); font-size: 14px; }
+/* User permissions: checkbox rows in the user dialogs; viewers get no write controls. */
+.check-line { display: flex; align-items: center; gap: 6px; margin: 4px 0; font-size: 13px; }
+.check-line[hidden] { display: none; }
+body.read-only:not(.auth-mode) .btn.primary, body.read-only:not(.auth-mode) .row-actions { display: none !important; }
+/* Key-value card (click details) */
+.kv { display: grid; grid-template-columns: minmax(100px, max-content) minmax(0, 1fr); gap: 6px 16px; align-items: baseline; }
+.kv-value { overflow-wrap: anywhere; }

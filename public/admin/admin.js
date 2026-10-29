@@ -1,5 +1,5 @@
 // Umbrella admin UI — layout and workflows modelled on Keitaro, backed by the existing tracker API.
-const state = { token: null, offers: {}, campaigns: {}, landings: {}, sources: {}, users: [] };
+const state = { token: null, offers: {}, campaigns: {}, landings: {}, sources: {}, networks: {}, users: [] };
 // Set by the server when the tracker runs under a path prefix (BASE_PATH, e.g. /umbrella behind nginx).
 const BASE = document.querySelector('meta[name="umbrella-base"]')?.getAttribute('content') || '';
 const view = document.getElementById('view');
@@ -82,17 +82,22 @@ const qs = (params) => {
 };
 
 async function loadRefs() {
-  const [o, c, l, s] = await Promise.all([api('/api/offers'), api('/api/campaigns'), api('/api/landings'), api('/api/sources')]);
+  const [o, c, l, s, n] = await Promise.all([api('/api/offers'), api('/api/campaigns'), api('/api/landings'), api('/api/sources'), api('/api/networks')]);
   state.offers = o.offers || {};
   state.campaigns = c.campaigns || {};
   state.landings = l.landings || {};
   state.sources = s.sources || {};
+  state.networks = n.networks || {};
   state.domains = (await api('/api/domains').catch(() => ({ domains: [] }))).domains || [];
   // Owners see the team list (for assigning campaigns and per-buyer earnings); buyers get 403 and an empty list.
   state.users = isOwnerView() ? ((await api('/api/users').catch(() => ({ users: [] }))).users || []) : [];
 }
 
 const isOwnerView = () => state.me?.user?.role === 'owner';
+// Permission flags of the signed-in user. The server already strips the data; the panel only tidies the layout.
+const hideRev = () => Boolean(state.me?.user?.hideRevenue) && state.me.user.role !== 'owner';
+const REV_COLS = new Set(['revenue', 'profit', 'roi', 'epc', 'rpm', 'uepc', 'pendingRevenue', 'earn']);
+const ROLE_LABEL = { owner: 'Владелец', buyer: 'Баер', viewer: 'Только чтение' };
 const userEmail = (id) => state.users.find((u) => u.id === id)?.email || (id ? 'удалённый пользователь' : '—');
 
 // ---------- period ----------
@@ -146,6 +151,12 @@ function currencyControl(onChange) {
   return h('select', { class: 'select', 'aria-label': 'Валюта', title: 'Валюта отчётов', onchange: (e) => { currency.code = e.target.value; store.set('currency', currency.code); onChange(); } },
     codes.map((c) => h('option', { value: c, selected: c === currency.code }, c)));
 }
+// Multiplier from the default currency into the selected one (1 when rates are unknown — amounts are not converted then either).
+function currencyRate() {
+  const info = currency.info;
+  const from = info?.rates?.[info.defaultCurrency]; const to = info?.rates?.[currency.code];
+  return from > 0 && to > 0 ? to / from : 1;
+}
 function ratesNote() {
   const info = currency.info;
   if (!info?.updatedAt) return h('p', { class: 'muted rates-note' }, 'Курсы валют ещё не загружены — суммы в других валютах не пересчитываются.');
@@ -159,7 +170,7 @@ const ACTION_LABEL = { create: 'Создание', update: 'Изменение',
 const FIELD_LABEL = { conversionCap: 'Кап конверсий', capTz: 'Часовой пояс капа', altOfferId: 'Запасной оффер', name: 'Название', active: 'Состояние', dailyCap: 'Дневной кап', totalCap: 'Общий кап', revenueCap: 'Кап дохода', capUrl: 'URL капа', streams: 'Потоки',
   allowGeos: 'Страны', allowDevices: 'Устройства', allowOS: 'ОС', allowBrowsers: 'Браузеры', blockedIps: 'Черный список IP', allowedIps: 'Белый список IP', botFilter: 'Фильтр ботов', datacenterAsBot: 'Дата-центры = боты',
   dedupeWindow: 'Уникальность', conversionWindowDays: 'Окно конверсии', redirectMethod: 'Способ редиректа', paramMap: 'Параметры', costModel: 'Модель затрат', cpc: 'CPC',
-  costFromParam: 'Расход из параметра', url: 'URL', postbackUrl: 'S2S постбэк', dailyCap_offer: 'Дневной кап', reason: 'Причина', email: 'Email', role: 'Роль' };
+  costFromParam: 'Расход из параметра', bindVisitors: 'Привязка посетителя', bindTtlHours: 'Срок привязки', url: 'URL', postbackUrl: 'S2S постбэк', dailyCap_offer: 'Дневной кап', reason: 'Причина', email: 'Email', role: 'Роль' };
 const showValue = (v) => (v === null || v === undefined || v === '' ? '—' : v === true ? 'да' : v === false ? 'нет' : String(v));
 async function historyModal(entity, id, title) {
   const list = h('div', {}, 'Загрузка…');
@@ -222,7 +233,7 @@ function tokenModal(reason) {
 }
 
 // ---------- data table (column chooser, sort, totals, search, pagination, export) ----------
-function dataTable({ id, columns, rows = [], selectable = false, pageSize = 50, rowClass, totals = true, serverPaging = null, empty = 'Нет данных', compact = false }) {
+function dataTable({ id, columns, rows = [], selectable = false, pageSize = 50, rowClass, totals = true, serverPaging = null, empty = 'Нет данных', compact = false, onRowClick = null }) {
   let data = rows;
   let sort = store.get('sort:' + id, null);
   let page = 0;
@@ -262,7 +273,11 @@ function dataTable({ id, columns, rows = [], selectable = false, pageSize = 50, 
       title: c.title || null,
       onclick: c.sortable === false ? null : () => { sort = sort?.key === c.key ? { key: c.key, dir: sort.dir === 'desc' ? 'asc' : 'desc' } : { key: c.key, dir: c.num ? 'desc' : 'asc' }; store.set('sort:' + id, sort); render(); },
     }, c.label, sort?.key === c.key ? (sort.dir === 'desc' ? ' ↓' : ' ↑') : ''))));
-    const tbody = h('tbody', {}, shown.length ? shown.map((r) => h('tr', { class: rowClass ? rowClass(r) : null },
+    // onRowClick: the whole row opens details (mouse or Enter on the focused row); links and controls inside keep their own action.
+    const rowAttrs = (r) => (onRowClick ? { tabindex: '0', style: 'cursor:pointer',
+      onclick: (e) => { if (!e.target.closest('a, button, input, select, label')) onRowClick(r); },
+      onkeydown: (e) => { if (e.key === 'Enter' && e.target === e.currentTarget) { e.preventDefault(); onRowClick(r); } } } : {});
+    const tbody = h('tbody', {}, shown.length ? shown.map((r) => h('tr', { class: rowClass ? rowClass(r) : null, ...rowAttrs(r) },
       selectable ? h('td', { class: 'sel' }, h('input', { type: 'checkbox', 'aria-label': 'Выбрать', checked: selected.has(r.id),
         onchange: (e) => { e.target.checked ? selected.add(r.id) : selected.delete(r.id); root.dispatchEvent(new Event('selection')); } })) : null,
       cols.map((c) => h('td', { class: [c.num ? 'num' : '', c.cls || ''].join(' '), title: c.tip ? c.tip(r) : null, 'data-label': c.label }, c.render ? c.render(r) : (valueOf(c, r) ?? '—')))))
@@ -409,7 +424,7 @@ const metricCols = (opts = {}) => [
   { key: 'approvePct', label: 'Approve %', title: 'Approve % — доля подтверждённых от всех завершённых', num: true, hidden: true, value: (r) => { const d = (r.sales || 0) + (r.rejected || 0) + (r.leads || 0); return d ? (r.sales || 0) / d : 0; }, render: (r) => { const d = (r.sales || 0) + (r.rejected || 0) + (r.leads || 0); return d ? pct((r.sales || 0) / d) : '—'; }, total: (rs) => { const d = sum(rs, 'sales') + sum(rs, 'rejected') + sum(rs, 'leads'); return d ? pct(sum(rs, 'sales') / d) : '—'; } },
   { key: 'crHold', label: 'CR (холд)', title: 'CR (холд) — доля лидов от кликов', num: true, hidden: true, value: (r) => ratio(r.leads, r.clicks), render: (r) => (r.clicks ? pct(ratio(r.leads, r.clicks)) : '—'), total: (rs) => { const c = sum(rs, 'clicks'); return c ? pct(sum(rs, 'leads') / c) : '—'; } },
   { key: 'cpa', label: 'CPA', title: 'CPA — расход на продажу', num: true, hidden: true, value: (r) => (r.sales ? (r.cost || 0) / r.sales : 0), render: (r) => (r.sales ? money4((r.cost || 0) / r.sales) : '—'), total: (rs) => { const s = sum(rs, 'sales'); return s ? money4(sum(rs, 'cost') / s) : '—'; } },
-];
+].filter((c) => !hideRev() || !REV_COLS.has(c.key));
 const sum = (rows, key) => rows.reduce((s, r) => s + (Number(r[key]) || 0), 0);
 const groupRows = (obj) => Object.entries(obj || {}).map(([id, v]) => ({ id, clicks: v.clicks || 0, uniqueClicks: v.uniqueClicks || 0, conversions: v.conversions || 0, revenue: v.revenue || 0, cost: v.cost || 0, lpClicks: v.lpClicks || 0,
   leads: v.leads || 0, sales: v.sales || 0, rejected: v.rejected || 0, pendingRevenue: v.pendingRevenue || 0 }));
@@ -476,12 +491,13 @@ async function pageDashboard() {
   const campSel = h('select', { class: 'select', 'aria-label': 'Кампания', onchange: () => load() }, h('option', { value: '' }, 'Все кампании'),
     Object.entries(state.campaigns).map(([id, c]) => h('option', { value: id }, c.name || id)));
   put(view, h('div', { class: 'page-head' }, h('h1', {}, 'Дашборд'),
-    h('div', { class: 'toolbar', style: 'margin:0' }, campSel, periodControl(() => load()), currencyControl(() => load()), h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'))), body);
+    h('div', { class: 'toolbar', style: 'margin:0' }, campSel, periodControl(() => load()), currencyControl(() => load()), h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'),
+      (state.me?.user?.role === 'owner' || !state.me?.loginRequired) ? h('button', { class: 'btn', title: 'Дневной план команды', onclick: () => goalsModal(() => load()) }, 'Цели') : null)), body);
   async function load() {
     const { from, to } = periodRange();
     const campaign = campSel.value || null;
     try {
-      const [s, series, recent, team, botsData, statsBotsData] = await Promise.all([api('/stats' + qs({ from, to, campaign })), timeseries({ campaign, from, to }), api('/api/clicks' + qs({ from, to, campaign, limit: 10 })).catch(() => ({ clicks: [] })), api('/api/settings').catch(() => ({ buyerSharePct: 35 })), api('/api/bots' + qs({ from, to, campaign, limit: 1000 })).catch(() => ({ bots: [] })), api('/stats/bots' + qs({ from, to, campaign })).catch(() => ({ total: 0, byCampaign: {} }))]);
+      const [s, series, recent, team, botsData, statsBotsData, monitorData] = await Promise.all([api('/stats' + qs({ from, to, campaign })), timeseries({ campaign, from, to }), api('/api/clicks' + qs({ from, to, campaign, limit: 10 })).catch(() => ({ clicks: [] })), api('/api/settings').catch(() => ({ buyerSharePct: 35 })), api('/api/bots' + qs({ from, to, campaign, limit: 1000 })).catch(() => ({ bots: [] })), api('/stats/bots' + qs({ from, to, campaign })).catch(() => ({ total: 0, byCampaign: {} })), api('/api/monitor').catch(() => ({ targets: [] }))]);
       const sharePct = Number(team.buyerSharePct) || 0;
       const profit = (s.revenue || 0) - (s.cost || 0);
       // The buyer earns a share of positive net profit; a loss means 0, not a negative payout.
@@ -490,17 +506,35 @@ async function pageDashboard() {
       const earningsTile = h('div', { class: 'kpi' + (isOwner ? ' kpi-edit' : ''), style: 'background:var(--k6)', title: isOwner ? 'Нажмите, чтобы изменить процент' : null,
         onclick: isOwner ? () => shareModal(sharePct, () => load()) : null },
         h('div', { class: 'k' }, `Заработок баера · ${sharePct.toLocaleString('ru-RU')}%`), h('div', { class: 'v' }, money(buyerEarnings)));
-      const kpi = (label, value, color) => h('div', { class: 'kpi', style: `background:${color}` }, h('div', { class: 'k' }, label), h('div', { class: 'v' }, value));
+      const kpi = (label, value, color, extra) => h('div', { class: 'kpi', style: `background:${color}` }, h('div', { class: 'k' }, label), h('div', { class: 'v' }, value), extra || null);
+      // Daily goals are stored in the default currency; shown only for «Сегодня», converted like every other amount.
+      const goalBar = (value, goal) => {
+        if (hideRev() || period.key !== 'today' || goal == null || !(Number(goal) > 0)) return null;
+        const target = Number(goal) * currencyRate();
+        const share = Math.max(0, value) / target;
+        const done = share >= 1;
+        return h('div', { class: 'goal' + (done ? ' done' : ''), title: `План на сегодня: ${money(target)}` },
+          h('div', { class: 'goal-track', role: 'progressbar', 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': Math.min(100, Math.round(share * 100)) },
+            h('div', { class: 'goal-fill', style: `width:${Math.min(100, share * 100).toFixed(1)}%` })),
+          h('div', { class: 'goal-cap' }, done ? 'план выполнен' : `${Math.floor(share * 100 + 1e-9)}% плана`));
+      };
       const small = (title, id, rows, nameOf, link) => h('div', { class: 'card' }, h('h2', {}, title), dataTable({
         id: 'dash-' + id, pageSize: 10, compact: true, rows: rows.sort((a, b) => b.clicks - a.clicks),
         columns: [{ key: 'id', label: title, fixed: true, cls: 'name', render: (r) => (link ? h('a', { href: link(r) }, nameOf(r)) : nameOf(r)) },
           ...metricCols().filter((c) => ['clicks', 'conversions', 'cr', 'revenue'].includes(c.key))],
       }));
       const top5 = (id, title, rows, nameOf, link) => h('div', { class: 'card' }, h('h2', {}, title), dataTable({ id: 'dash-t5-' + id, pageSize: 5, compact: true, totals: false, rows: [...rows].sort((a, b) => b.revenue - a.revenue).slice(0, 5), columns: [{ key: 'id', label: 'Название', fixed: true, cls: 'name', render: (r) => h('a', { href: link(r) }, nameOf(r)) }, ...metricCols().filter((c) => ['clicks', 'conversions', 'revenue', 'roi'].includes(c.key))] }));
-      put(body, 
+      const down = (monitorData.targets || []).filter((x) => !x.ok);
+      // Offer monitor (src/monitor.js): shown only while something does not answer.
+      const downCard = down.length ? h('div', { class: 'card monitor-down', role: 'alert', style: 'margin-bottom:14px' }, h('h2', {}, `Не отвечают · ${down.length}`),
+        h('ul', {}, down.map((x) => h('li', {},
+          h('span', { class: 'mono' }, x.url || 'URL скрыт'), ' — ', h('span', { class: 'neg' }, x.status ? `HTTP ${x.status}` : (x.error || 'нет ответа')),
+          x.downSince ? h('span', { class: 'muted' }, ` с ${dt(x.downSince)}`) : null, ': ',
+          x.campaigns.map((c, i) => [i ? ', ' : '', h('a', { href: '#/campaigns/' + encodeURIComponent(c.campaign) }, c.name || c.campaign), h('span', { class: 'muted' }, ` (${c.stream}${c.mode === 'disable' ? ', поток выключается' : ''})`)]))))) : null;
+      put(body, downCard,
         h('div', { class: 'kpis' }, kpi('Клики', num(s.clicks), 'var(--k1)'), kpi('Уник. клики', num(s.uniqueClicks), 'var(--k2)'), kpi('Конверсии', num(s.conversions), 'var(--k3)'), kpi('CR', pct(ratio(s.conversions, s.clicks)), 'var(--k2)'),
-          kpi('Доход', money(s.revenue), 'var(--k5)'), kpi('Расход', money(s.cost || 0), 'var(--k4)'), kpi('Прибыль', h('span', { class: profit >= 0 ? '' : 'neg' }, money(profit)), 'var(--k8)'), kpi('ROI', pct(ratio(profit, s.cost || 0)), 'var(--k9)'), earningsTile,
-          kpi('EPC', money4(ratio(s.revenue, s.clicks)), 'var(--k6)'), kpi('RPM', money(ratio(s.revenue * 1000, s.clicks)), 'var(--k7)'),
+          hideRev() ? null : kpi('Доход', money(s.revenue), 'var(--k5)', goalBar(s.revenue || 0, team.dailyRevenueGoal)), kpi('Расход', money(s.cost || 0), 'var(--k4)'), ...(hideRev() ? [] : [kpi('Прибыль', h('span', { class: profit >= 0 ? '' : 'neg' }, money(profit)), 'var(--k8)', goalBar(profit, team.dailyProfitGoal)), kpi('ROI', pct(ratio(profit, s.cost || 0)), 'var(--k9)'), earningsTile,
+          kpi('EPC', money4(ratio(s.revenue, s.clicks)), 'var(--k6)'), kpi('RPM', money(ratio(s.revenue * 1000, s.clicks)), 'var(--k7)')]),
           botsData.bots?.length > 0 ? h('a', { href: '#/botlog' + (campaign ? qs({ campaign }) : ''), style: 'text-decoration:none' },
             h('div', { class: 'kpi', style: 'background:var(--bad)' }, h('div', { class: 'k' }, 'Боты'), h('div', { class: 'v' }, botsData.bots.length >= 1000 ? '1000+' : num(botsData.bots.length)))) : null),
         ratesNote(),
@@ -509,7 +543,7 @@ async function pageDashboard() {
           const campRows = groupRows(s.byCampaign);
           const botsByCamp = statsBotsData.byCampaign || {};
           const items = [
-            ...campRows.filter((r) => r.clicks >= MIN_CLICKS && ratio(r.revenue - r.cost, r.cost) <= ROI_ALERT)
+            ...campRows.filter((r) => !hideRev() && r.clicks >= MIN_CLICKS && ratio(r.revenue - r.cost, r.cost) <= ROI_ALERT)
               .map((r) => ({ text: `${state.campaigns[r.id]?.name || r.id}: ROI ${pct(ratio(r.revenue - r.cost, r.cost))}`, link: '#/reports' + qs({ group: 'stream', campaign: r.id }) })),
             ...groupRows(s.byOffer).filter((r) => r.clicks >= MIN_CLICKS && (r.conversions || 0) === 0)
               .map((r) => ({ text: `Оффер ${r.id}: ${num(r.clicks)} кл., 0 конв.`, link: '#/reports' + qs({ group: 'country', offer: r.id }) })),
@@ -528,7 +562,7 @@ async function pageDashboard() {
           { key: 'clicks', label: 'Клики', color: '#4d86f0', values: series.map((p) => p.clicks) },
           { key: 'conversions', label: 'Конв.', color: '#e0496a', values: series.map((p) => p.conversions) },
           { key: 'revenue', label: 'Доход', color: '#e8913f', right: true, values: series.map((p) => p.revenue) },
-        ], series)),
+        ].filter((l) => !hideRev() || l.key !== 'revenue'), series)),
         h('div', { class: 'grid-2', style: 'margin-bottom:14px' },
           top5('camp', 'Топ кампаний', groupRows(s.byCampaign), (r) => state.campaigns[r.id]?.name || r.id, (r) => '#/reports' + qs({ group: 'stream', campaign: r.id })),
           top5('offer', 'Топ офферов', groupRows(s.byOffer), (r) => r.id, (r) => '#/reports' + qs({ group: 'country', offer: r.id })),
@@ -570,6 +604,35 @@ async function pageDashboard() {
   load();
 }
 
+// Owner-only team plan: two daily goals in the default currency (empty field = no goal).
+async function goalsModal(onSaved) {
+  const team = await api('/api/settings').catch(() => ({}));
+  const base = currency.info?.defaultCurrency || 'EUR';
+  const values = { dailyRevenueGoal: team.dailyRevenueGoal ?? '', dailyProfitGoal: team.dailyProfitGoal ?? '' };
+  const input = (key, label) => h('input', { class: 'input', type: 'number', min: 0, step: '0.01', value: values[key], placeholder: 'нет', 'aria-label': label, oninput: (e) => { values[key] = e.target.value; } });
+  const err = h('p', { class: 'err' });
+  const close = openModal({
+    title: 'Цели',
+    body: h('div', {},
+      field(`Дневной план по доходу, ${base}`, input('dailyRevenueGoal', 'План по доходу')),
+      field(`Дневной план по прибыли, ${base}`, input('dailyProfitGoal', 'План по прибыли'),
+        'Цель команды на день. На дашборде за «Сегодня» плитки «Доход» и «Прибыль» показывают прогресс в выбранной валюте. Пустое поле — без цели.'),
+      err),
+    footer: [h('button', { class: 'btn', onclick: () => close() }, 'Отмена'), h('button', { class: 'btn primary', onclick: async () => {
+      const body = {};
+      for (const key of Object.keys(values)) {
+        const raw = String(values[key]).trim();
+        if (raw === '') { body[key] = null; continue; }
+        const n = Number(raw);
+        if (!Number.isFinite(n) || n < 0) { err.textContent = 'План — число от 0 или пустое поле.'; return; }
+        body[key] = n;
+      }
+      try { await api('/api/settings', { method: 'PATCH', body }); toast('Цели сохранены'); close(); onSaved(); }
+      catch (e) { err.textContent = e.message === 'owner_only' ? 'Менять цели может только владелец.' : 'Не сохранено: ' + e.message; }
+    } }, 'Сохранить')],
+  });
+}
+
 function shareModal(current, onSaved) {
   let value = String(current);
   const err = h('p', { class: 'err' });
@@ -604,7 +667,9 @@ async function pageCampaigns() {
         h('button', { title: 'Копировать ссылку', 'aria-label': 'Копировать ссылку', onclick: () => copyText(trackingUrl(r.id)) }, '🔗'),
         h('a', { href: '#/reports' + qs({ group: 'stream', campaign: r.id }), title: 'Отчёт', 'aria-label': 'Отчёт' }, '▥'),
         h('a', { href: '#/clicks' + qs({ campaign: r.id }), title: 'Лог кликов', 'aria-label': 'Лог кликов' }, '☰'),
-        h('button', { title: r.active ? 'Выключить' : 'Включить', 'aria-label': r.active ? 'Выключить' : 'Включить', onclick: () => setActive([r.id], !r.active) }, r.active ? '⏸' : '▶')) },
+        h('button', { title: r.active ? 'Выключить' : 'Включить', 'aria-label': r.active ? 'Выключить' : 'Включить', onclick: () => setActive([r.id], !r.active) }, r.active ? '⏸' : '▶'),
+        h('button', { title: 'Копировать', 'aria-label': 'Копировать', onclick: () => cloneEntity('campaigns', r.id, load) }, '⧉'),
+        archiveButton('campaigns', r, load)) },
       { key: 'group', label: 'Группа', value: (r) => r.group || '', render: (r) => r.group || '—' },
       { key: 'owner', label: 'Баер', hidden: !isOwnerView(), value: (r) => (r.ownerId ? userEmail(r.ownerId) : '—') },
       { key: 'streams', label: 'Потоки', num: true, render: (r) => h('a', { href: '#/campaigns/' + encodeURIComponent(r.id) }, r.streams), total: (rs) => num(sum(rs, 'streams')) },
@@ -624,7 +689,45 @@ async function pageCampaigns() {
     const n = table.selected().length;
     put(bulk, n ? [h('span', { class: 'muted' }, `Выбрано: ${n}`),
       h('button', { class: 'btn', onclick: () => setActive(table.selected(), true) }, 'Включить'),
-      h('button', { class: 'btn', onclick: () => setActive(table.selected(), false) }, 'Выключить')] : []);
+      h('button', { class: 'btn', onclick: () => setActive(table.selected(), false) }, 'Выключить'),
+      n === 2 ? h('button', { class: 'btn', onclick: () => compareModal(table.selected()) }, 'Сравнить') : null] : []);
+  }
+  async function compareModal(ids) {
+    const [id1, id2] = ids;
+    const { from, to } = periodRange();
+    try {
+      const [s1, s2] = await Promise.all([api('/stats' + qs({ campaign: id1, from, to })), api('/stats' + qs({ campaign: id2, from, to }))]);
+      const n1 = state.campaigns[id1]?.name || id1, n2 = state.campaigns[id2]?.name || id2;
+      const p1 = (s1.revenue || 0) - (s1.cost || 0), p2 = (s2.revenue || 0) - (s2.cost || 0);
+      const mrows = [
+        ['Клики', s1.clicks || 0, s2.clicks || 0, num, false],
+        ['Уник. клики', s1.uniqueClicks || 0, s2.uniqueClicks || 0, num, false],
+        ['Конверсии', s1.conversions || 0, s2.conversions || 0, num, false],
+        ['CR', ratio(s1.conversions, s1.clicks), ratio(s2.conversions, s2.clicks), pct, false],
+        ['Доход', s1.revenue || 0, s2.revenue || 0, money, false],
+        ['Расход', s1.cost || 0, s2.cost || 0, money, true],
+        ['Прибыль', p1, p2, money, false],
+        ['ROI', ratio(p1, s1.cost || 0), ratio(p2, s2.cost || 0), pct, false],
+        ['EPC', ratio(s1.revenue, s1.clicks), ratio(s2.revenue, s2.clicks), money4, false],
+      ];
+      const diffCell = (v1, v2, fmt, lb) => {
+        if (v1 == null || v2 == null) return h('td', {}, '—');
+        const abs = v2 - v1, sign = abs >= 0 ? '+' : '';
+        const rel = v1 !== 0 ? abs / Math.abs(v1) : null;
+        const cls = abs === 0 ? '' : ((abs > 0) !== lb ? 'pos' : 'neg');
+        return h('td', { class: cls }, `${sign}${fmt(abs)}${rel != null ? ` (${sign}${pct(rel)})` : ''}`);
+      };
+      let close;
+      close = openModal({
+        title: 'Сравнение кампаний',
+        body: h('div', { style: 'overflow-x:auto' },
+          h('table', { class: 'grid', style: 'width:100%' },
+            h('thead', {}, h('tr', {}, h('th', {}, 'Метрика'), h('th', {}, n1), h('th', {}, n2), h('th', {}, 'Разница'))),
+            h('tbody', {}, ...mrows.map(([label, v1, v2, fmt, lb]) =>
+              h('tr', {}, h('td', {}, label), h('td', {}, v1 != null ? fmt(v1) : '—'), h('td', {}, v2 != null ? fmt(v2) : '—'), diffCell(v1, v2, fmt, lb)))))),
+        footer: [h('button', { class: 'btn', onclick: () => close() }, 'Закрыть')],
+      });
+    } catch (e) { toast('Ошибка сравнения: ' + e.message, true); }
   }
   async function setActive(ids, active) {
     try {
@@ -912,9 +1015,16 @@ async function pageCampaignEditor(id) {
           h('label', {}, h('input', { type: 'radio', name: 'crot', checked: d.streamRotation !== 'position', onchange: () => { d.streamRotation = 'weight'; mark(); } }), 'По весу'),
           h('label', {}, h('input', { type: 'radio', name: 'crot', checked: d.streamRotation === 'position', onchange: () => { d.streamRotation = 'position'; mark(); } }), 'По позиции')),
           'По весу — обычные потоки делят трафик по весам. По позиции — клик забирает первый подходящий обычный поток сверху.'),
+        field('Привязка посетителя', h('select', { class: 'select', 'aria-label': 'Привязка посетителя', onchange: (e) => { d.bindVisitors = e.target.value; mark(); } },
+          [['off', 'Нет'], ['stream', 'К потоку'], ['stream_offer', 'К потоку и офферу']].map(([v, l]) => h('option', { value: v, selected: (d.bindVisitors || 'off') === v }, l))),
+          'Вернувшийся посетитель (те же IP и браузер) попадает в тот же поток, а при «К потоку и офферу» — и на тот же оффер и лендинг, пока поток включён и подходит, а оффер не в капе и не в архиве. Привязки хранятся в памяти и сбрасываются при перезапуске.'),
+        field('Срок привязки, часов', h('input', { class: 'input', type: 'number', min: 1, max: 720, 'aria-label': 'Срок привязки, часов', value: d.bindTtlHours ?? 24, oninput: bind('bindTtlHours', 'int') }), 'Считается от последнего визита.'),
         field('Способ редиректа', h('div', { class: 'radios' }, [['http', 'HTTP 302'], ['meta', 'Meta refresh'], ['js', 'JavaScript']].map(([v, l]) => h('label', {},
           h('input', { type: 'radio', name: 'credir', checked: (d.redirectMethod || 'http') === v, onchange: () => { d.redirectMethod = v; mark(); } }), l))),
           'Как посетитель уходит на оффер. HTTP 302 — быстрее всего; meta и JS отдают страницу, которая сама переходит дальше.'),
+        field('Мониторинг офферов', h('select', { class: 'select', 'aria-label': 'Мониторинг офферов', onchange: (e) => { d.monitoring = e.target.value; mark(); } },
+          [['off', 'Выключен'], ['notify', 'Уведомлять'], ['disable', 'Выключать поток']].map(([v, l]) => h('option', { value: v, selected: (d.monitoring || 'notify') === v }, l))),
+          'Каждые 10 минут проверяются офферы и лендинги потоков. Не ответил дважды подряд — событие в журнале и блок «Не отвечают» на дашборде; «Выключать поток» ещё и выключает поток, а когда оффер снова отвечает — включает обратно.'),
         field('Окно конверсии, дней', h('input', { class: 'input', type: 'number', min: 1, max: 365, value: d.conversionWindowDays ?? '', placeholder: 'без ограничения', oninput: bind('conversionWindowDays', 'int') }), 'Постбэк на клик старше окна отклоняется.'),
         field('Источник трафика', h('select', { class: 'select', 'aria-label': 'Источник трафика', onchange: (e) => {
           const sid = e.target.value; d.sourceId = sid || null;
@@ -922,6 +1032,10 @@ async function pageCampaignEditor(id) {
           mark();
         } }, h('option', { value: '' }, 'Без источника'), Object.entries(state.sources).map(([sid, s]) => h('option', { value: sid, selected: (d.sourceId || '') === sid }, s.name || sid))),
         'При выборе источника его параметры копируются в кампанию.'),
+        field('Постбэк в источник', h('input', { class: 'input', type: 'url', value: d.sourcePostbackUrl || '', placeholder: 'пусто — URL из источника', 'aria-label': 'Постбэк в источник', oninput: bind('sourcePostbackUrl', 'url') }),
+          'Свой URL постбэка для этой кампании. ' + SOURCE_PB_MACROS),
+        fieldGroup('Статусы постбэка в источник', checkGroup(SOURCE_PB_STATUSES, d.sourcePostbackStatuses, (v) => { d.sourcePostbackStatuses = v; mark(); }), 'Ничего не отмечено — как в источнике.'),
+        canSourcePostback() ? postbackTestButton(() => d.sourcePostbackUrl || (d.sourceId && !state.sources[d.sourceId]?.postbackUrlMasked ? state.sources[d.sourceId]?.postbackUrl : '')) : null,
         field('Модель затрат', h('div', { class: 'radios' },
           h('label', {}, h('input', { type: 'radio', name: 'costModel', checked: d.costModel !== 'cpc', onchange: () => { d.costModel = 'none'; d.cpc = null; cpcField.hidden = true; costFromParamField.hidden = true; mark(); } }), 'Нет'),
           h('label', {}, h('input', { type: 'radio', name: 'costModel', checked: d.costModel === 'cpc', onchange: () => { d.costModel = 'cpc'; cpcField.hidden = false; costFromParamField.hidden = false; mark(); } }), 'CPC')), 'При CPC расход за клик записывается в статистику.'),
@@ -979,7 +1093,7 @@ async function pageCampaignEditor(id) {
         h('div', { style: 'min-width:0' },
           h('div', { class: 'title', onclick: () => streamModal(s, (next) => { d.streams[i] = next; mark(); drawStreams(); }, false, d.id) },
             `${i + 1}. ${s.name} `, h('span', { class: 'badge ' + (s.type || 'regular') }, typeLabel[s.type || 'regular']),
-            s.enabled === false ? [' ', h('span', { class: 'badge' }, 'Выключен')] : null,
+            s.enabled === false ? [' ', h('span', { class: 'badge', title: s.disabledBy === 'monitor' ? 'Оффер или лендинг не отвечает; поток включится сам, когда они снова ответят' : null }, s.disabledBy === 'monitor' ? 'Выключен монитором' : 'Выключен')] : null,
             s.countClicks === false ? [' ', h('span', { class: 'badge' }, 'Клики не считаются')] : null),
           h('div', { class: 'meta' }, summarizeConditions(s.conditions)),
           h('div', { class: 'meta' }, (s.action === 'url' ? 'Прямой URL: ' + s.url : s.action === 'campaign' ? '→ кампания ' + (state.campaigns[s.campaignId]?.name || s.campaignId) : s.action === 'not_found' ? 'Действие: ошибка 404' : (s.landings?.length ? 'Лендинги: ' + s.landings.map((l) => `${state.landings[l.landingId]?.name || l.landingId} (${l.weight ?? 1})`).join(', ') + ' → ' : '') + 'Офферы: ' + (s.offers || []).map((o) => `${o.offerId} (${o.weight ?? 1})`).join(', ')) + ((s.type || 'regular') === 'regular' ? ` · вес потока ${s.weight ?? 1}` : ''))),
@@ -1009,7 +1123,8 @@ async function pageCampaignEditor(id) {
     if (new Set(names).size !== names.length) { err.textContent = 'Названия потоков должны различаться — по ним строится статистика.'; return; }
     const body = { name: d.name.trim(), group: (d.group || '').trim(), active: d.active, streams: d.streams, dailyCap: d.dailyCap, totalCap: d.totalCap, revenueCap: d.revenueCap, capUrl: d.capUrl, geoCapUrl: d.geoCapUrl,
       allowGeos: d.allowGeos, allowDevices: d.allowDevices, allowOS: d.allowOS, allowBrowsers: d.allowBrowsers, blockedIps: d.blockedIps, allowedIps: d.allowedIps,
-      dedupeWindow: d.dedupeWindow || 0, botFilter: d.botFilter, datacenterAsBot: Boolean(d.datacenterAsBot), conversionWindowDays: d.conversionWindowDays, redirectMethod: d.redirectMethod || 'http', domain: d.domain || null, uniquenessHours: d.uniquenessHours ?? 24, streamRotation: d.streamRotation || 'weight', ...(isOwnerView() ? { ownerId: d.ownerId || null } : {}), paramMap: d.paramMap || {}, costModel: d.costModel || 'none', cpc: d.cpc, costFromParam: d.costFromParam || false, sourceId: d.sourceId || null };
+      dedupeWindow: d.dedupeWindow || 0, botFilter: d.botFilter, datacenterAsBot: Boolean(d.datacenterAsBot), conversionWindowDays: d.conversionWindowDays, redirectMethod: d.redirectMethod || 'http', domain: d.domain || null, uniquenessHours: d.uniquenessHours ?? 24, streamRotation: d.streamRotation || 'weight', bindVisitors: d.bindVisitors || 'off', bindTtlHours: d.bindTtlHours ?? 24, ...(isOwnerView() ? { ownerId: d.ownerId || null } : {}), paramMap: d.paramMap || {}, costModel: d.costModel || 'none', cpc: d.cpc, costFromParam: d.costFromParam || false, sourceId: d.sourceId || null,
+      sourcePostbackUrl: d.sourcePostbackUrl || null, sourcePostbackStatuses: d.sourcePostbackStatuses || [], monitoring: d.monitoring || 'notify' };
     saveBtn.disabled = true;
     try {
       const saved = isNew ? await api('/api/campaigns', { method: 'POST', body: { id: d.id, ...body } })
@@ -1034,6 +1149,37 @@ async function pageCampaignEditor(id) {
     finally { saveBtn.disabled = false; }
   }
 
+  // Keitaro «Очистка статистики»: owners (or the admin key) only; the campaign id typed by hand confirms it.
+  function dangerZone() {
+    const c = { mode: 'all', before: '', typed: '' };
+    const msg = h('p', { class: 'err', role: 'status' });
+    const dateInput = h('input', { class: 'input', type: 'date', 'aria-label': 'Удалить данные до даты', disabled: true, oninput: (e) => { c.before = e.target.value; } });
+    const btn = h('button', { class: 'btn danger', disabled: true, onclick: async () => {
+      msg.textContent = '';
+      if (c.mode === 'before' && !c.before) { msg.textContent = 'Укажите дату.'; return; }
+      btn.disabled = true;
+      try {
+        const r = await api('/api/campaigns/' + encodeURIComponent(d.id) + '/clear-stats', { method: 'POST', body: { confirm: c.typed, ...(c.mode === 'before' ? { before: c.before } : {}) } });
+        const x = r.removed || {};
+        toast(`Удалено: ${num(x.clicks)} кликов, ${num(x.conversions)} конверсий, ${num(x.bots)} ботов`);
+        confirmInput.value = ''; c.typed = '';
+        loadStreamStats();
+      } catch (e) { msg.textContent = ({ owner_only: 'Очищать статистику может только владелец.', confirm_mismatch: 'Идентификатор введён неверно.', invalid_before_date: 'Неверная дата.' })[e.message] || 'Не удалось: ' + e.message; }
+      finally { btn.disabled = c.typed !== d.id; }
+    } }, 'Очистить статистику');
+    const confirmInput = h('input', { class: 'input', 'aria-label': 'Идентификатор кампании для подтверждения', placeholder: d.id, autocomplete: 'off',
+      oninput: (e) => { c.typed = e.target.value.trim(); btn.disabled = c.typed !== d.id; } });
+    return h('section', { class: 'danger-zone', 'aria-label': 'Очистить статистику' },
+      h('h3', {}, 'Очистить статистику'),
+      h('p', { class: 'muted' }, 'Удаляет клики, конверсии, клики по лендингам и ботов этой кампании из журнала и PostgreSQL. Отменить нельзя — вернуть можно только из ночного бэкапа.'),
+      field('Что удалить', h('div', { class: 'radios' },
+        h('label', {}, h('input', { type: 'radio', name: 'cclear', checked: true, onchange: () => { c.mode = 'all'; dateInput.disabled = true; } }), 'Всё'),
+        h('label', {}, h('input', { type: 'radio', name: 'cclear', onchange: () => { c.mode = 'before'; dateInput.disabled = false; } }), 'Старше даты')), null),
+      field('Клики до даты (UTC)', dateInput, 'Удаляются клики раньше этой даты вместе с их конверсиями.'),
+      field(`Введите «${d.id}» для подтверждения`, confirmInput),
+      btn, msg);
+  }
+
   put(view, 
     h('div', { class: 'editor-head' }, nameInput,
       h('div', { class: 'toolbar', style: 'margin:0' }, saveBtn,
@@ -1045,7 +1191,7 @@ async function pageCampaignEditor(id) {
         h('a', { class: 'btn', href: '#/campaigns' }, 'К списку'))),
     err,
     h('div', { class: 'editor' },
-      h('div', { class: 'left' }, left),
+      h('div', { class: 'left' }, left, !isNew && (isOwnerView() || !state.me?.user) ? dangerZone() : null),
       h('div', { class: 'right' },
         h('div', { class: 'toolbar' },
           h('button', { class: 'btn primary', onclick: () => streamModal({ name: `Flow ${d.streams.length + 1}`, type: 'regular', weight: 1, conditions: {}, offers: [] }, (s) => { d.streams.push(s); mark(); drawStreams(); }, true, d.id) }, 'Создать поток'),
@@ -1059,13 +1205,37 @@ async function pageCampaignEditor(id) {
   return () => window.removeEventListener('beforeunload', guard);
 }
 
+// Postback to the traffic source: statuses, owner check and the «Тестовый постбэк» button.
+const SOURCE_PB_STATUSES = [['lead', 'Лид (lead)'], ['sale', 'Продажа (sale)'], ['rejected', 'Отклонён (rejected)'], ['trash', 'Треш (trash)']];
+const SOURCE_PB_MACROS = 'Макросы: {click_id}, {external_id}, {sub_id_1}…{sub_id_30}, {status}, {revenue}, {payout}, {currency}, {campaign}, {offer_id}, {country}, {keyword}, {source}, {creative_id}, {ad_campaign_id}.';
+// Without a logged-in user (admin key / local mode) the server treats requests as the owner's.
+const canSourcePostback = () => isOwnerView() || !state.me?.user;
+// Like field(), but a div with role=group: checkboxes inside keep their own labels (no nested <label>).
+const fieldGroup = (label, control, hint) => h('div', { class: 'field', role: 'group', 'aria-label': label }, h('span', {}, label), control, hint ? h('span', { class: 'hint' }, hint) : null);
+function postbackTestButton(getUrl) {
+  const out = h('span', { class: 'muted', role: 'status', 'aria-label': 'Результат тестового постбэка' });
+  const btn = h('button', { type: 'button', class: 'btn', onclick: async () => {
+    const url = (getUrl() || '').trim();
+    if (!url) { out.textContent = 'Сначала укажите URL.'; return; }
+    btn.disabled = true; out.textContent = 'Отправка…';
+    try {
+      const r = await api('/api/sources/postback-test', { method: 'POST', body: { url } });
+      out.textContent = r.httpStatus ? `HTTP ${r.httpStatus}${r.ok ? ' — доставлено' : ''}` : `Не отправлено: ${r.error}`;
+    } catch (e) { out.textContent = 'Ошибка: ' + e.message; }
+    finally { btn.disabled = false; }
+  } }, 'Тестовый постбэк');
+  return h('div', { class: 'toolbar', style: 'align-items:center;gap:10px' }, btn, out);
+}
+
 function sourceModal(id, onSaved) {
   const isNew = !id;
   const SOURCE_PARAM_FIELDS = ['keyword', 'source', 'external_id', 'creative_id', 'ad_campaign_id', ...Array.from({ length: 30 }, (_, i) => `sub_id_${i + 1}`), 'cost'];
   const cur = isNew ? null : state.sources[id];
   const d = isNew
-    ? { id: '', name: '', paramMap: {}, costModel: 'none', cpc: '', costFromParam: false }
-    : { id, name: cur.name || '', paramMap: { ...(cur.paramMap || {}) }, costModel: cur.costModel || 'none', cpc: cur.cpc ?? '', costFromParam: !!cur.costFromParam };
+    ? { id: '', name: '', paramMap: {}, costModel: 'none', cpc: '', costFromParam: false, postbackUrl: '', postbackStatuses: ['sale'] }
+    : { id, name: cur.name || '', paramMap: { ...(cur.paramMap || {}) }, costModel: cur.costModel || 'none', cpc: cur.cpc ?? '', costFromParam: !!cur.costFromParam,
+      postbackUrl: cur.postbackUrl || '', postbackStatuses: cur.postbackStatuses || ['sale'] };
+  const pbEditable = canSourcePostback() && !cur?.postbackUrlMasked;
   const err = h('p', { class: 'err' });
   const cpcField = field('Стоимость клика', h('input', { class: 'input', type: 'number', min: 0, step: '0.0001', value: d.cpc, placeholder: '0.0000', oninput: (e) => { d.cpc = e.target.value; } }));
   cpcField.hidden = d.costModel !== 'cpc';
@@ -1091,6 +1261,13 @@ function sourceModal(id, onSaved) {
             h('thead', {}, h('tr', {}, h('th', {}, 'Поле'), h('th', {}, 'Параметр в ссылке'))),
             h('tbody', {}, ...rows))));
     }],
+    ['Постбэк', () => h('div', {},
+      h('p', { class: 'muted' }, 'Трекер сам отправит GET на этот URL, когда конверсия получит отмеченный статус (один раз на клик и статус). Кампания может задать свой URL.'),
+      field('URL постбэка в источник', h('input', { class: 'input', type: 'url', value: d.postbackUrl, placeholder: 'https://…?click_id={external_id}&status={status}&payout={payout}', readonly: !pbEditable,
+        'aria-label': 'URL постбэка в источник', oninput: (e) => { d.postbackUrl = e.target.value.trim(); } }), pbEditable ? SOURCE_PB_MACROS : 'Меняет только владелец; параметры URL скрыты.'),
+      fieldGroup('Отправлять при статусах', pbEditable ? checkGroup(SOURCE_PB_STATUSES, d.postbackStatuses, (v) => { d.postbackStatuses = v; })
+        : h('span', {}, d.postbackStatuses.join(', ')), 'По умолчанию — только продажа (sale).'),
+      pbEditable ? postbackTestButton(() => d.postbackUrl) : null)],
   ]);
   const close = openModal({
     title: isNew ? 'Создание источника' : 'Редактирование источника', body: h('div', {}, body, err),
@@ -1099,7 +1276,8 @@ function sourceModal(id, onSaved) {
       if (!ID_RE.test(d.id)) { err.textContent = 'ID: 2–80 символов, латиница, цифры, - и _.'; return; }
       if (isNew && state.sources[d.id]) { err.textContent = 'Источник с таким ID уже есть.'; return; }
       try {
-        const body2 = { name: d.name.trim() || null, paramMap: d.paramMap, costModel: d.costModel, cpc: d.cpc !== '' ? Number(d.cpc) : 0, costFromParam: d.costFromParam };
+        const body2 = { name: d.name.trim() || null, paramMap: d.paramMap, costModel: d.costModel, cpc: d.cpc !== '' ? Number(d.cpc) : 0, costFromParam: d.costFromParam,
+          ...(pbEditable ? { postbackUrl: d.postbackUrl || null, postbackStatuses: d.postbackStatuses.length ? d.postbackStatuses : ['sale'] } : {}) };
         await (isNew ? api('/api/sources', { method: 'POST', body: { id: d.id, ...body2 } }) : api('/api/sources/' + encodeURIComponent(d.id), { method: 'PATCH', body: body2 }));
         toast(isNew ? 'Источник создан' : 'Сохранено'); close(); onSaved();
       } catch (e) { err.textContent = 'Не сохранено: ' + e.message; }
@@ -1117,6 +1295,7 @@ async function pageSources() {
       { key: 'name', label: 'Название', cls: 'name', value: (r) => r.name || '', render: (r) => h('span', { title: r.name || '' }, r.name || '—') },
       { key: 'costModel', label: 'Модель', value: (r) => r.costModel === 'cpc' ? 'CPC' : 'Нет' },
       { key: 'cpc', label: 'CPC', num: true, render: (r) => (r.cpc ? money4(r.cpc) : '—') },
+      { key: 'postback', label: 'Постбэк', value: (r) => (r.postbackUrl ? (r.postbackStatuses || []).join(', ') : '—') },
     ],
   });
   put(view,
@@ -1132,20 +1311,69 @@ async function pageSources() {
   return () => table.detach();
 }
 
+// Partner-network macros are stored with or without braces (`sub1` / `{sub1}`); the postback needs exactly one pair.
+const networkMacro = (param, fallback) => `{${(String(param || '').trim() || fallback).replace(/^\{+|\}+$/g, '')}}`;
+// The secret stays a placeholder: the real POSTBACK_SECRET never reaches the browser.
+const networkPostbackUrl = (n) => `${location.origin}${BASE}/postback?click_id=${networkMacro(n.clickIdParam, 'sub1')}&secret=POSTBACK_SECRET&revenue=${networkMacro(n.payoutParam, 'payout')}&currency=EUR`;
+// Appends the network's offerParams (e.g. `sub1={click_id}&sub2={campaign}`) to an offer URL, skipping keys the URL already has.
+function withNetworkParams(url, offerParams) {
+  const [base, ...hash] = String(url || '').split('#');
+  let out = base;
+  const has = (key) => (out.split('?')[1] || '').split('&').some((kv) => kv.split('=')[0] === key);
+  for (const pair of String(offerParams || '').replace(/^[?&\s]+/, '').split('&').map((x) => x.trim()).filter(Boolean)) {
+    if (has(pair.split('=')[0])) continue;
+    out += (out.includes('?') ? (/[?&]$/.test(out) ? '' : '&') : '?') + pair;
+  }
+  return out + (hash.length ? '#' + hash.join('#') : '');
+}
+
+// Row-menu actions shared by campaigns and offers (task 6): copy, and archive with an in-row confirmation instead of confirm().
+async function cloneEntity(kind, id, onDone) {
+  try {
+    const r = await api(`/api/${kind}/${encodeURIComponent(id)}/clone`, { method: 'POST' });
+    toast(kind === 'campaigns' ? `Копия создана (выключена): ${r.id}` : `Копия создана: ${r.id}`); onDone();
+  } catch (e) { toast('Не удалось скопировать: ' + e.message, true); }
+}
+function archiveButton(kind, r, onDone) {
+  const label = r.archived ? 'Из архива' : 'В архив';
+  const icon = r.archived ? '↩' : '🗄';
+  return h('button', { title: label, 'aria-label': r.archived ? 'Вернуть из архива' : 'Архивировать', onclick: async (e) => {
+    const b = e.currentTarget;
+    if (!b.dataset.armed) { b.dataset.armed = '1'; b.textContent = label + '?'; setTimeout(() => { if (b.isConnected) { delete b.dataset.armed; b.textContent = icon; } }, 3000); return; }
+    try {
+      await api(`/api/${kind}/${encodeURIComponent(r.id)}`, { method: 'PATCH', body: { archived: !r.archived } });
+      toast(r.archived ? 'Восстановлено из архива' : 'Отправлено в архив'); onDone();
+    } catch (err) { toast('Не удалось изменить архив: ' + err.message, true); }
+  } }, icon);
+}
+
 function offerModal(id, onSaved) {
   const isNew = !id;
-  const o = isNew ? { id: '', name: '', url: '', postbackUrl: '', dailyCap: '', conversionCap: '', capTz: 'UTC', altOfferId: '', group: '' }
+  const o = isNew ? { id: '', name: '', url: '', postbackUrl: '', dailyCap: '', conversionCap: '', capTz: 'UTC', altOfferId: '', group: '', networkId: '' }
     : { id, ...state.offers[id], name: state.offers[id].name || '', postbackUrl: state.offers[id].postbackUrl || '', dailyCap: state.offers[id].dailyCap ?? '',
-      conversionCap: state.offers[id].conversionCap ?? '', capTz: state.offers[id].capTz || 'UTC', altOfferId: state.offers[id].altOfferId || '', group: state.offers[id].group || '' };
+      conversionCap: state.offers[id].conversionCap ?? '', capTz: state.offers[id].capTz || 'UTC', altOfferId: state.offers[id].altOfferId || '', group: state.offers[id].group || '',
+      networkId: state.offers[id].networkId || '' };
   const zones = TIME_ZONES.includes(o.capTz) ? ['UTC', ...TIME_ZONES.filter((z) => z !== 'UTC')] : [o.capTz, 'UTC', ...TIME_ZONES.filter((z) => z !== 'UTC')];
   const others = Object.keys(state.offers || {}).filter((k) => k !== id && (!state.offers[k].archived || k === o.altOfferId)).sort();
   const err = h('p', { class: 'err' });
+  let urlInput;
   const body = tabs([
     ['Основные', () => h('div', {},
       field('ID оффера', h('input', { class: 'input', value: o.id, readonly: !isNew, oninput: (e) => { o.id = e.target.value.trim(); } }), isNew ? 'Латиница, цифры, - и _.' : null),
       field('Название', h('input', { class: 'input', value: o.name, maxlength: 200, oninput: (e) => { o.name = e.target.value; } })),
       field('Группа', groupInput(state.offers, o.group, (v) => { o.group = v; }), 'Можно выбрать существующую или ввести новую.'),
-      field('URL', h('input', { class: 'input', type: 'url', value: o.url, placeholder: 'https://…', oninput: (e) => { o.url = e.target.value.trim(); } }), 'Макросы: {click_id} {subid} {campaign} {offer_id} {device} {country}. Если {click_id} нет — click_id добавится параметром.'))],
+      field('URL', urlInput = h('input', { class: 'input', type: 'url', value: o.url, placeholder: 'https://…', oninput: (e) => { o.url = e.target.value.trim(); } }), 'Макросы: {click_id} {subid} {campaign} {offer_id} {device} {country}. Если {click_id} нет — click_id добавится параметром.'),
+      field('Партнёрская сеть', h('select', { class: 'select', value: o.networkId, onchange: (e) => { o.networkId = e.target.value; } },
+        h('option', { value: '' }, 'Без сети'), Object.entries(state.networks || {}).map(([nid, network]) => h('option', { value: nid, selected: o.networkId === nid }, network.name ? `${network.name} (${nid})` : nid))),
+        'Постбэк сети приходит с её макросами click ID и выплаты.'),
+      h('button', { class: 'btn', type: 'button', onclick: () => {
+        const network = state.networks?.[o.networkId];
+        if (!network) { toast('Сначала выберите партнёрскую сеть', true); return; }
+        if (!network.offerParams) { toast('У сети не заданы параметры оффера', true); return; }
+        const next = withNetworkParams(o.url, network.offerParams);
+        if (next === o.url) { toast('Параметры сети уже есть в URL'); return; }
+        o.url = next; urlInput.value = next; toast('Параметры сети добавлены в URL');
+      } }, 'Добавить параметры сети в URL'))],
     ['Настройки', () => h('div', {},
       field('Дневной кап кликов', h('input', { class: 'input', type: 'number', min: 1, value: o.dailyCap, placeholder: 'нет', oninput: (e) => { o.dailyCap = e.target.value; } }), 'Считается по всем кампаниям; в потоках капнутый оффер пропускается.'),
       field('Кап конверсий в день', h('input', { class: 'input', type: 'number', min: 1, value: o.conversionCap, placeholder: 'нет', 'aria-label': 'Кап конверсий в день', oninput: (e) => { o.conversionCap = e.target.value; } }), 'Лиды + продажи за сутки по всем кампаниям (отклонённые не считаются). Пересчёт — до 30 секунд.'),
@@ -1169,7 +1397,7 @@ function offerModal(id, onSaved) {
       if (Number.isNaN(convCap) || (convCap !== null && convCap < 1)) { err.textContent = 'Кап конверсий — целое число больше нуля.'; return; }
       if (isNew && state.offers[o.id]) { err.textContent = 'Оффер с таким ID уже есть.'; return; }
       try {
-        const body2 = { name: o.name.trim() || null, group: o.group.trim(), url: o.url, postbackUrl: o.postbackUrl || null, dailyCap: cap, conversionCap: convCap, capTz: o.capTz, altOfferId: o.altOfferId || null };
+        const body2 = { name: o.name.trim() || null, group: o.group.trim(), url: o.url, postbackUrl: o.postbackUrl || null, dailyCap: cap, conversionCap: convCap, capTz: o.capTz, altOfferId: o.altOfferId || null, networkId: o.networkId || null };
         await (isNew ? api('/api/offers', { method: 'POST', body: { id: o.id, ...body2 } }) : api('/api/offers/' + encodeURIComponent(o.id), { method: 'PATCH', body: body2 }));
         toast(isNew ? 'Оффер создан' : 'Сохранено'); close(); onSaved();
       } catch (e) { err.textContent = 'Не сохранено: ' + e.message; }
@@ -1245,14 +1473,17 @@ async function pageNetworks() {
   function networkModal(current, onSaved) {
     const n = { id: current?.id || '', name: current?.name || '', offerParams: current?.offerParams || '', clickIdParam: current?.clickIdParam || 'sub1', payoutParam: current?.payoutParam || 'payout', notes: current?.notes || '' };
     const err = h('p', { class: 'err' });
+    const postback = h('input', { class: 'input', readonly: true, 'aria-label': 'URL постбэка', value: networkPostbackUrl(n) });
     const close = openModal({ title: current ? 'Редактирование сети' : 'Новая сеть', body: h('div', {},
       field('ID', h('input', { class: 'input', value: n.id, readonly: Boolean(current), oninput: (e) => { n.id = e.target.value.trim(); } })),
       field('Название', h('input', { class: 'input', value: n.name, oninput: (e) => { n.name = e.target.value; } })),
       field('Параметры оффера', h('input', { class: 'input', value: n.offerParams, oninput: (e) => { n.offerParams = e.target.value; } })),
-      field('Параметр click ID', h('input', { class: 'input', value: n.clickIdParam, oninput: (e) => { n.clickIdParam = e.target.value; } })),
-      field('Параметр выплаты', h('input', { class: 'input', value: n.payoutParam, oninput: (e) => { n.payoutParam = e.target.value; } })),
+      field('Параметр click ID', h('input', { class: 'input', value: n.clickIdParam, oninput: (e) => { n.clickIdParam = e.target.value; postback.value = networkPostbackUrl(n); } }), 'Макрос сети, например {sub1}; скобки можно не писать.'),
+      field('Параметр выплаты', h('input', { class: 'input', value: n.payoutParam, oninput: (e) => { n.payoutParam = e.target.value; postback.value = networkPostbackUrl(n); } })),
+      field('Готовый URL постбэка', h('div', { class: 'toolbar' }, postback,
+        h('button', { class: 'btn', type: 'button', onclick: async () => { try { await navigator.clipboard.writeText(postback.value); toast('URL скопирован'); } catch { toast('Не удалось скопировать URL', true); } } }, 'Копировать')), 'Скопируйте URL в настройках партнёрской сети и замените POSTBACK_SECRET на секрет сети.'),
       field('Заметки', h('textarea', { class: 'input', rows: 4, oninput: (e) => { n.notes = e.target.value; } }, n.notes)), err),
-      footer: [h('button', { class: 'btn', onclick: close }, 'Отмена'), h('button', { class: 'btn primary', onclick: async () => { try { await api(current ? '/api/networks/' + encodeURIComponent(n.id) : '/api/networks', { method: current ? 'PATCH' : 'POST', body: n }); toast('Сеть сохранена'); close(); onSaved(); } catch (e) { err.textContent = e.message; } } }, 'Сохранить')],
+      footer: [h('button', { class: 'btn', onclick: () => close() }, 'Отмена'), h('button', { class: 'btn primary', onclick: async () => { try { await api(current ? '/api/networks/' + encodeURIComponent(n.id) : '/api/networks', { method: current ? 'PATCH' : 'POST', body: n }); toast('Сеть сохранена'); close(); onSaved(); } catch (e) { err.textContent = e.message; } } }, 'Сохранить')],
     });
   }
   function load() { api('/api/networks').then((r) => table.setRows(Object.entries(r.networks || {}).map(([id, v]) => ({ id, ...v })))).catch((e) => toast('Ошибка сетей: ' + e.message, true)); }
@@ -1272,7 +1503,9 @@ async function pageOffers() {
       { key: 'menu', label: '', title: 'Меню', sortable: false, value: () => '', render: (r) => h('span', { class: 'row-actions' },
         h('button', { title: 'Изменить', 'aria-label': 'Изменить', onclick: () => offerModal(r.id, load) }, '✎'),
         h('a', { href: '#/reports' + qs({ group: 'country', offer: r.id }), title: 'Отчёт', 'aria-label': 'Отчёт' }, '▥'),
-        h('a', { href: '#/clicks' + qs({ offer: r.id }), title: 'Лог кликов', 'aria-label': 'Лог кликов' }, '☰')) },
+        h('a', { href: '#/clicks' + qs({ offer: r.id }), title: 'Лог кликов', 'aria-label': 'Лог кликов' }, '☰'),
+        h('button', { title: 'Копировать', 'aria-label': 'Копировать', onclick: () => cloneEntity('offers', r.id, load) }, '⧉'),
+        archiveButton('offers', r, load)) },
       { key: 'name', label: 'Название', cls: 'name', value: (r) => r.name || '', render: (r) => h('span', { title: r.name || '' }, r.name || '—') },
       { key: 'group', label: 'Группа', value: (r) => r.group || '', render: (r) => r.group || '—' },
       { key: 'url', label: 'URL', cls: 'name', hidden: true, render: (r) => h('span', { title: r.url }, r.url) },
@@ -1464,6 +1697,18 @@ async function pageReports(params) {
       txt('country', 'Страна'), txt('stream', 'Поток'), txt('subid', 'Sub ID'),
       periodControl(() => load()), currencyControl(() => load()), compareLabel,
       listsBtn,
+      h('button', { class: 'btn', title: 'Скачать CSV', 'aria-label': 'CSV', onclick: () => {
+        const tbl = holder.querySelector('table.grid');
+        if (!tbl) { toast('Нет данных для экспорта', true); return; }
+        const esc = (v) => { const s = String(v ?? '').trim().replace(/\r/g, ''); const fc = s[0]; if (fc === '=' || fc === '+' || fc === '-' || fc === '@') return `"'${s.replace(/"/g, '""')}"`;  if (s.includes(',') || s.includes('"') || s.includes('\n')) return `"${s.replace(/"/g, '""')}"`;  return s; };
+        const hdr = [...tbl.querySelectorAll('thead tr:first-child th')].map((th) => esc(th.textContent.trim()));
+        const dataRows = [...tbl.querySelectorAll('tbody tr, tfoot tr')].filter((tr) => !tr.classList.contains('sub-row')).map((tr) => [...tr.querySelectorAll('td')].map((td) => esc(td.textContent.trim())).join(','));
+        const csv = '﻿' + [hdr.join(','), ...dataRows].join('\r\n');
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = Object.assign(document.createElement('a'), { href: url, download: 'report.csv' });
+        document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+      } }, 'CSV'),
       h('button', { class: 'btn', onclick: saveReport }, '💾 Сохранить'),
       h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'),
       h('button', { class: 'btn square', title: 'Колонки', 'aria-label': 'Колонки', onclick: () => table?.chooser() }, '⚙')),
@@ -1614,17 +1859,25 @@ async function pageReports(params) {
           put(subTd, h('p', { class: 'err' }, e.message));
         }
       };
+      const LP_CTR_WARN = 0.1; const LP_MIN_CLICKS = 100;
+      if (key === 'landing') rows.sort((a, b) => ratio(b.lpClicks, b.clicks) - ratio(a.lpClicks, a.clicks));
+      const lpCols = key === 'landing' ? [
+        { key: 'lpClicks', label: 'Клики LP', title: 'Переходы с лендинга на оффер', num: true, render: (r) => num(r.lpClicks), total: (rs) => num(sum(rs, 'lpClicks')) },
+        { key: 'lpCtr', label: 'LP CTR', num: true, value: (r) => ratio(r.lpClicks, r.clicks), render: (r) => pct(ratio(r.lpClicks, r.clicks)), total: (rs) => pct(ratio(sum(rs, 'lpClicks'), sum(rs, 'clicks'))) },
+        { key: 'crLp', label: 'CR (LP)', title: 'CR от лендинга = конверсии / клики LP', num: true, value: (r) => ratio(r.conversions, r.lpClicks), render: (r) => pct(ratio(r.conversions, r.lpClicks)), total: (rs) => pct(ratio(sum(rs, 'conversions'), sum(rs, 'lpClicks'))) },
+      ] : [];
       table?.detach();
       table = dataTable({
         id: 'report-' + key, pageSize: 100,
         rows,
+        rowClass: key === 'landing' ? (r) => (r.clicks >= LP_MIN_CLICKS && ratio(r.lpClicks, r.clicks) < LP_CTR_WARN ? 'row-warn' : '') : undefined,
         columns: [{ key: 'id', label: f.field ? 'Значение' : label, fixed: true, cls: 'name', value: nameOf,
           render: (r) => drill
             ? h('span', { style: 'display:inline-flex;align-items:center;gap:4px' },
                 h('button', { style: 'all:unset;cursor:pointer;font-size:10px;color:var(--fg-2,#999);user-select:none', 'aria-label': 'Развернуть', onclick: (e) => { e.stopPropagation(); expandRow(r, e.currentTarget); } }, '▸'),
                 nameOf(r))
             : nameOf(r) },
-          ...(prev ? withDeltas(metricCols({ rpm: true })) : metricCols({ rpm: true }))],
+          ...(prev ? withDeltas(metricCols({ rpm: true })) : metricCols({ rpm: true })), ...lpCols],
       });
       put(holder, table);
     } catch (e) { put(holder, h('p', { class: 'err' }, 'Ошибка отчёта: ' + e.message)); }
@@ -1693,11 +1946,54 @@ function pageLog(kind, params) {
       const rows = (r[kind] || []).map((x) => ({ ...x, id: x.clickId }));
       last = { hasMore: Boolean(r.hasMore), rows: rows.length };
       table?.detach();
-      table = dataTable({ id: 'log-' + kind, columns, rows, serverPaging: paging, pageSize: limit, totals: !isClicks, empty: isClicks ? 'Кликов за период нет' : 'Конверсий за период нет' });
+      table = dataTable({ id: 'log-' + kind, columns, rows, serverPaging: paging, pageSize: limit, totals: !isClicks, empty: isClicks ? 'Кликов за период нет' : 'Конверсий за период нет', onRowClick: isClicks ? clickCard : null });
       put(holder, table);
     } catch (e) { put(holder, h('p', { class: 'err' }, 'Ошибка загрузки: ' + e.message)); }
   }
   return () => table?.detach();
+}
+
+const CONVERSION_STATUS = { lead: 'Лид', sale: 'Продажа', rejected: 'Отклонена', trash: 'Мусор' };
+// Click card: every field of one click. UA, referrer and params come from visitors — text nodes via h() only.
+function clickCard(r) {
+  const idEl = h('span', { class: 'mono', style: 'user-select:all' }, r.clickId);
+  const copy = () => {
+    // Called synchronously from the click handler so the clipboard permission applies.
+    const fallback = () => { window.getSelection()?.selectAllChildren(idEl); toast('Не удалось скопировать — ID выделен, нажмите Ctrl+C', true); };
+    try { navigator.clipboard.writeText(r.clickId).then(() => toast('Click ID скопирован'), fallback); } catch { fallback(); }
+  };
+  const yesNo = (v) => (v === true ? 'да' : v === false ? 'нет' : '—');
+  const params = Object.entries(r.params || {}).filter(([, v]) => v !== null && v !== undefined && v !== '');
+  const offerName = r.offerId && state.offers[r.offerId]?.name;
+  const landingName = r.landingId && state.landings[r.landingId]?.name;
+  const conversion = h('span', { class: 'muted' }, 'Загрузка…');
+  const rows = [
+    ['Дата и время', dt(r.at)],
+    ['Click ID', h('span', { style: 'display:inline-flex;flex-wrap:wrap;gap:8px;align-items:center' }, idEl, h('button', { class: 'btn', type: 'button', onclick: copy }, 'Копировать'))],
+    ['Кампания', r.campaign ? h('a', { href: '#/campaigns/' + encodeURIComponent(r.campaign) }, state.campaigns[r.campaign]?.name || r.campaign) : null],
+    ['Поток', r.stream],
+    ['Оффер', offerName ? `${offerName} (${r.offerId})` : r.offerId],
+    ['Лендинг', landingName ? `${landingName} (${r.landingId})` : r.landingId],
+    ['IP', r.ip], ['Страна', r.country],
+    ['Устройство', r.device], ['ОС', r.os], ['Браузер', r.browser], ['Язык', r.language],
+    r.isp ? ['Провайдер', r.isp] : null,
+    ['Реферер', r.referrer], ['Путь', r.path],
+    ['User Agent', r.userAgent],
+    ['Subid', r.subid],
+    ...params.map(([k, v]) => [k, String(v)]),
+    ['Расход', r.cost != null ? money(r.cost) : null],
+    ['Уникальность', `кампания: ${yesNo(r.uniqueCampaign)}, поток: ${yesNo(r.uniqueStream)}, глобально: ${yesNo(r.uniqueGlobal)}`],
+    ['Конверсия', conversion],
+  ].filter(Boolean);
+  openModal({ title: 'Клик', wide: true,
+    body: h('div', { class: 'kv' }, rows.map(([label, value]) => [h('div', { class: 'muted' }, label),
+      h('div', { class: 'kv-value' }, value === null || value === undefined || value === '' ? '—' : value)])) });
+  api('/api/conversions' + qs({ click: r.clickId, limit: 5 })).then((d) => {
+    const list = d.conversions || [];
+    put(conversion, list.length ? list.map((c) => h('div', {}, [CONVERSION_STATUS[c.status] || c.status || 'Продажа',
+      c.revenue == null ? null : amount(c.revenue) + (c.currency ? ' ' + c.currency : ''), dt(c.at)].filter(Boolean).join(' · '))) : 'нет');
+    conversion.className = '';
+  }).catch((e) => { put(conversion, 'Ошибка загрузки: ' + e.message); conversion.className = 'err'; });
 }
 
 // ---------- buyers report ----------
@@ -1776,20 +2072,52 @@ function drawUserBox() {
   const me = state.me?.user;
   document.querySelectorAll('[data-owner-only]').forEach((el) => { el.hidden = me?.role !== 'owner'; });
   document.querySelectorAll('[data-user-only]').forEach((el) => { el.hidden = !me; });
-  put(box, me ? [h('span', { class: 'muted', title: me.role === 'owner' ? 'Владелец' : 'Баер' }, me.email),
+  // Viewers cannot write (the server answers 403 read_only), so creation, saving and row actions are hidden.
+  document.body.classList.toggle('read-only', me?.role === 'viewer');
+  put(box, me ? [h('span', { class: 'muted', title: ROLE_LABEL[me.role] || me.role }, me.email),
     h('button', { class: 'btn', onclick: async () => { await fetch(BASE + '/api/auth/logout', { method: 'POST', headers: { 'x-requested-with': 'umbrella' } }); state.me = { ...state.me, user: null }; drawUserBox(); state.me.loginRequired ? authScreen() : route(); } }, 'Выйти')]
     : state.me?.setupRequired ? h('button', { class: 'btn', onclick: () => authScreen() }, 'Создать владельца') : []);
 }
 
+// Role select and permission checkboxes shared by the create and edit dialogs; u is mutated in place.
+function permissionFields(u) {
+  const check = (key, label, on = true, off = false) => h('label', { class: 'check-line' },
+    h('input', { type: 'checkbox', checked: u[key] === on, onchange: (e) => { u[key] = e.target.checked ? on : off; } }), ' ' + label);
+  const viewAll = check('viewAll', 'Видит все кампании (не только свои)');
+  viewAll.hidden = u.role !== 'viewer';
+  return [
+    field('Роль', h('select', { class: 'input', 'aria-label': 'Роль', onchange: (e) => { u.role = e.target.value; viewAll.hidden = u.role !== 'viewer'; } },
+      Object.entries(ROLE_LABEL).map(([v, l]) => h('option', { value: v, selected: v === u.role }, l))),
+    'Владелец управляет пользователями. Баер работает с кампаниями, офферами и отчётами. «Только чтение» видит отчёты и ничего не меняет.'),
+    h('div', { class: 'field' }, h('span', {}, 'Права'), check('hideRevenue', 'Скрывать доход'), check('offersAccess', 'Только офферы своих кампаний', 'own', 'all'), viewAll,
+      h('span', { class: 'hint' }, 'Не действуют на владельца. Доход, прибыль, ROI, EPC и URL офферов вырезаются на сервере.')),
+  ];
+}
+
 async function pageUsers() {
-  const roleLabel = { owner: 'Владелец', buyer: 'Баер' };
+  const roleLabel = ROLE_LABEL;
+  const permsText = (r) => (r.role === 'owner' ? '—' : [r.hideRevenue ? 'без дохода' : null, r.offersAccess === 'own' ? 'свои офферы' : null, r.role === 'viewer' && r.viewAll ? 'все кампании' : null].filter(Boolean).join(', ') || 'полные');
+  const editUser = (r) => {
+    const u = { role: r.role, hideRevenue: r.hideRevenue, offersAccess: r.offersAccess, viewAll: r.viewAll };
+    const err = h('p', { class: 'err' });
+    const close = openModal({
+      title: 'Права пользователя',
+      body: h('div', {}, h('p', {}, r.email), ...permissionFields(u), err),
+      footer: [h('button', { class: 'btn', onclick: () => close() }, 'Отмена'), h('button', { class: 'btn primary', onclick: async () => {
+        try { await api('/api/users/' + r.id, { method: 'PATCH', body: u }); toast('Права сохранены'); close(); load(); }
+        catch (e) { err.textContent = ({ last_owner: 'Нельзя понизить последнего владельца.', cannot_change_own_role: 'Свою роль менять нельзя.' })[e.message] || 'Ошибка: ' + e.message; }
+      } }, 'Сохранить')],
+    });
+  };
   const table = dataTable({
     id: 'users', totals: false,
     columns: [
       { key: 'email', label: 'Email', fixed: true },
       { key: 'role', label: 'Роль', value: (r) => roleLabel[r.role] || r.role },
+      { key: 'perms', label: 'Права', value: permsText },
       { key: 'createdAt', label: 'Создан', render: (r) => dt(r.createdAt) },
       { key: 'menu', label: '', sortable: false, value: () => '', render: (r) => (r.id === state.me?.user?.id ? h('span', { class: 'muted' }, 'это вы') : h('span', { class: 'row-actions' },
+        h('button', { title: 'Права', 'aria-label': 'Права пользователя ' + r.email, onclick: () => editUser(r) }, '✎'),
         h('button', { title: 'Удалить', 'aria-label': 'Удалить пользователя', onclick: async (e) => {
           const b = e.currentTarget;
           if (!b.dataset.armed) { b.dataset.armed = '1'; b.textContent = 'Удалить?'; setTimeout(() => { if (b.isConnected) { delete b.dataset.armed; b.textContent = '✕'; } }, 3000); return; }
@@ -1799,15 +2127,14 @@ async function pageUsers() {
     ],
   });
   const create = () => {
-    const u = { email: '', password: '', role: 'buyer' };
+    const u = { email: '', password: '', role: 'buyer', hideRevenue: false, offersAccess: 'all', viewAll: false };
     const err = h('p', { class: 'err' });
     const close = openModal({
       title: 'Новый пользователь',
       body: h('div', {},
         field('Email', h('input', { class: 'input', type: 'email', autocomplete: 'off', oninput: (e) => { u.email = e.target.value; } })),
         field('Пароль', h('input', { class: 'input', type: 'password', autocomplete: 'new-password', oninput: (e) => { u.password = e.target.value; } }), 'Минимум 10 символов. Передайте его пользователю лично.'),
-        field('Роль', h('div', { class: 'radios' }, Object.entries(roleLabel).map(([v, l]) => h('label', {}, h('input', { type: 'radio', name: 'urole', checked: v === 'buyer', onchange: () => { u.role = v; } }), l))),
-          'Владелец управляет пользователями. Баер работает с кампаниями, офферами и отчётами.'),
+        ...permissionFields(u),
         err),
       footer: [h('button', { class: 'btn', onclick: () => close() }, 'Отмена'), h('button', { class: 'btn primary', onclick: async () => {
         try { await api('/api/users', { method: 'POST', body: u }); toast('Пользователь создан'); close(); load(); }

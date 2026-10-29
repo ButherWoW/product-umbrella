@@ -71,6 +71,9 @@ await db.query(`
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
   )
 `);
+// Postback to the traffic source (URL with macros and the statuses that trigger it).
+await db.query(`ALTER TABLE sources ADD COLUMN IF NOT EXISTS postback_url TEXT`);
+await db.query(`ALTER TABLE sources ADD COLUMN IF NOT EXISTS postback_statuses JSONB NOT NULL DEFAULT '["sale"]'::jsonb`);
 await db.query(`
   CREATE TABLE IF NOT EXISTS landings (
     id         TEXT        PRIMARY KEY,
@@ -118,6 +121,12 @@ await db.query(`
   )
 `);
 await db.query(`CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id)`);
+// User permissions: read-only viewer role and per-user flags.
+await db.query(`ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check`);
+await db.query(`ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN ('owner', 'buyer', 'viewer'))`);
+await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS hide_revenue BOOLEAN NOT NULL DEFAULT false`);
+await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS offers_access TEXT NOT NULL DEFAULT 'all' CHECK (offers_access IN ('all', 'own'))`);
+await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS view_all BOOLEAN NOT NULL DEFAULT false`);
 // Per-user API keys: only the SHA-256 of the secret and its last 4 characters are stored.
 await db.query(`
   CREATE TABLE IF NOT EXISTS api_keys (

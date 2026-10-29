@@ -71,6 +71,7 @@
           "action": { "type": "string", "enum": ["offers", "url", "not_found", "campaign"] },
           "weight": { "type": "integer" },
           "enabled": { "type": "boolean" },
+          "disabledBy": { "type": "string", "enum": ["monitor"], "description": "Set when the offer monitor switched the stream off; it switches it back on when the targets answer again." },
           "countClicks": { "type": "boolean" },
           "offers": {
             "type": "array",
@@ -126,6 +127,8 @@
           "dedupeWindow": { "type": ["integer", "null"] },
           "uniquenessHours": { "type": "integer" },
           "conversionWindowDays": { "type": ["integer", "null"] },
+          "sourcePostbackUrl": { "type": ["string", "null"], "description": "Campaign override of the traffic-source postback URL (https, macros {click_id}, {external_id}, {sub_id_N}, {status}, {revenue}, {payout}, {currency}…); null = use the source's" },
+          "sourcePostbackStatuses": { "type": "array", "items": { "type": "string", "enum": ["lead", "sale", "rejected", "trash"] }, "description": "Statuses that trigger the source postback; empty = use the source's" },
           "botFilter": { "type": "boolean" },
           "datacenterAsBot": { "type": "boolean" },
           "allowDevices": { "type": "array", "items": { "type": "string", "enum": ["mobile", "tablet", "desktop"] } },
@@ -138,7 +141,8 @@
           "paramMap": { "type": "object" },
           "costModel": { "type": "string", "enum": ["none", "cpc"] },
           "cpc": { "type": "number" },
-          "costFromParam": { "type": "boolean" }
+          "costFromParam": { "type": "boolean" },
+          "monitoring": { "type": "string", "enum": ["off", "notify", "disable"], "default": "notify", "description": "Offer/landing monitoring: off, notify (event + audit), disable (also switches the stream off and back on)." }
         }
       },
       "StatsMetrics": {
@@ -182,7 +186,10 @@
         "properties": {
           "id": { "type": "string", "format": "uuid" },
           "email": { "type": "string", "format": "email" },
-          "role": { "type": "string", "enum": ["owner", "buyer"] }
+          "role": { "type": "string", "enum": ["owner", "buyer", "viewer"], "description": "viewer is read-only: every non-GET panel request answers 403 read_only" },
+          "hideRevenue": { "type": "boolean", "description": "Revenue, profit, ROI, EPC, payouts and offer/postback URLs are removed from this user's responses" },
+          "offersAccess": { "type": "string", "enum": ["all", "own"], "description": "own: /api/offers lists only offers used in the user's campaigns" },
+          "viewAll": { "type": "boolean", "description": "viewer only: sees all campaigns instead of its own" }
         }
       },
       "AuditEntry": {
@@ -1408,7 +1415,10 @@
                 "properties": {
                   "email": { "type": "string", "format": "email" },
                   "password": { "type": "string", "minLength": 1 },
-                  "role": { "type": "string", "enum": ["owner", "buyer"], "default": "buyer" }
+                  "role": { "type": "string", "enum": ["owner", "buyer", "viewer"], "default": "buyer" },
+                  "hideRevenue": { "type": "boolean", "default": false },
+                  "offersAccess": { "type": "string", "enum": ["all", "own"], "default": "all" },
+                  "viewAll": { "type": "boolean", "default": false }
                 }
               }
             }
@@ -1428,6 +1438,55 @@
       }
     },
     "/api/users/{id}": {
+      "patch": {
+        "summary": "Change a user's role and permissions",
+        "description": "Owner only. Cannot change your own role or demote the last owner.",
+        "operationId": "updateUser",
+        "tags": ["users"],
+        "security": [{ "bearerAuth": [] }, { "cookieAuth": [] }],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "role": { "type": "string", "enum": ["owner", "buyer", "viewer"] },
+                  "hideRevenue": { "type": "boolean" },
+                  "offersAccess": { "type": "string", "enum": ["all", "own"] },
+                  "viewAll": { "type": "boolean" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated user",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "user": { "$ref": "#/components/schemas/User" } } } } }
+          },
+          "400": {
+            "description": "Invalid role or flag",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" }, "example": { "error": "invalid_role" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": {
+            "description": "Owner only",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "404": {
+            "description": "User not found",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" }, "example": { "error": "user_not_found" } } }
+          },
+          "409": {
+            "description": "Own role or last owner",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" }, "example": { "error": "last_owner" } } }
+          }
+        }
+      },
       "delete": {
         "summary": "Delete a user",
         "description": "Owner only. Cannot delete yourself or the last owner.",
@@ -1561,7 +1620,7 @@
     "/api/settings": {
       "get": {
         "summary": "Get team settings",
-        "description": "Returns team-level settings such as buyerSharePct.",
+        "description": "Returns team-level settings: buyerSharePct and daily goals (dailyRevenueGoal, dailyProfitGoal) in the default currency, null when unset.",
         "operationId": "getSettings",
         "tags": ["settings"],
         "responses": {
@@ -1572,7 +1631,9 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "buyerSharePct": { "type": "number", "minimum": 0, "maximum": 100 }
+                    "buyerSharePct": { "type": "number", "minimum": 0, "maximum": 100 },
+                    "dailyRevenueGoal": { "type": ["number", "null"], "minimum": 0 },
+                    "dailyProfitGoal": { "type": ["number", "null"], "minimum": 0 }
                   }
                 }
               }
@@ -1582,7 +1643,7 @@
       },
       "patch": {
         "summary": "Update team settings",
-        "description": "Owner only. Updates buyerSharePct (0–100).",
+        "description": "Owner only. Partial update: buyerSharePct (0–100) and/or dailyRevenueGoal / dailyProfitGoal (number ≥ 0 or null).",
         "operationId": "updateSettings",
         "tags": ["settings"],
         "security": [{ "bearerAuth": [] }, { "cookieAuth": [] }],
@@ -1593,7 +1654,9 @@
               "schema": {
                 "type": "object",
                 "properties": {
-                  "buyerSharePct": { "type": "number", "minimum": 0, "maximum": 100 }
+                  "buyerSharePct": { "type": "number", "minimum": 0, "maximum": 100 },
+                    "dailyRevenueGoal": { "type": ["number", "null"], "minimum": 0 },
+                    "dailyProfitGoal": { "type": ["number", "null"], "minimum": 0 }
                 }
               }
             }
@@ -1614,7 +1677,7 @@
             }
           },
           "400": {
-            "description": "Invalid buyer share",
+            "description": "Invalid buyer share (invalid_buyer_share) or goal (invalid_goal)",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" }, "example": { "error": "invalid_buyer_share" } } }
           },
           "401": { "$ref": "#/components/responses/Unauthorized" },
@@ -1657,6 +1720,51 @@
             }
           },
           "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/monitor": {
+      "get": {
+        "summary": "Offer and landing monitor state",
+        "description": "Per checked URL (without query string): whether it answers, last status, since when it is down and which campaigns/streams use it. Buyers see only their own campaigns.",
+        "operationId": "getMonitor",
+        "tags": ["system"],
+        "security": [{ "bearerAuth": [] }, { "cookieAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Monitor state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "enabled": { "type": "boolean" },
+                    "intervalMs": { "type": "integer" },
+                    "targets": { "type": "array", "items": { "type": "object", "properties": {
+                      "url": { "type": "string" }, "ok": { "type": "boolean" }, "status": { "type": ["integer", "null"] }, "error": { "type": ["string", "null"] },
+                      "checkedAt": { "type": "string", "format": "date-time" }, "downSince": { "type": ["string", "null"], "format": "date-time" }, "failures": { "type": "integer" },
+                      "campaigns": { "type": "array", "items": { "type": "object", "properties": {
+                        "campaign": { "type": "string" }, "name": { "type": "string" }, "stream": { "type": "string" }, "target": { "type": "string" }, "mode": { "type": "string", "enum": ["off", "notify", "disable"] } } } }
+                    } } }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "description": "Authorization required" }
+        }
+      }
+    },
+    "/api/monitor/check": {
+      "post": {
+        "summary": "Run a monitor check now",
+        "description": "Checks every monitored URL immediately and applies notify/disable actions. Owner only.",
+        "operationId": "runMonitorCheck",
+        "tags": ["system"],
+        "security": [{ "bearerAuth": [] }, { "cookieAuth": [] }],
+        "responses": {
+          "200": { "description": "Check finished; same targets as GET /api/monitor plus checked/down counts" },
+          "403": { "description": "Owner only" }
         }
       }
     },

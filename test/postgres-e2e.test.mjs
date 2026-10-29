@@ -50,3 +50,87 @@ test('PostgreSQL: campaigns, offers, clicks and conversions survive a restart', 
     assert.equal(params.rows[0].value, 'abc');
   } finally { await server.stop(); }
 });
+
+// «Очистка статистики» and RETENTION_DAYS delete from PostgreSQL too: a restart with an empty data
+// directory must not bring the removed clicks, conversions and bots back.
+async function pgPool() {
+  const { default: pg } = await import('pg');
+  return new pg.Pool({ connectionString: databaseUrl, max: 2 });
+}
+const oldAt = '2026-01-10T10:00:00.000Z';
+async function insertClick(pool, campaign, { at = oldAt, converted = false, lp = false } = {}) {
+  const { randomUUID } = await import('node:crypto');
+  const clickId = randomUUID();
+  await pool.query('INSERT INTO clicks (click_id, campaign, offer_id, created_at, lp_clicked_at) VALUES ($1,$2,$3,$4,$5)', [clickId, campaign, 'offer-1', at, lp ? at : null]);
+  if (converted) await pool.query('INSERT INTO conversions (click_id, revenue, currency, created_at) VALUES ($1, 3, $2, $3)', [clickId, 'EUR', at]);
+  return clickId;
+}
+
+test('PostgreSQL: clear-stats deletes one campaign\'s rows (with `before`), others stay', { skip: !databaseUrl && 'set TEST_DATABASE_URL to run', timeout: 30000 }, async (t) => {
+  const dirs = [];
+  const start = async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'umbrella-pgclear-')); dirs.push(dir);
+    return startTestServer(dir, { DATABASE_URL: databaseUrl, REQUIRE_POSTGRES: '1', ADMIN_TOKEN: TOKEN });
+  };
+  const pool = await pgPool();
+  t.after(async () => { await pool.end(); for (const dir of dirs) await rm(dir, { recursive: true, force: true }); });
+  const run = Date.now().toString(36);
+  const a = `pg-clr-a-${run}`, b = `pg-clr-b-${run}`;
+
+  let server = await start();
+  const call = (path, body, method = body ? 'POST' : 'GET') => fetch(server.url + path, {
+    method, headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+  const hit = async (campaign) => new URL((await fetch(`${server.url}/r/${campaign}`, { redirect: 'manual' })).headers.get('location')).searchParams.get('click_id');
+  try {
+    for (const id of [a, b]) assert.equal((await call('/api/campaigns', { id, name: id, streams: [{ name: 'main', offers: [{ offerId: 'offer-1' }] }] })).status, 201);
+    await insertClick(pool, a, { converted: true, lp: true });
+    await insertClick(pool, a);
+    await insertClick(pool, b, { converted: true });
+    await pool.query('INSERT INTO bots (campaign, reason, created_at) VALUES ($1, $3, $4), ($2, $3, $4)', [a, b, 'ua', oldAt]);
+    const live = await hit(a);
+    await hit(b);
+    assert.equal((await fetch(`${server.url}/postback?secret=conversion-test-secret&click_id=${live}&revenue=4`)).status, 200);
+
+    assert.equal((await call(`/api/campaigns/${a}/clear-stats`, { confirm: b })).status, 400);
+    const partial = await (await call(`/api/campaigns/${a}/clear-stats`, { confirm: a, before: '2026-06-01' })).json();
+    assert.deepEqual(partial.removed.postgres, { clicks: 2, conversions: 1, lpClicks: 1, bots: 1 });
+    let s = await (await call(`/stats?campaign=${a}`)).json();
+    assert.deepEqual([s.clicks, s.conversions], [1, 1], 'clicks after `before` stay');
+    const all = await (await call(`/api/campaigns/${a}/clear-stats`, { confirm: a })).json();
+    assert.deepEqual([all.removed.postgres.clicks, all.removed.postgres.conversions, all.removed.clicks], [1, 1, 1], 'database and journal both cleared');
+    await hit(b);
+  } finally { await server.stop(); }
+
+  server = await start();
+  try {
+    const sa = await (await call(`/stats?campaign=${a}`)).json();
+    assert.deepEqual([sa.clicks, sa.conversions, sa.revenue], [0, 0, 0], 'nothing comes back from PostgreSQL');
+    const sb = await (await call(`/stats?campaign=${b}`)).json();
+    assert.deepEqual([sb.clicks, sb.conversions], [3, 1], 'other campaign intact, clicks after the clear recorded');
+    const bots = await pool.query('SELECT campaign FROM bots WHERE campaign = ANY($1)', [[a, b]]);
+    assert.deepEqual(bots.rows.map((r) => r.campaign), [b]);
+  } finally { await server.stop(); }
+});
+
+test('PostgreSQL: RETENTION_DAYS deletes old unconverted clicks and bots, converted clicks stay', { skip: !databaseUrl && 'set TEST_DATABASE_URL to run', timeout: 30000 }, async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'umbrella-pgret-'));
+  const pool = await pgPool();
+  t.after(async () => { await pool.end(); await rm(dir, { recursive: true, force: true }); });
+  const campaign = `pg-ret-${Date.now().toString(36)}`;
+  const paid = await insertClick(pool, campaign, { converted: true });
+  const unpaid = await insertClick(pool, campaign, { lp: true });
+  const recent = await insertClick(pool, campaign, { at: new Date().toISOString() });
+  await pool.query('INSERT INTO bots (campaign, reason, created_at) VALUES ($1, $2, $3), ($1, $2, now())', [campaign, 'ua', oldAt]);
+  const server = await startTestServer(dir, { DATABASE_URL: databaseUrl, REQUIRE_POSTGRES: '1', ADMIN_TOKEN: TOKEN, RETENTION_DAYS: '30', RETENTION_DELAY_MS: '0' });
+  try {
+    let left = [];
+    for (let i = 0; i < 100; i++) {
+      left = (await pool.query('SELECT click_id FROM clicks WHERE campaign = $1', [campaign])).rows.map((r) => r.click_id);
+      if (!left.includes(unpaid)) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.deepEqual(left.sort(), [paid, recent].sort(), 'only the old unconverted click is gone');
+    assert.equal((await pool.query('SELECT 1 FROM conversions WHERE click_id = $1', [paid])).rowCount, 1, 'conversion kept');
+    assert.equal((await pool.query('SELECT 1 FROM bots WHERE campaign = $1', [campaign])).rowCount, 1, 'old bot removed, recent kept');
+  } finally { await server.stop(); }
+});
