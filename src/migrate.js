@@ -91,6 +91,8 @@ await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS datacenter BOOLEAN`)
 for (const column of ['is_unique_campaign', 'is_unique_stream', 'is_unique_global']) await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS ${column} BOOLEAN NOT NULL DEFAULT true`);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS params JSONB`);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS cost NUMERIC(12,6) NOT NULL DEFAULT 0`);
+// CPC offer payout earned by the click (DEFAULT_CURRENCY).
+await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS revenue NUMERIC(12,6) NOT NULL DEFAULT 0`);
 
 await db.query(`
   CREATE TABLE IF NOT EXISTS conversions (

@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS clicks (
   stream text,
   params jsonb,
   cost numeric(12,6) NOT NULL DEFAULT 0,
+  revenue numeric(12,6) NOT NULL DEFAULT 0,
   landing_id text,
   lp_clicked_at timestamptz,
   is_unique_campaign boolean NOT NULL DEFAULT true,

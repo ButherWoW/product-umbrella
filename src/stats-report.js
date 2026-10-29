@@ -52,7 +52,7 @@ export function reportFromEvents(clicks, conversions) {
     const amount = Number(conversion?.revenue) || 0;
     add(report, [click.campaign, click.country || 'unknown', click.offerId || 'unknown',
       click.stream || 'default', click.landingId || 'none'], { clicks: 1, conversions: status === 'lead' || status === 'sale' ? 1 : 0,
-      revenue: status === 'sale' ? amount : 0, pendingRevenue: status === 'lead' ? amount : 0, cost: click.cost ?? 0, lpClicks: click.lpClicked ? 1 : 0, uniqueClicks: click.uniqueCampaign === false ? 0 : 1,
+      revenue: (status === 'sale' ? amount : 0) + (Number(click.revenue) || 0), pendingRevenue: status === 'lead' ? amount : 0, cost: click.cost ?? 0, lpClicks: click.lpClicked ? 1 : 0, uniqueClicks: click.uniqueCampaign === false ? 0 : 1,
       leads: status === 'lead' ? 1 : 0, sales: status === 'sale' ? 1 : 0, rejected: status === 'rejected' ? 1 : 0, trash: status === 'trash' ? 1 : 0 });
   }
   return finish(report);

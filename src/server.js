@@ -40,11 +40,14 @@ function sqlFx(params, currency) {
     revenue: `COALESCE(SUM(${amount}) FILTER (WHERE cv.status = 'sale'), 0)`,
     pending: `COALESCE(SUM(${amount}) FILTER (WHERE cv.status = 'lead'), 0)`,
     cost: `COALESCE(SUM(c.cost), 0) * $${n}::float`,
+    // CPC offer payout booked on the click itself (stored in DEFAULT_CURRENCY, like cost).
+    clickRevenue: `COALESCE(SUM(c.revenue), 0) * $${n}::float`,
   };
 }
 // JSONL equivalents.
 const convertConversion = (cv, currency) => (cv.revenue === null || cv.revenue === undefined ? cv : { ...cv, revenue: Number(cv.revenue) * rates.factor(cv.currency, currency) });
-const convertClickCost = (click, currency) => (click.cost ? { ...click, cost: Number(click.cost) * rates.factor(rates.defaultCurrency, currency) } : click);
+const convertClickCost = (click, currency) => (click.cost || click.revenue ? { ...click, cost: Number(click.cost || 0) * rates.factor(rates.defaultCurrency, currency),
+  revenue: Number(click.revenue || 0) * rates.factor(rates.defaultCurrency, currency) } : click);
 const SESSION_COOKIE = 'umb_session';
 const loginFailures = new Map();
 const postbackSecret = process.env.POSTBACK_SECRET || '';
@@ -665,6 +668,14 @@ function parseOffer(raw) {
     conversionCap, capTz, altOfferId };
 }
 
+// Validation of the payout fields in POST/PATCH /api/offers (absent fields are not checked).
+function payoutError(body) {
+  if (body.payoutType !== undefined && body.payoutType !== null && !['cpa', 'cpc'].includes(body.payoutType)) return 'invalid_payout_type';
+  if (body.payout !== undefined && body.payout !== null && body.payout !== '' && !/^\d{1,8}(?:\.\d{1,4})?$/.test(String(body.payout))) return 'invalid_payout';
+  if (body.payoutCurrency !== undefined && body.payoutCurrency !== null && body.payoutCurrency !== '' && !/^[A-Z]{3}$/i.test(String(body.payoutCurrency))) return 'invalid_payout_currency';
+  return null;
+}
+
 // Validation of the conversion-cap fields in POST/PATCH /api/offers (absent fields are not checked).
 function conversionCapError(id, body) {
   if (body.conversionCap !== undefined && body.conversionCap !== null && !(Number.isInteger(body.conversionCap) && body.conversionCap > 0)) return 'invalid_conversion_cap';
@@ -679,8 +690,8 @@ function conversionCapError(id, body) {
 async function loadOffers() {
   if (db) {
     try {
-      const { rows } = await db.query('SELECT id, url, postback_url, daily_cap, name, network_id, "group", archived, conversion_cap, cap_tz, alt_offer_id FROM offers');
-      for (const row of rows) if (/^[a-z0-9_-]{2,80}$/i.test(row.id) && /^https:\/\//i.test(row.url)) offers.set(row.id, parseOffer({ url: row.url, postbackUrl: row.postback_url, dailyCap: row.daily_cap, name: row.name, networkId: row.network_id, group: row.group, archived: row.archived === true,
+      const { rows } = await db.query('SELECT id, url, postback_url, payout_type, payout, payout_currency, daily_cap, name, network_id, "group", archived, conversion_cap, cap_tz, alt_offer_id FROM offers');
+      for (const row of rows) if (/^[a-z0-9_-]{2,80}$/i.test(row.id) && /^https:\/\//i.test(row.url)) offers.set(row.id, parseOffer({ url: row.url, postbackUrl: row.postback_url, payoutType: row.payout_type, payout: row.payout, payoutCurrency: row.payout_currency, dailyCap: row.daily_cap, name: row.name, networkId: row.network_id, group: row.group, archived: row.archived === true,
         conversionCap: row.conversion_cap, capTz: row.cap_tz, altOfferId: row.alt_offer_id }));
       return;
     } catch (error) { console.warn('[db] offers load fallback:', error.message); }
@@ -702,7 +713,7 @@ async function saveOffers() {
 
 async function persistOffer(id, value) {
   const offer = typeof value === 'string' ? { url: value, postbackUrl: null } : value;
-  if (db) await db.query('INSERT INTO offers (id, url, postback_url, daily_cap, name, network_id, "group", archived, conversion_cap, cap_tz, alt_offer_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (id) DO UPDATE SET url = EXCLUDED.url, postback_url = EXCLUDED.postback_url, daily_cap = EXCLUDED.daily_cap, name = EXCLUDED.name, network_id = EXCLUDED.network_id, "group" = EXCLUDED."group", archived = EXCLUDED.archived, conversion_cap = EXCLUDED.conversion_cap, cap_tz = EXCLUDED.cap_tz, alt_offer_id = EXCLUDED.alt_offer_id', [id, offer.url, offer.postbackUrl, offer.dailyCap ?? null, offer.name ?? null, offer.networkId ?? null, offer.group ?? '', offer.archived === true, offer.conversionCap ?? null, offer.capTz || 'UTC', offer.altOfferId ?? null]);
+  if (db) await db.query('INSERT INTO offers (id, url, postback_url, daily_cap, name, network_id, "group", archived, conversion_cap, cap_tz, alt_offer_id, payout_type, payout, payout_currency) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) ON CONFLICT (id) DO UPDATE SET url = EXCLUDED.url, postback_url = EXCLUDED.postback_url, payout_type = EXCLUDED.payout_type, payout = EXCLUDED.payout, payout_currency = EXCLUDED.payout_currency, daily_cap = EXCLUDED.daily_cap, name = EXCLUDED.name, network_id = EXCLUDED.network_id, "group" = EXCLUDED."group", archived = EXCLUDED.archived, conversion_cap = EXCLUDED.conversion_cap, cap_tz = EXCLUDED.cap_tz, alt_offer_id = EXCLUDED.alt_offer_id', [id, offer.url, offer.postbackUrl, offer.dailyCap ?? null, offer.name ?? null, offer.networkId ?? null, offer.group ?? '', offer.archived === true, offer.conversionCap ?? null, offer.capTz || 'UTC', offer.altOfferId ?? null, offer.payoutType || 'cpa', offer.payout ?? null, offer.payoutCurrency ?? null]);
   else await saveOffers();
 }
 
@@ -879,7 +890,7 @@ async function stats({ campaign = null, allowed = null, from = null, to = null, 
           COUNT(c.click_id)::int                  AS clicks,
           COUNT(c.click_id) FILTER (WHERE c.is_unique_campaign)::int AS unique_clicks,
           ${SQL_CONVERSIONS}::int                 AS conversions,
-          ${fx.revenue}::float                    AS revenue,
+          (${fx.revenue} + ${fx.clickRevenue})::float AS revenue,
           COUNT(cv.click_id) FILTER (WHERE cv.status = 'lead')::int     AS leads,
           COUNT(cv.click_id) FILTER (WHERE cv.status = 'sale')::int     AS sales,
           COUNT(cv.click_id) FILTER (WHERE cv.status = 'rejected')::int AS rejected,
@@ -955,7 +966,7 @@ async function paramReport({ field, campaign, allowed = null, from, to, currency
       const fx = sqlFx(values, currency);
       const { rows } = await db.query(`
         SELECT ${isColumn ? `COALESCE(c.${field}, '')` : "COALESCE(c.params->>$1, '')"} AS value, COUNT(c.click_id)::int AS clicks, COUNT(c.click_id) FILTER (WHERE c.is_unique_campaign IS DISTINCT FROM false)::int AS unique_clicks, ${SQL_CONVERSIONS}::int AS conversions,
-          ${fx.revenue}::float AS revenue, ${fx.cost}::float AS cost
+          (${fx.revenue} + ${fx.clickRevenue})::float AS revenue, ${fx.cost}::float AS cost
         FROM clicks c LEFT JOIN conversions cv USING (click_id)
         ${conditions.length ? 'WHERE ' + conditions.join(' AND ') : ''}
         GROUP BY 1 ORDER BY clicks DESC LIMIT 500`, values);
@@ -977,6 +988,7 @@ async function paramReport({ field, campaign, allowed = null, from, to, currency
     const g = groups.get(key) || { value: key, clicks: 0, uniqueClicks: 0, conversions: 0, revenue: 0, cost: 0 };
     const cv = conv.get(click.clickId);
     g.clicks += 1; if (click.uniqueCampaign !== false) g.uniqueClicks += 1; g.cost += (Number(click.cost) || 0) * rates.factor(rates.defaultCurrency, currency);
+    g.revenue += (Number(click.revenue) || 0) * rates.factor(rates.defaultCurrency, currency);
     if (cv && conversionCounts(cv)) { g.conversions += 1; g.revenue += saleRevenue(cv) * rates.factor(cv.currency, currency); }
     groups.set(key, g);
   }
@@ -1102,6 +1114,12 @@ const recordPostback = createConversionRecorder({
   currentConversion: (clickId) => findRecordedConversion({ clickId, eventsFile, db,
     onFallback: (error) => console.warn('[db] currentConversion fallback:', error.message) }),
   windowDaysForClick: (click) => campaigns.get(click.campaign)?.conversionWindowDays,
+  // A postback without revenue earns the CPA offer's payout (CPC offers are paid per click, not here).
+  defaultRevenue: (click) => {
+    const offer = offers.get(click.offerId);
+    return offer?.payoutType === 'cpa' && offer.payout !== null && offer.payout !== undefined
+      ? { revenue: String(offer.payout), currency: offer.payoutCurrency } : null;
+  },
   record: (payload) => event('conversion', payload),
   onRecorded: ({ click, clickId, revenue, currency, status, recorded }) => {
     // Recount the offer's conversion cap now and again once PostgreSQL has the conversion.
@@ -1542,6 +1560,10 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
+      // CPC offer: the payout is earned per click and booked on the click in DEFAULT_CURRENCY (like cost).
+      const cpcOffer = offers.get(offerId);
+      const clickRevenue = cpcOffer?.payoutType === 'cpc' && cpcOffer.payout
+        ? Math.round(cpcOffer.payout * rates.factor(cpcOffer.payoutCurrency || rates.defaultCurrency, rates.defaultCurrency) * 1e6) / 1e6 : 0;
       // Streams with countClicks=false redirect normally but stay out of logs and reports, as in Keitaro.
       if (countClick) {
         const visitor = `${ip}|${req.headers['user-agent'] || ''}`;
@@ -1552,7 +1574,7 @@ const server = http.createServer(async (req, res) => {
         const lang = String(req.headers['accept-language'] || '').trim().slice(0, 2).toLowerCase();
         await event('click', { clickId, campaign: campaignId, offerId, path: url.pathname, referrer: req.headers.referer || null, userAgent: req.headers['user-agent'] || null, subid, country, ip,
           device, os, browser, language: /^[a-z]{2}$/.test(lang) ? lang : null,
-          ...(network ? { asn: network.asn, isp: network.isp, datacenter: network.datacenter } : {}), stream: streamName, ...extra, ...(Object.keys(params).length ? { params } : {}), ...(cost ? { cost } : {}) });
+          ...(network ? { asn: network.asn, isp: network.isp, datacenter: network.datacenter } : {}), stream: streamName, ...extra, ...(Object.keys(params).length ? { params } : {}), ...(cost ? { cost } : {}), ...(clickRevenue ? { revenue: clickRevenue } : {}) });
         if (totalCount !== null && totalCount + 1 >= c.totalCap) await pauseCampaign(campaignId, 'total_cap_reached');
       }
       return sendRedirect(res, destination.toString(), c.redirectMethod);
@@ -1617,13 +1639,9 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/postback' && req.method === 'GET') {
       if (postbackSecret && !safeEqual(url.searchParams.get('secret'), postbackSecret)) return json(res, 401, { error: 'invalid_postback_secret' });
       try {
-        const clickId = url.searchParams.get('click_id');
-        const click = await getClickData(clickId);
-        const offer = click ? offers.get(click.offerId) : null;
-        const suppliedRevenue = url.searchParams.get('revenue') || url.searchParams.get('payout');
-        const fallbackRevenue = suppliedRevenue || (offer?.payout != null && offer.payoutType === 'cpa' ? String(offer.payout) : null);
-        const result = await recordPostback({ clickId, revenue: fallbackRevenue,
-          currency: url.searchParams.get('currency') || offer?.payoutCurrency, status: url.searchParams.get('status') });
+        // `payout` is an alias of `revenue`; without either, a CPA offer's payout is used (see recordPostback).
+        const result = await recordPostback({ clickId: url.searchParams.get('click_id'),
+          revenue: url.searchParams.get('revenue') || url.searchParams.get('payout'), currency: url.searchParams.get('currency'), status: url.searchParams.get('status') });
         return json(res, 200, result);
       } catch (error) {
         if (!error.statusCode) throw error;
@@ -1807,7 +1825,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readJson(req);
       if (!/^[a-z0-9_-]{2,80}$/i.test(String(body.id || '')) || !/^https:\/\//i.test(String(body.url || ''))) return json(res, 400, { error: 'id_and_https_url_required' });
       if (body.networkId !== undefined && body.networkId !== null && !networks.has(String(body.networkId))) return json(res, 400, { error: 'network_not_found' });
-      const capError = conversionCapError(String(body.id), body);
+      const capError = conversionCapError(String(body.id), body) || payoutError(body);
       if (capError) return json(res, 400, { error: capError });
       const offer = parseOffer({ url: String(body.url), postbackUrl: body.postbackUrl, payoutType: body.payoutType, payout: body.payout, payoutCurrency: body.payoutCurrency, dailyCap: body.dailyCap, name: body.name, networkId: body.networkId, archived: body.archived, group: body.group,
         conversionCap: body.conversionCap, capTz: body.capTz, altOfferId: body.altOfferId });
@@ -1835,7 +1853,7 @@ const server = http.createServer(async (req, res) => {
       const newPostbackUrl = body.postbackUrl !== undefined ? body.postbackUrl : cur.postbackUrl;
       const newDailyCap = body.dailyCap !== undefined ? body.dailyCap : cur.dailyCap;
       if (body.networkId !== undefined && body.networkId !== null && !networks.has(String(body.networkId))) return json(res, 400, { error: 'network_not_found' });
-      const capError = conversionCapError(id, body);
+      const capError = conversionCapError(id, body) || payoutError(body);
       if (capError) return json(res, 400, { error: capError });
       const updated = parseOffer({ url: newUrl, postbackUrl: newPostbackUrl, payoutType: body.payoutType !== undefined ? body.payoutType : cur.payoutType, payout: body.payout !== undefined ? body.payout : cur.payout, payoutCurrency: body.payoutCurrency !== undefined ? body.payoutCurrency : cur.payoutCurrency, dailyCap: newDailyCap, name: body.name !== undefined ? body.name : cur.name, networkId: body.networkId !== undefined ? body.networkId : cur.networkId, archived: body.archived !== undefined ? body.archived : cur.archived, group: body.group !== undefined ? body.group : cur.group,
         conversionCap: body.conversionCap !== undefined ? body.conversionCap : cur.conversionCap, capTz: body.capTz !== undefined ? body.capTz : cur.capTz, altOfferId: body.altOfferId !== undefined ? body.altOfferId : cur.altOfferId });
@@ -2009,7 +2027,7 @@ const server = http.createServer(async (req, res) => {
               COUNT(c.click_id)::int                AS clicks,
               COUNT(c.click_id) FILTER (WHERE c.is_unique_campaign)::int AS unique_clicks,
               ${SQL_CONVERSIONS}::int               AS conversions,
-              ${fx.revenue}::float                  AS revenue,
+              (${fx.revenue} + ${fx.clickRevenue})::float AS revenue,
               ${fx.cost}::float                     AS cost
             FROM clicks c
             LEFT JOIN conversions cv USING (click_id)
@@ -2044,6 +2062,7 @@ const server = http.createServer(async (req, res) => {
           buckets[b].clicks += 1;
           if (click.uniqueCampaign) buckets[b].uniqueClicks += 1;
           buckets[b].cost += Number(click.cost) * rates.factor(rates.defaultCurrency, tsCurrency) || 0;
+          buckets[b].revenue += Number(click.revenue) * rates.factor(rates.defaultCurrency, tsCurrency) || 0;
         }
         for (const conv of convs) {
           const b = clickBucket.get(conv.clickId) || '';
