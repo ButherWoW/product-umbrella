@@ -16,6 +16,8 @@
 
 Для защиты tracking routes от флуда доступны `CLICK_RATE_LIMIT` и `CLICK_RATE_WINDOW_MS`. При превышении лимита запрос получает `429`, новый клик не записывается.
 
+Для production обязательно задайте `REQUIRE_LOGIN=1` и `ADMIN_TOKEN`. `TRUST_PROXY=1` включайте только за собственным reverse proxy; иначе IP нельзя считать доверенным из заголовка клиента.
+
 Запуск:
 
 ```bash
@@ -93,6 +95,13 @@ Tracking URL принимает `utm_source`, `utm_medium`, `utm_campaign`, `utm
 У кампании есть `ownerId` (id пользователя). Баер создаёт кампании только на себя, видит и правит только свои: `/api/campaigns`, `/stats*`, `/api/clicks`, `/api/conversions`, `/api/audit` отдают ему только его данные, а запрос чужой кампании → `403 campaign_not_yours`. Владелец (и `ADMIN_TOKEN`) видит всё и назначает баера полем `ownerId` (в /admin — «Баер» в редакторе кампании). Кампании без баера видит только владелец. На дашборде владельца — таблица «Баеры»: кампании, клики, доход, расход, прибыль и заработок по доле. Офферы и лендинги общие для команды.
 
 ## История изменений и доля баера
+
+## Источники, партнёрские сети и управление сущностями
+
+- Источники трафика: `GET/POST /api/sources`, `PATCH /api/sources/:id`. Источник содержит `name`, `paramMap`, `costModel`, `cpc`, `costFromParam`; данные сохраняются в JSON fallback или PostgreSQL.
+- Партнёрские сети: `GET/POST /api/networks`, `PATCH /api/networks/:id`. Оффер связывается через `networkId`; сеть хранит параметры click ID и payout для настройки postback.
+- При создании кампании с `sourceId` его параметры стоимости и `paramMap` подставляются автоматически, если не указаны вручную.
+- Архивирование: `PATCH /api/campaigns/:id` или `/api/offers/:id` с `{ "archived": true }`. Клонирование: `POST /api/campaigns/:id/clone` и `POST /api/offers/:id/clone`.
 
 - `GET /api/audit?entity=campaign|offer|landing|user|settings&id=&limit=` — кто, когда и что изменил (новые сверху): создание и правки кампаний, потоков, офферов, лендингов, пользователей, входы, автопауза по капу (`actor: system`). Пароли не пишутся. В редакторе кампании — кнопка «История».
 - `GET /api/settings`, `PATCH /api/settings { buyerSharePct }` (только владелец, 0–100, по умолчанию 35). Дашборд показывает «Заработок баера» = процент от чистой прибыли (доход − расход) за выбранный период/кампанию в выбранной валюте; при убытке — 0. Владелец меняет процент кликом по плитке.
@@ -235,6 +244,15 @@ npm start
 ## Проверка на PostgreSQL
 
 CI поднимает чистый PostgreSQL (job `postgres`): миграции с нуля дважды, затем `test/postgres*.test.mjs` — данные, записанные сервером, должны вернуться из базы после перезапуска с пустым каталогом данных. Локально: `docker run -d --name umb-pg -e POSTGRES_USER=umbrella -e POSTGRES_PASSWORD=local -e POSTGRES_DB=umbrella -p 55432:5432 postgres:16-alpine`, затем `DATABASE_URL=postgresql://umbrella:local@127.0.0.1:55432/umbrella node src/migrate.js` и `TEST_DATABASE_URL=… node --test test/postgres-e2e.test.mjs`.
+Для production задайте `REQUIRE_POSTGRES=1`: тогда приложение не стартует при недоступной базе и не потеряет события, незаметно переключившись на JSONL.
+
+### Production checklist
+
+1. Задайте `DATABASE_URL`, `REQUIRE_POSTGRES=1`, `REQUIRE_LOGIN=1`, `ADMIN_TOKEN` и `POSTBACK_SECRET` через секрет-хранилище.
+2. Выполните миграцию до запуска приложения: `npm run migrate` или используйте Docker Compose, где миграция запускается автоматически.
+3. Ограничьте доступ к PostgreSQL сетью приложения, а HTTP наружу отдавайте через HTTPS reverse proxy.
+4. Периодически запускайте `DATABASE_URL=... BACKUP_DIR=./backups sh scripts/backup-postgres.sh` и проверяйте восстановление резервной копии на отдельной базе.
+5. Проверьте `/health`, `/stats`, тестовый `/r/<campaign>` и postback после деплоя; не публикуйте `ADMIN_TOKEN` и `POSTBACK_SECRET` в логах.
 
 ## Бэкапы
 

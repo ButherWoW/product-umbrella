@@ -18,6 +18,8 @@ const offersFile = join(dataDir, 'offers.json');
 const landingsFile = join(dataDir, 'landings.json');
 const settingsFile = join(dataDir, 'settings.json');
 const campaignsFile = join(dataDir, 'campaigns.json');
+const sourcesFile = join(dataDir, 'sources.json');
+const networksFile = join(dataDir, 'networks.json');
 const port = Number(process.env.PORT || 4100);
 // Public path prefix when served behind a proxy under a subpath (nginx strips it before proxying).
 const basePath = /^\/[A-Za-z0-9_-]{1,40}$/.test(process.env.BASE_PATH || '') ? process.env.BASE_PATH : '';
@@ -46,6 +48,7 @@ const SESSION_COOKIE = 'umb_session';
 const loginFailures = new Map();
 const postbackSecret = process.env.POSTBACK_SECRET || '';
 const adminToken = process.env.ADMIN_TOKEN || '';
+const requirePostgres = /^(1|true|yes)$/i.test(process.env.REQUIRE_POSTGRES || '');
 const clickRateLimit = Math.max(0, Number(process.env.CLICK_RATE_LIMIT || 120));
 const clickRateWindowMs = Math.max(1000, Number(process.env.CLICK_RATE_WINDOW_MS || 60000));
 const rateBuckets = new Map();
@@ -53,6 +56,8 @@ const rateBuckets = new Map();
 const offers = new Map([
   ['offer-1', { url: process.env.OFFER_1_URL || 'https://example.com/', postbackUrl: null }],
 ]);
+const sources = new Map();
+const networks = new Map();
 
 // Optional geo-lookup. Requires GEOIP_DB env var + @maxmind/geoip2-node installed.
 let geoReader = null;
@@ -357,7 +362,7 @@ async function cappedOffers(streams) {
   const capped = new Set();
   for (const id of ids) {
     const cap = offers.get(id)?.dailyCap;
-    if (cap && await countClicks({ offerId: id, since: todayStart() }) >= cap) capped.add(id);
+    if (offers.get(id)?.archived || (cap && await countClicks({ offerId: id, since: todayStart() }) >= cap)) capped.add(id);
   }
   return capped;
 }
@@ -467,14 +472,55 @@ function parseOffer(raw) {
   const postbackUrl = raw?.postbackUrl && /^https:\/\//i.test(String(raw.postbackUrl)) ? String(raw.postbackUrl).slice(0, 2048) : null;
   const dailyCap = Number.isInteger(raw?.dailyCap) && raw.dailyCap > 0 ? raw.dailyCap : null;
   const name = typeof raw?.name === 'string' && raw.name.trim() ? raw.name.trim().slice(0, 200) : null;
-  return { url: urlStr, postbackUrl, dailyCap, name };
+  const networkId = OFFER_ID_RE.test(String(raw?.networkId || '')) ? String(raw.networkId) : null;
+  return { url: urlStr, postbackUrl, dailyCap, name, networkId, archived: raw?.archived === true, group: typeof raw?.group === 'string' ? raw.group.trim().slice(0, 60) : '' };
+}
+
+function parseNetwork(raw) {
+  const name = typeof raw?.name === 'string' ? raw.name.trim().slice(0, 120) : '';
+  if (!name) return null;
+  return { name, offerParams: typeof raw?.offerParams === 'string' ? raw.offerParams.trim().slice(0, 1000) : '', clickIdParam: typeof raw?.clickIdParam === 'string' ? raw.clickIdParam.trim().slice(0, 80) : 'sub1', payoutParam: typeof raw?.payoutParam === 'string' ? raw.payoutParam.trim().slice(0, 80) : 'payout', notes: typeof raw?.notes === 'string' ? raw.notes.slice(0, 2000) : '' };
+}
+async function loadNetworks() {
+  if (db) { try { const { rows } = await db.query('SELECT id,name,offer_params,click_id_param,payout_param,notes FROM networks'); for (const r of rows) { const n=parseNetwork({name:r.name,offerParams:r.offer_params,clickIdParam:r.click_id_param,payoutParam:r.payout_param,notes:r.notes}); if(n) networks.set(r.id,n); } return; } catch (e) { console.warn('[db] networks load fallback:', e.message); } }
+  try { const saved=JSON.parse(await readFile(networksFile,'utf8')); for (const [id,raw] of Object.entries(saved||{})) if (OFFER_ID_RE.test(id) && parseNetwork(raw)) networks.set(id,parseNetwork(raw)); } catch (e) { if(e.code!=='ENOENT') console.warn('[networks] invalid config ignored'); }
+}
+async function saveNetworks() { await mkdir(dataDir,{recursive:true}); await writeFile(networksFile,JSON.stringify(Object.fromEntries(networks),null,2)+'\n'); }
+async function persistNetwork(id,v) { if(db) await db.query('INSERT INTO networks (id,name,offer_params,click_id_param,payout_param,notes) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,offer_params=EXCLUDED.offer_params,click_id_param=EXCLUDED.click_id_param,payout_param=EXCLUDED.payout_param,notes=EXCLUDED.notes',[id,v.name,v.offerParams,v.clickIdParam,v.payoutParam,v.notes]); else await saveNetworks(); }
+
+function parseSource(raw) {
+  const name = typeof raw?.name === 'string' ? raw.name.trim().slice(0, 120) : '';
+  if (!name) return null;
+  const paramMap = parseParamMap(raw?.paramMap);
+  const costModel = raw?.costModel === 'cpc' ? 'cpc' : 'none';
+  const cpc = Number.isFinite(Number(raw?.cpc)) && Number(raw.cpc) >= 0 ? Number(raw.cpc) : null;
+  return { name, paramMap, costModel, cpc, costFromParam: typeof raw?.costFromParam === 'string' ? raw.costFromParam.trim().slice(0, 64) || null : null };
+}
+
+async function loadSources() {
+  if (db) {
+    try {
+      const { rows } = await db.query('SELECT id, name, param_map, cost_model, cpc, cost_from_param FROM sources');
+      for (const row of rows) { const source = parseSource({ name: row.name, paramMap: row.param_map, costModel: row.cost_model, cpc: row.cpc, costFromParam: row.cost_from_param }); if (source) sources.set(row.id, source); }
+      return;
+    } catch (error) { console.warn('[db] sources load fallback:', error.message); }
+  }
+  try {
+    const saved = JSON.parse(await readFile(sourcesFile, 'utf8'));
+    for (const [id, raw] of Object.entries(saved || {})) if (OFFER_ID_RE.test(id) && parseSource(raw)) sources.set(id, parseSource(raw));
+  } catch (error) { if (error.code !== 'ENOENT') console.warn('[sources] invalid config ignored'); }
+}
+async function saveSources() { await mkdir(dataDir, { recursive: true }); await writeFile(sourcesFile, JSON.stringify(Object.fromEntries(sources), null, 2) + '\n'); }
+async function persistSource(id, value) {
+  if (db) await db.query('INSERT INTO sources (id, name, param_map, cost_model, cpc, cost_from_param) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,param_map=EXCLUDED.param_map,cost_model=EXCLUDED.cost_model,cpc=EXCLUDED.cpc,cost_from_param=EXCLUDED.cost_from_param', [id, value.name, value.paramMap, value.costModel, value.cpc, value.costFromParam]);
+  else await saveSources();
 }
 
 async function loadOffers() {
   if (db) {
     try {
-      const { rows } = await db.query('SELECT id, url, postback_url, daily_cap, name FROM offers');
-      for (const row of rows) if (/^[a-z0-9_-]{2,80}$/i.test(row.id) && /^https:\/\//i.test(row.url)) offers.set(row.id, parseOffer({ url: row.url, postbackUrl: row.postback_url, dailyCap: row.daily_cap, name: row.name }));
+      const { rows } = await db.query('SELECT id, url, postback_url, daily_cap, name, network_id, "group" FROM offers');
+      for (const row of rows) if (/^[a-z0-9_-]{2,80}$/i.test(row.id) && /^https:\/\//i.test(row.url)) offers.set(row.id, parseOffer({ url: row.url, postbackUrl: row.postback_url, dailyCap: row.daily_cap, name: row.name, networkId: row.network_id, group: row.group }));
       return;
     } catch (error) { console.warn('[db] offers load fallback:', error.message); }
   }
@@ -495,14 +541,16 @@ async function saveOffers() {
 
 async function persistOffer(id, value) {
   const offer = typeof value === 'string' ? { url: value, postbackUrl: null } : value;
-  if (db) await db.query('INSERT INTO offers (id, url, postback_url, daily_cap, name) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO UPDATE SET url = EXCLUDED.url, postback_url = EXCLUDED.postback_url, daily_cap = EXCLUDED.daily_cap, name = EXCLUDED.name', [id, offer.url, offer.postbackUrl, offer.dailyCap ?? null, offer.name ?? null]);
+  if (db) await db.query('INSERT INTO offers (id, url, postback_url, daily_cap, name, network_id, "group") VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (id) DO UPDATE SET url = EXCLUDED.url, postback_url = EXCLUDED.postback_url, daily_cap = EXCLUDED.daily_cap, name = EXCLUDED.name, network_id = EXCLUDED.network_id, "group" = EXCLUDED."group"', [id, offer.url, offer.postbackUrl, offer.dailyCap ?? null, offer.name ?? null, offer.networkId ?? null, offer.group ?? '']);
   else await saveOffers();
 }
 
 function parseCampaign(id, value) {
   return {
     name: String(value.name || id).slice(0, 120),
-    active: value.active !== false,
+    group: typeof value.group === 'string' ? value.group.trim().slice(0, 60) : '',
+    active: value.archived === true ? false : value.active !== false,
+    archived: value.archived === true,
     streams: parseStreams(value.streams),
     dailyCap: Number.isInteger(value.dailyCap) && value.dailyCap > 0 ? value.dailyCap : null,
     capUrl: value.capUrl && /^https:\/\//i.test(String(value.capUrl)) ? String(value.capUrl).slice(0, 2048) : null,
@@ -525,6 +573,7 @@ function parseCampaign(id, value) {
     streamRotation: value.streamRotation === 'position' ? 'position' : 'weight',
     uniquenessHours: Number.isInteger(value.uniquenessHours) && value.uniquenessHours >= 1 && value.uniquenessHours <= 720 ? value.uniquenessHours : 24,
     ownerId: /^[0-9a-f-]{36}$/i.test(String(value.ownerId || '')) ? String(value.ownerId).toLowerCase() : null,
+    sourceId: OFFER_ID_RE.test(String(value.sourceId || '')) ? String(value.sourceId) : null,
     redirectMethod: REDIRECT_METHODS.includes(value.redirectMethod) ? value.redirectMethod : 'http',
     blockedIps: parseIpRules(value.blockedIps),
     allowedIps: parseIpRules(value.allowedIps),
@@ -893,22 +942,28 @@ function dashboard(res) {
   let lastStats={};
   async function render(q={}){
     const p=new URLSearchParams(q);
-    const [s,o,c,ts]=await Promise.all([fetch('/stats?'+p).then(r=>r.json()),fetch('/api/offers').then(r=>r.json()),fetch('/api/campaigns').then(r=>r.json()),fetch('/stats/timeseries?from='+new Date(Date.now()-6*86400000).toISOString().slice(0,10)).then(r=>r.json())]);
+    const compareUrl=q.from&&q.to?('/stats/compare?from='+encodeURIComponent(q.from)+'&to='+encodeURIComponent(q.to)):null;
+    const paramField=q.param||'sub_id_1';
+    const [s,o,c,ts,src,net,cmp,pr,bots]=await Promise.all([fetch('/stats?'+p).then(r=>r.json()),fetch('/api/offers').then(r=>r.json()),fetch('/api/campaigns').then(r=>r.json()),fetch('/stats/timeseries?from='+new Date(Date.now()-6*86400000).toISOString().slice(0,10)).then(r=>r.json()),fetch('/api/sources').then(r=>r.json()),fetch('/api/networks').then(r=>r.json()),compareUrl?fetch(compareUrl).then(r=>r.json()):Promise.resolve(null),fetch('/stats/params?field='+encodeURIComponent(paramField)+(q.from?'&from='+q.from:'')+(q.to?'&to='+q.to:'')).then(r=>r.json()),fetch('/stats/bots'+(q.from?'?from='+q.from+(q.to?'&to='+q.to:''):'')).then(r=>r.json())]);
     lastStats=s;
     const campRows=Object.entries(s.byCampaign).map(([name,v])=>'<tr><td><a href="?campaign='+encodeURIComponent(name)+'" style="color:#087f7b;text-decoration:none;font-weight:650">'+esc(name)+'</a></td><td>'+v.clicks+'</td><td>'+v.conversions+'</td><td>'+((v.conversions/Math.max(v.clicks,1))*100).toFixed(2)+'%</td><td>'+fmt(v.revenue)+'</td></tr>').join('');
     const ctryRows=Object.entries(s.byCountry||{}).sort((a,b)=>b[1].clicks-a[1].clicks).slice(0,15).map(([ctry,v])=>'<tr><td>'+ctry+'</td><td>'+v.clicks+'</td><td>'+v.conversions+'</td><td>'+fmt(v.revenue)+'</td></tr>').join('');
     const offerRows=Object.entries(s.byOffer||{}).sort((a,b)=>b[1].clicks-a[1].clicks).map(([id,v])=>'<tr><td>'+id+'</td><td>'+v.clicks+'</td><td>'+v.conversions+'</td><td>'+((v.conversions/Math.max(v.clicks,1))*100).toFixed(2)+'%</td><td>'+fmt(v.revenue)+'</td></tr>').join('');
     const streamRows=Object.entries(s.byStream||{}).sort((a,b)=>b[1].clicks-a[1].clicks).map(([name,v])=>'<tr><td>'+esc(name)+'</td><td>'+v.clicks+'</td><td>'+v.conversions+'</td><td>'+((v.cr||0)*100).toFixed(2)+'%</td><td>'+fmt(v.revenue)+'</td><td>'+fmt(v.epc)+'</td></tr>').join('');
-    const offerList=Object.entries(o.offers).map(([id,v])=>'<li><b>'+esc(id)+'</b> — '+esc(typeof v==='string'?v:v.url)+(v.postbackUrl?' <small>[S2S]</small>':'')+'</li>').join('');
-    const campList=Object.entries(c.campaigns).map(([id,v])=>'<li><b>'+esc(id)+'</b> — '+esc(v.name)+' <button data-campaign="'+esc(id)+'" data-active="'+(!v.active)+'">'+(v.active?'Выключить':'Включить')+'</button></li>').join('');
+    const paramRows=(pr.rows||[]).map(v=>'<tr><td>'+esc(v.value||'(не передан)')+'</td><td>'+v.clicks+'</td><td>'+v.conversions+'</td><td>'+fmt(v.revenue)+'</td></tr>').join('');
+    const offerList=Object.entries(o.offers).map(([id,v])=>'<li><input type="checkbox" data-offer-select="'+esc(id)+'"> <b>'+esc(id)+'</b> — '+esc(typeof v==='string'?v:v.url)+(v.group?' <small>['+esc(v.group)+']</small>':'')+(v.postbackUrl?' <small>[S2S]</small>':'')+(v.networkId&&net.networks?.[v.networkId]?' <small>['+esc(net.networks[v.networkId].name)+']</small>':'')+' <button data-offer-action="clone" data-offer="'+esc(id)+'">Копировать</button> <button data-offer-action="archive" data-offer="'+esc(id)+'">'+(v.archived?'Восстановить':'В архив')+'</button></li>').join('');
+    const campList=Object.entries(c.campaigns).map(([id,v])=>'<li><b>'+esc(id)+'</b> — '+esc(v.name)+(v.group?' <small>['+esc(v.group)+']</small>':'')+' <button data-campaign="'+esc(id)+'" data-active="'+(!v.active)+'">'+(v.active?'Выключить':'Включить')+'</button> <button data-campaign-action="clone" data-campaign-id="'+esc(id)+'">Копировать</button> <button data-campaign-action="archive" data-campaign-id="'+esc(id)+'">'+(v.archived?'Восстановить':'В архив')+'</button></li>').join('');
     const campOpts='<option value="">Все кампании</option>'+Object.keys(c.campaigns).map(id=>'<option>'+id+'</option>').join('');
+    const sourceOpts='<option value="">Без источника</option>'+Object.entries(src.sources||{}).map(([id,v])=>'<option value="'+esc(id)+'">'+esc(v.name)+' ('+esc(id)+')</option>').join('');
+    const networkOpts='<option value="">Без сети</option>'+Object.entries(net.networks||{}).map(([id,v])=>'<option value="'+esc(id)+'">'+esc(v.name)+' ('+esc(id)+')</option>').join('');
     const inp=k=>'<input id="f-'+k+'" '+(k==='from'||k==='to'?'type="date"':'placeholder="'+(k==='country'?'Страна (US)':'Оффер')+'"')+' style="font:inherit;border-radius:10px;padding:10px;border:1px solid #b8ded9;background:#fff;width:130px">';
     const spark=ts&&ts.series&&ts.series.length?'<div style="font-family:monospace;font-size:18px;letter-spacing:2px;color:#1a7f6e;margin:-6px 0 6px;line-height:1" title="Клики за 7 дней">'+sparkline(ts.series)+'</div><div style="font-size:11px;color:#999;margin-bottom:8px">7 дней</div>':'';
     document.querySelector('#app').innerHTML=
-      '<div class="cards"><div class="card"><div class="muted">Клики</div><div class="value">'+s.clicks+'</div>'+spark+'</div>'
-      +'<div class="card"><div class="muted">Конверсии</div><div class="value">'+s.conversions+'</div></div>'
+      '<div class="cards"><div class="card"><div class="muted">Клики</div><div class="value">'+s.clicks+'</div>'+spark+(cmp?.deltaPct?.clicks!=null?'<small>Δ '+cmp.deltaPct.clicks+'%</small>':'')+'</div>'
+      +'<div class="card"><div class="muted">Конверсии</div><div class="value">'+s.conversions+'</div>'+(cmp?.deltaPct?.conversions!=null?'<small>Δ '+cmp.deltaPct.conversions+'%</small>':'')+'</div>'
       +'<div class="card"><div class="muted">CR</div><div class="value">'+((s.conversions/Math.max(s.clicks,1))*100).toFixed(2)+'%</div></div>'
-      +'<div class="card"><div class="muted">Revenue</div><div class="value">'+fmt(s.revenue)+'</div></div></div>'
+      +'<div class="card"><div class="muted">Revenue</div><div class="value">'+fmt(s.revenue)+'</div>'+(cmp?.deltaPct?.revenue!=null?'<small>Δ '+cmp.deltaPct.revenue+'%</small>':'')+'</div></div>'
+      +(bots.total>0?'<div class="card" style="margin-bottom:20px"><div class="muted">Боты</div><div class="value">'+bots.total+'</div><small>Доля: '+((bots.total/Math.max(s.clicks+bots.total,1))*100).toFixed(2)+'%</small></div>':'')
       +'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px;align-items:center">'
       +'<select id="f-campaign" style="font:inherit;border-radius:10px;padding:10px 13px;border:1px solid #b8ded9;background:#fff">'+campOpts+'</select>'
       +inp('from')+inp('to')+inp('country')+inp('offer')
@@ -918,17 +973,29 @@ function dashboard(res) {
       +'<h2>По кампаниям</h2>'+tbl(campRows,['Кампания','Клики','Конв.','CR','Revenue'])
       +(offerRows?'<h2>По офферам</h2>'+tbl(offerRows,['Оффер','Клики','Конв.','CR','Revenue']):'')
       +(streamRows?'<h2>По потокам</h2>'+tbl(streamRows,['Поток','Клики','Конв.','CR','Revenue','EPC']):'')
+      +'<h2>По параметру</h2><div style="margin-bottom:8px"><select id="f-param" style="font:inherit;border-radius:10px;padding:10px;border:1px solid #b8ded9;background:#fff"><option value="sub_id_1">sub_id_1</option><option value="source">source</option><option value="keyword">keyword</option><option value="creative_id">creative_id</option></select><button id="f-param-apply">Показать</button></div>'+tbl(paramRows,['Значение','Клики','Конв.','Revenue'])
       +(ctryRows?'<h2>По странам (топ-15)</h2>'+tbl(ctryRows,['Страна','Клики','Конв.','Revenue']):'')
-      +'<h2>Добавить оффер</h2><form id="offer-form"><input name="id" placeholder="offer-id" required pattern="[A-Za-z0-9_-]{2,80}"><input name="url" type="url" placeholder="https://..." required><input name="postbackUrl" type="url" placeholder="S2S URL (необязательно)"><button>Сохранить</button></form>'
-      +'<h2>Офферы</h2><ul>'+(offerList||'<li>Пока нет офферов</li>')+'</ul>'
-      +'<h2>Кампании</h2><form id="campaign-form"><input name="id" placeholder="campaign-id" required pattern="[A-Za-z0-9_-]{2,80}"><input name="name" placeholder="Название" required><button>Создать</button></form>'
-      +'<ul>'+(campList||'<li>Нет кампаний</li>')+'</ul>';
+      +'<h2>Добавить оффер</h2><form id="offer-form"><input name="id" placeholder="offer-id" required pattern="[A-Za-z0-9_-]{2,80}"><input name="url" type="url" placeholder="https://..." required><input name="group" placeholder="Группа (необязательно)" maxlength="60"><input name="postbackUrl" type="url" placeholder="S2S URL (необязательно)"><select name="networkId" style="font:inherit;border-radius:10px;padding:10px 13px;border:1px solid #b8ded9;background:#fff">'+networkOpts+'</select><button>Сохранить</button></form>'
+      +'<h2>Офферы</h2><button id="bulk-offer-archive" style="background:#1a7f6e">Архивировать выбранные</button><ul>'+(offerList||'<li>Пока нет офферов</li>')+'</ul>'
+      +'<h2>Кампании</h2><form id="campaign-form"><input name="id" placeholder="campaign-id" required pattern="[A-Za-z0-9_-]{2,80}"><input name="name" placeholder="Название" required><input name="group" placeholder="Группа (необязательно)" maxlength="60"><select name="sourceId" style="font:inherit;border-radius:10px;padding:10px 13px;border:1px solid #b8ded9;background:#fff">'+sourceOpts+'</select><button>Создать</button></form>'
+      +'<h2>Источники</h2><form id="source-form"><input name="id" placeholder="source-id" required pattern="[A-Za-z0-9_-]{2,80}"><input name="name" placeholder="Название источника" required><select name="costModel" style="font:inherit;border-radius:10px;padding:10px;border:1px solid #b8ded9;background:#fff"><option value="none">Без CPC</option><option value="cpc">CPC</option></select><input name="cpc" type="number" min="0" step="0.000001" placeholder="CPC"><input name="paramMap" placeholder="Параметры JSON: {&quot;sub_id_1&quot;:&quot;ad_id&quot;}"><button>Добавить источник</button></form><ul>'+(Object.entries(src.sources||{}).map(([id,v])=>'<li><b>'+esc(id)+'</b> — '+esc(v.name)+' <small>('+esc(v.costModel||'none')+')</small></li>').join('')||'<li>Источники пока не созданы</li>')+'</ul>'
+      +'<h2>Партнёрские сети</h2><form id="network-form"><input name="id" placeholder="network-id" required pattern="[A-Za-z0-9_-]{2,80}"><input name="name" placeholder="Название сети" required><input name="clickIdParam" placeholder="click id: sub1"><input name="payoutParam" placeholder="payout: payout"><button>Добавить сеть</button></form><ul>'+(Object.entries(net.networks||{}).map(([id,v])=>'<li><b>'+esc(id)+'</b> — '+esc(v.name)+' <small>click: '+esc(v.clickIdParam||'sub1')+', payout: '+esc(v.payoutParam||'payout')+'</small></li>').join('')||'<li>Сети пока не созданы</li>')+'</ul>'
+      +'<ul>'+(campList||'<li>Нет кампаний</li>')+'</ul>'
+      +'<h2>Тренды</h2><div><select id="trend-campaigns" multiple size="4" style="min-width:220px;font:inherit;border:1px solid #b8ded9;border-radius:10px;padding:8px">'+Object.keys(c.campaigns).map(id=>'<option value="'+esc(id)+'">'+esc(id)+'</option>').join('')+'</select><select id="trend-metric" style="font:inherit;border:1px solid #b8ded9;border-radius:10px;padding:10px"><option value="clicks">Клики</option><option value="conversions">Конверсии</option><option value="revenue">Доход</option></select><button id="trend-load">Показать</button></div><div id="trend-output" class="muted" style="margin-top:10px">Выберите до пяти кампаний</div>';
     for(const key of ['campaign','from','to','country','offer','stream'])document.querySelector('#f-'+key).value=q[key]||'';
+    document.querySelector('#f-param').value=paramField;
+    document.querySelector('#f-param-apply').onclick=()=>render({...q,param:document.querySelector('#f-param').value});
     document.querySelector('#f-apply').onclick=()=>{const f={};for(const key of ['campaign','from','to','country','offer','stream']){const value=document.querySelector('#f-'+key).value;if(value)f[key]=value;}render(f);};
     document.querySelector('#f-csv').onclick=()=>{const rows=['campaign,clicks,conversions,cr,revenue',...Object.entries(lastStats.byCampaign||{}).map(([n,v])=>[n,v.clicks,v.conversions,((v.conversions/Math.max(v.clicks,1))*100).toFixed(2),v.revenue.toFixed(2)].join(','))].join('\\n');csvDownload(rows,'stats.csv');};
+    document.querySelector('#trend-load').onclick=async()=>{const ids=[...document.querySelector('#trend-campaigns').selectedOptions].slice(0,5).map(x=>x.value);if(!ids.length)return;const metric=document.querySelector('#trend-metric').value;const rows=await Promise.all(ids.map(async id=>({id,data:(await (await fetch('/stats/timeseries?campaign='+encodeURIComponent(id))).json()).series||[]})));const days=[...new Set(rows.flatMap(x=>x.data.map(v=>v.date)))].sort();document.querySelector('#trend-output').innerHTML=tbl(days.map(day=>'<tr><td>'+day+'</td>'+rows.map(x=>'<td>'+fmt((x.data.find(v=>v.date===day)||{})[metric]||0)+'</td>').join('')+'</tr>').join(''),['День',...rows.map(x=>x.id)]);};
     document.querySelector('#offer-form').onsubmit=async e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.target));if(!body.postbackUrl)delete body.postbackUrl;const r=await fetch('/api/offers',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});if(!r.ok)return alert('Ошибка');render();};
     document.querySelector('#campaign-form').onsubmit=async e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.target));const r=await fetch('/api/campaigns',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});if(!r.ok)return alert('Ошибка');render();};
+    document.querySelector('#source-form').onsubmit=async e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.target));if(body.cpc)body.cpc=Number(body.cpc);if(body.paramMap){try{body.paramMap=JSON.parse(body.paramMap);}catch{return alert('Неверный JSON paramMap');}}else delete body.paramMap;const r=await fetch('/api/sources',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});if(!r.ok)return alert('Ошибка');render();};
+    document.querySelector('#network-form').onsubmit=async e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.target));const r=await fetch('/api/networks',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});if(!r.ok)return alert('Ошибка');render();};
     document.querySelectorAll('[data-campaign]').forEach(b=>b.onclick=async()=>{await fetch('/api/campaigns/'+b.dataset.campaign,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({active:b.dataset.active==='true'})});render();});
+    document.querySelectorAll('[data-campaign-action]').forEach(b=>b.onclick=async()=>{const id=b.dataset.campaignId;if(b.dataset.campaignAction==='clone')await fetch('/api/campaigns/'+id+'/clone',{method:'POST'});else await fetch('/api/campaigns/'+id,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({archived:b.textContent.includes('В архив')})});render();});
+    document.querySelectorAll('[data-offer-action]').forEach(b=>b.onclick=async()=>{const id=b.dataset.offer;if(b.dataset.offerAction==='clone')await fetch('/api/offers/'+id+'/clone',{method:'POST'});else await fetch('/api/offers/'+id,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({archived:b.textContent.includes('В архив')})});render();});
+    document.querySelector('#bulk-offer-archive').onclick=async()=>{const ids=[...document.querySelectorAll('[data-offer-select]:checked')].map(x=>x.dataset.offer);await Promise.all(ids.map(id=>fetch('/api/offers/'+id,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({archived:true})})));render();};
   }
   render();
   </script><script type="module" src="/assets/stream-editor.js"></script><script type="module" src="/assets/event-logs.js"></script></html>`);
@@ -1256,7 +1323,7 @@ const server = http.createServer(async (req, res) => {
     if (match && req.method === 'GET') {
       const [, campaignId, offerId] = match;
       const offer = offers.get(offerId);
-      if (!offer) return json(res, 404, { error: 'offer_not_found' });
+      if (!offer || offer.archived) return json(res, 404, { error: 'offer_not_found' });
       return await handleClick(campaignId, offerId, offer.url);
     }
     if (url.pathname === '/postback' && req.method === 'GET') {
@@ -1400,11 +1467,40 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/offers' && req.method === 'GET') {
       return json(res, 200, { offers: Object.fromEntries(offers) });
     }
+    if (url.pathname === '/api/sources' && req.method === 'GET') {
+      return json(res, 200, { sources: Object.fromEntries(sources) });
+    }
+    if (url.pathname === '/api/networks' && req.method === 'GET') return json(res, 200, { networks: Object.fromEntries(networks) });
+    if (url.pathname === '/api/networks' && req.method === 'POST') {
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      const body=await readJson(req), id=String(body.id||''), network=parseNetwork(body);
+      if(!OFFER_ID_RE.test(id)) return json(res,400,{error:'valid_id_required'}); if(!network) return json(res,400,{error:'name_required'}); if(networks.has(id)) return json(res,409,{error:'network_exists'});
+      networks.set(id,network); await persistNetwork(id,network); await audit(req,'create','network',id,null,network); return json(res,201,{id,...network});
+    }
+    const networkUpdate=url.pathname.match(/^\/api\/networks\/([A-Za-z0-9_-]{2,80})$/);
+    if(networkUpdate && req.method==='PATCH') { if(!(await adminAuthorized(req))) return json(res,401,{error:'admin_authorization_required'}); const id=networkUpdate[1],cur=networks.get(id); if(!cur) return json(res,404,{error:'network_not_found'}); const next=parseNetwork({...cur,...await readJson(req)}); if(!next) return json(res,400,{error:'name_required'}); networks.set(id,next); await persistNetwork(id,next); await audit(req,'update','network',id,cur,next); return json(res,200,{id,...next}); }
+    if (url.pathname === '/api/sources' && req.method === 'POST') {
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      const body = await readJson(req); const id = String(body.id || '');
+      if (!OFFER_ID_RE.test(id)) return json(res, 400, { error: 'valid_id_required' });
+      const source = parseSource(body); if (!source) return json(res, 400, { error: 'name_required' });
+      if (sources.has(id)) return json(res, 409, { error: 'source_exists' });
+      sources.set(id, source); await persistSource(id, source); await audit(req, 'create', 'source', id, null, source);
+      return json(res, 201, { id, ...source });
+    }
+    const sourceUpdate = url.pathname.match(/^\/api\/sources\/([A-Za-z0-9_-]{2,80})$/);
+    if (sourceUpdate && req.method === 'PATCH') {
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      const id = sourceUpdate[1]; const cur = sources.get(id); if (!cur) return json(res, 404, { error: 'source_not_found' });
+      const body = await readJson(req); const next = parseSource({ ...cur, ...body }); if (!next) return json(res, 400, { error: 'name_required' });
+      sources.set(id, next); await persistSource(id, next); await audit(req, 'update', 'source', id, cur, next); return json(res, 200, { id, ...next });
+    }
     if (url.pathname === '/api/offers' && req.method === 'POST') {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const body = await readJson(req);
       if (!/^[a-z0-9_-]{2,80}$/i.test(String(body.id || '')) || !/^https:\/\//i.test(String(body.url || ''))) return json(res, 400, { error: 'id_and_https_url_required' });
-      const offer = parseOffer({ url: String(body.url), postbackUrl: body.postbackUrl, dailyCap: body.dailyCap, name: body.name });
+      if (body.networkId !== undefined && body.networkId !== null && !networks.has(String(body.networkId))) return json(res, 400, { error: 'network_not_found' });
+      const offer = parseOffer({ url: String(body.url), postbackUrl: body.postbackUrl, dailyCap: body.dailyCap, name: body.name, networkId: body.networkId, archived: body.archived, group: body.group });
       if (!offer) return json(res, 400, { error: 'id_and_https_url_required' });
       offers.set(String(body.id), offer);
       await persistOffer(String(body.id), offer);
@@ -1412,6 +1508,13 @@ const server = http.createServer(async (req, res) => {
       return json(res, 201, { id: body.id, ...offer });
     }
     const offerUpdate = url.pathname.match(/^\/api\/offers\/([A-Za-z0-9_-]{2,80})$/);
+    const offerClone = url.pathname.match(/^\/api\/offers\/([A-Za-z0-9_-]{2,80})\/clone$/);
+    if (offerClone && req.method === 'POST') {
+      if (!(await adminAuthorized(req))) return json(res,401,{error:'admin_authorization_required'});
+      const id=offerClone[1],cur=offers.get(id); if(!cur) return json(res,404,{error:'offer_not_found'});
+      let nextId=`${id}-copy`, n=2; while(offers.has(nextId)) nextId=`${id}-copy${n++}`;
+      const copy=parseOffer({...cur,name:`${cur.name||id} (копия)`,archived:false}); offers.set(nextId,copy); await persistOffer(nextId,copy); await audit(req,'create','offer',nextId,null,copy); return json(res,201,{id:nextId,...copy});
+    }
     if (offerUpdate && req.method === 'PATCH') {
       const id = offerUpdate[1];
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
@@ -1421,7 +1524,8 @@ const server = http.createServer(async (req, res) => {
       const newUrl = body.url !== undefined ? String(body.url) : cur.url;
       const newPostbackUrl = body.postbackUrl !== undefined ? body.postbackUrl : cur.postbackUrl;
       const newDailyCap = body.dailyCap !== undefined ? body.dailyCap : cur.dailyCap;
-      const updated = parseOffer({ url: newUrl, postbackUrl: newPostbackUrl, dailyCap: newDailyCap, name: body.name !== undefined ? body.name : cur.name });
+      if (body.networkId !== undefined && body.networkId !== null && !networks.has(String(body.networkId))) return json(res, 400, { error: 'network_not_found' });
+      const updated = parseOffer({ url: newUrl, postbackUrl: newPostbackUrl, dailyCap: newDailyCap, name: body.name !== undefined ? body.name : cur.name, networkId: body.networkId !== undefined ? body.networkId : cur.networkId, archived: body.archived !== undefined ? body.archived : cur.archived, group: body.group !== undefined ? body.group : cur.group });
       if (!updated) return json(res, 400, { error: 'invalid_url' });
       offers.set(id, updated);
       await persistOffer(id, updated);
@@ -1436,25 +1540,38 @@ const server = http.createServer(async (req, res) => {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const body = await readJson(req);
       if (!/^[a-z0-9_-]{2,80}$/i.test(String(body.id || ''))) return json(res, 400, { error: 'valid_id_required' });
+      if (body.sourceId !== undefined && body.sourceId !== null && !sources.has(String(body.sourceId))) return json(res, 400, { error: 'source_not_found' });
       if (campaigns.has(String(body.id)) && !canEditCampaign(req, campaigns.get(String(body.id)))) return json(res, 403, { error: 'campaign_not_yours' });
       // A buyer's new campaign is always theirs; the owner may assign it to someone.
       const ownerId = isBuyer(req) ? req.user.id : (body.ownerId ?? req.user?.id ?? null);
-      campaigns.set(String(body.id), parseCampaign(String(body.id), { ...body, ownerId }));
+      const sourceDefaults = body.sourceId ? sources.get(String(body.sourceId)) : null;
+      campaigns.set(String(body.id), parseCampaign(String(body.id), { ...body, ownerId,
+        ...(sourceDefaults ? { paramMap: body.paramMap ?? sourceDefaults.paramMap, costModel: body.costModel ?? sourceDefaults.costModel, cpc: body.cpc ?? sourceDefaults.cpc } : {}) }));
       await persistCampaign(String(body.id), campaigns.get(String(body.id)));
       await audit(req, 'create', 'campaign', String(body.id), null, campaigns.get(String(body.id)));
       return json(res, 201, { id: body.id, ...campaigns.get(String(body.id)) });
     }
     const campaignUpdate = url.pathname.match(/^\/api\/campaigns\/([A-Za-z0-9_-]{2,80})$/);
+    const campaignClone = url.pathname.match(/^\/api\/campaigns\/([A-Za-z0-9_-]{2,80})\/clone$/);
+    if (campaignClone && req.method === 'POST') {
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      const id=campaignClone[1], cur=campaigns.get(id); if(!cur) return json(res,404,{error:'campaign_not_found'}); if(!canEditCampaign(req,cur)) return json(res,403,{error:'campaign_not_yours'});
+      let nextId=`${id}-copy`, n=2; while(campaigns.has(nextId)) nextId=`${id}-copy${n++}`;
+      const copy=parseCampaign(nextId,{...cur,name:`${cur.name} (копия)`,active:false,archived:false}); campaigns.set(nextId,copy); await persistCampaign(nextId,copy); await audit(req,'create','campaign',nextId,null,copy); return json(res,201,{id:nextId,...copy});
+    }
     if (campaignUpdate && req.method === 'PATCH') {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const id = campaignUpdate[1];
       if (!campaigns.has(id)) return json(res, 404, { error: 'campaign_not_found' });
       if (!canEditCampaign(req, campaigns.get(id))) return json(res, 403, { error: 'campaign_not_yours' });
       const body = await readJson(req);
+      if (body.sourceId !== undefined && body.sourceId !== null && !sources.has(String(body.sourceId))) return json(res, 400, { error: 'source_not_found' });
       const cur = campaigns.get(id);
       campaigns.set(id, parseCampaign(id, {
         name: body.name === undefined ? cur.name : body.name,
-        active: body.active === undefined ? cur.active : body.active,
+        group: body.group === undefined ? cur.group : body.group,
+        active: body.archived === true ? false : (body.active === undefined ? cur.active : body.active),
+        archived: body.archived === undefined ? cur.archived : body.archived,
         streams: body.streams === undefined ? cur.streams : body.streams,
         dailyCap: body.dailyCap === undefined ? cur.dailyCap : body.dailyCap,
         capUrl: body.capUrl === undefined ? cur.capUrl : body.capUrl,
@@ -1471,6 +1588,7 @@ const server = http.createServer(async (req, res) => {
         streamRotation: body.streamRotation === undefined ? cur.streamRotation : body.streamRotation,
         uniquenessHours: body.uniquenessHours === undefined ? cur.uniquenessHours : body.uniquenessHours,
         ownerId: body.ownerId === undefined || req.user?.role === 'buyer' ? cur.ownerId : body.ownerId,
+        sourceId: body.sourceId === undefined ? cur.sourceId : body.sourceId,
         redirectMethod: body.redirectMethod === undefined ? cur.redirectMethod : body.redirectMethod,
         blockedIps: body.blockedIps === undefined ? cur.blockedIps : body.blockedIps,
         allowedIps: body.allowedIps === undefined ? cur.allowedIps : body.allowedIps,
@@ -1619,6 +1737,21 @@ const server = http.createServer(async (req, res) => {
       const pCurrency = reportCurrency(url.searchParams.get('currency'));
       return json(res, 200, { field, currency: pCurrency, rows: await paramReport({ field, campaign: pCampaign, allowed: req.scope?.allowed || null, from: pFrom, to: pTo, currency: pCurrency }) });
     }
+    if (url.pathname === '/stats/bots' && req.method === 'GET') {
+      const campaign = url.searchParams.get('campaign') || null;
+      const from = url.searchParams.get('from') || null; const to = url.searchParams.get('to') || null;
+      if ((from && !/^\d{4}-\d{2}-\d{2}$/.test(from)) || (to && !/^\d{4}-\d{2}-\d{2}$/.test(to))) return json(res, 400, { error: 'invalid_date' });
+      const fromMs = from ? Date.parse(`${from}T00:00:00Z`) : -Infinity; const toMs = to ? Date.parse(`${to}T23:59:59Z`) : Infinity;
+      try {
+        const lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map(JSON.parse);
+        const byCampaign = {};
+        for (const item of lines) if (item.type === 'bot' && (!campaign || item.campaign === campaign) && (!req.scope?.allowed || req.scope.allowed.includes(item.campaign))) {
+          const at = Date.parse(item.at || item.created_at || ''); if (at < fromMs || at > toMs) continue;
+          byCampaign[item.campaign] = (byCampaign[item.campaign] || 0) + 1;
+        }
+        return json(res, 200, { total: Object.values(byCampaign).reduce((a, b) => a + b, 0), byCampaign });
+      } catch (error) { if (error.code === 'ENOENT') return json(res, 200, { total: 0, byCampaign: {} }); throw error; }
+    }
     if (url.pathname === '/stats/paths' && req.method === 'GET') {
       const pathCampaign = url.searchParams.get('campaign') || null;
       const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit') || 20)));
@@ -1651,8 +1784,11 @@ const server = http.createServer(async (req, res) => {
 await rates.start();
 await loadSettings();
 await loadOffers();
+await loadSources();
+await loadNetworks();
 await loadLandings();
 await loadCampaigns();
+if (requirePostgres && !db) throw new Error('REQUIRE_POSTGRES=1, но PostgreSQL недоступен');
 server.listen(port, '127.0.0.1', () => console.log(`Product Umbrella listening on http://127.0.0.1:${server.address().port}`));
 
 async function shutdown() { await new Promise((resolve) => server.close(resolve)); await eventMirror?.drain(); await closeDb(); process.exit(0); }

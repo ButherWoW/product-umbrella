@@ -156,6 +156,19 @@ body.auth-mode .view { margin-left: 0; display: grid; place-items: start center;
 .auth-card { width: min(420px, 100%); display: grid; gap: 4px; }
 .auth-card h1 { margin-bottom: 6px; }
 @media (max-width: 520px) { .user-box .muted { display: none; } }
+@media (max-width: 600px) {
+  .table-wrap { overflow-x: visible; border: 0; background: transparent; }
+  table.grid, table.grid thead, table.grid tbody, table.grid tr, table.grid td { display: block; width: 100%; }
+  table.grid thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  table.grid tr { margin: 0 0 10px; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
+  table.grid td { display: flex; justify-content: space-between; gap: 12px; white-space: normal; padding: 5px 0; border-bottom: 1px solid var(--line); text-align: right; }
+  table.grid td:last-child { border-bottom: 0; }
+  table.grid td::before { content: attr(data-label); color: var(--fg-2); text-align: left; font-weight: 500; }
+  table.grid td.name { max-width: none; }
+  .filters, .filter-bar { display: grid; grid-template-columns: 1fr; gap: 8px; }
+  .modal-back { padding: 0; }
+  .modal { min-height: 100vh; width: 100%; border: 0; border-radius: 0; padding: 14px; }
+}
 [hidden] { display: none !important; }
 .attribution { margin: 24px 12px 0; font-size: 11px; }
 .attribution a { color: var(--fg-3); }

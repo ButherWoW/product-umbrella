@@ -17,6 +17,137 @@
 
 - dev2: задача 4 (источники, PR #4) — убери свой бэкенд и миграцию, делай UI в /admin поверх `/api/sources` из #13. Задачи 5 (сети), 6 (архив/копии), 7 (группы), 10 (массовые действия) — бэкенд уже есть (`/api/networks`, `archived`, `/clone`, `group`), только UI в /admin.
 - dev3: PR #10 — убери свой блок `/stats/bots` из server.js (он есть в #13), оставь плитку, колонки и тест.
+## @claude 2026-10-30 — live PostgreSQL verification attempt
+
+Проверка выполнена через `~/shared-secrets.env` без вывода секретов. Подключение к Live PostgreSQL не прошло: сервер ответил `password authentication failed for user "affiliate"`; миграции не запускались. Код и секреты не изменялись.
+
+### Вопрос Claude
+
+Проверь актуальный пароль роли `affiliate` и корректный `DATABASE_URL` для Live PostgreSQL. Не записывай секреты в Git и не публикуй их в чате; достаточно указать, какой env-файл должен использоваться и когда credentials обновлены.
+
+## @claude 2026-10-30 — admin mobile layout
+
+Админ-панель адаптирована для экранов до 600px: таблицы превращаются в карточки с подписями колонок, фильтры складываются в одну колонку, модальные окна занимают весь экран. `dataTable` теперь добавляет `data-label` к ячейкам. Тесты: 47 passed, 3 skipped.
+
+## @claude 2026-10-30 — production deployment preparation
+
+Добавлен безопасный `scripts/backup-postgres.sh` с timestamped gzip dump через `DATABASE_URL`, а README дополнен production checklist: секреты, миграции, HTTPS proxy, backup/restore и post-deploy health checks. Скрипт не запускался автоматически. Тесты: 47 passed, 3 skipped.
+
+## @claude 2026-10-30 — anti-fraud bot statistics
+
+Добавлен `GET /stats/bots?campaign=&from=&to=` с подсчётом событий `bot`, фильтрацией дат и scope баера. Dashboard показывает плитку ботов и Bot% только при наличии ботов. Smoke проверяет нулевой отчёт. Тесты: 47 passed, 3 skipped.
+
+## @claude 2026-10-30 — roadmap D1 OpenAPI
+
+Добавлены `docs/openapi.json` (OpenAPI 3.1) с tracking, stats, management и log routes, схемами bearer/cookie auth и базовыми ошибками. Добавлен `test/openapi.test.mjs`, проверяющий JSON и наличие ключевых маршрутов. Тесты: 47 passed, 3 skipped.
+
+## @claude 2026-10-30 — roadmap D2 trends
+
+В dashboard добавлен раздел «Тренды»: выбор до 5 кампаний, метрика клики/конверсии/доход и таблица день × кампания из `/stats/timeseries`. Smoke: 46 passed, 3 skipped.
+
+## @claude 2026-10-30 — roadmap task 3 completed
+
+В dashboard подключён отчёт по параметрам через `/stats/params`: выбор `sub_id_1`, `source`, `keyword`, `creative_id`, таблица значений с кликами, конверсиями и revenue. Smoke: 46 passed, 3 skipped.
+
+## @claude 2026-10-30 — roadmap task 4 completed
+
+Пункт 4 «Источники трафика» доведён до рабочего состояния: API, JSON/PostgreSQL storage, `sourceId` у кампании, автоматические defaults, dashboard-форма с `costModel`, CPC и JSON `paramMap`, список источников и smoke-проверки.
+
+## @claude 2026-10-30 — PostgreSQL integration test foundation
+
+Добавлен `test/postgres.integration.test.mjs`: при наличии `DATABASE_URL` проверяет наличие основных таблиц (`campaigns`, `offers`, `sources`, `networks`, `clicks`, `conversions`) и критичных колонок `offers`, `sources`. Без БД тест пропускается. Текущий прогон: 46 passed, 3 skipped.
+
+## @claude 2026-10-30 — bulk offer archive
+
+В dashboard добавлены чекбоксы офферов и кнопка «Архивировать выбранные», выполняющая PATCH для каждого выбранного оффера. Smoke после повторного запуска: 46 passed, 2 skipped.
+
+## @claude 2026-10-30 — final integrity audit of current block
+
+Проверены `git diff --check`, синтаксис `server.js`, `migrate.js`, `smoke.mjs` и соответствие новых таблиц/колонок в `schema.sql` и миграции. Ошибок синтаксиса, whitespace и рассинхронизации новых полей не найдено.
+
+## @claude 2026-10-30 — smoke coverage for new management APIs
+
+Smoke-тест расширен проверками создания источника, партнёрской сети, привязки source/network и клонирования кампании/оффера. Полный прогон: 46 passed, 2 skipped, 0 failed.
+
+## @claude 2026-10-30 — README API sync
+
+README синхронизирован с реализованными API источников, партнёрских сетей, source defaults, архивирования и клонирования. Документация теперь отражает JSON/PostgreSQL storage и реальные маршруты.
+
+## @claude 2026-10-30 — source defaults on campaign creation
+
+При создании кампании с `sourceId` backend автоматически подставляет `paramMap`, `costModel` и `cpc` из источника, если эти поля не переданы вручную. Ручные значения имеют приоритет. Тесты: 46 passed, 2 skipped.
+
+## @claude 2026-10-30 — full period deltas in cards
+
+Карточки dashboard теперь показывают delta предыдущего периода для кликов, конверсий и revenue, если выбраны `from/to`. Тесты: 46 passed, 2 skipped.
+
+## @claude 2026-10-30 — compare period in dashboard
+
+Dashboard теперь вызывает `/stats/compare`, когда задан период `from/to`, и показывает delta по кликам в карточке метрик. Без выбранного периода поведение прежнее. Тесты: 46 passed, 2 skipped.
+
+## @claude 2026-10-30 — create sources/networks from dashboard
+
+В dashboard добавлены формы создания источника и партнёрской сети. Источник поддерживает CPC, сеть — click ID и payout-параметры. Формы используют защищённые POST API и обновляют страницу после создания. Тесты: 46 passed, 2 skipped.
+
+## @claude 2026-10-30 — archive/clone dashboard actions
+
+В списках dashboard добавлены кнопки «Копировать» и «В архив/Восстановить» для кампаний и офферов. Кнопки используют backend clone/PATCH API и обновляют список после операции. Тесты: 46 passed, 2 skipped.
+
+## @claude 2026-10-30 — groups in dashboard
+
+В dashboard добавлены поля группы в формы создания кампании/оффера и отображение группы в списках. Ограничение `maxlength=60` совпадает с backend-нормализацией. Тесты: 46 passed, 2 skipped.
+
+## @claude 2026-10-30 — campaign and offer groups
+
+Добавлено поле `group` (до 60 символов) у кампаний и офферов. Кампании хранят его в config JSONB, офферы — в JSON fallback и отдельной PostgreSQL-колонке. POST/PATCH сохраняют значение, старые записи совместимы. Тесты: 46 passed, 2 skipped.
+
+## @claude 2026-10-30 — archive and clone backend
+
+Добавлены `archived` для кампаний/офферов, архивная кампания автоматически становится inactive, архивные офферы исключаются из выбора и прямого `/r/:campaign/:offer`. Добавлены `POST /api/campaigns/:id/clone` и `POST /api/offers/:id/clone` с независимым id `-copy`, `-copy2`… и выключенным состоянием. Тесты: 46 passed, 2 skipped.
+
+## @claude 2026-10-30 — networks in dashboard
+
+Dashboard теперь загружает `/api/networks`, показывает список партнёрских сетей, отображает сеть у оффера и даёт выбрать `networkId` при создании оффера. Тесты: 46 passed, 2 skipped.
+
+## @claude 2026-10-30 — affiliate networks backend
+
+Добавлены партнёрские сети: `GET/POST /api/networks`, `PATCH /api/networks/:id`, JSON fallback + PostgreSQL-таблица `networks`; оффер получил `networkId`, поле загружается/сохраняется в БД и проверяется при POST/PATCH. Добавлена миграция и schema. Тесты: 46 passed, 2 skipped.
+
+## @claude 2026-10-30 — source selector in dashboard
+
+В Tiffany dashboard добавлена загрузка `/api/sources`, список источников и поле выбора `sourceId` в форме создания кампании. Existing campaigns remain compatible; empty selection sends no source. Tests green: 46 passed, 2 skipped.
+
+## @claude 2026-10-30 — campaign/source binding
+
+Кампания теперь хранит `sourceId`: поле проходит через parse/load/save/POST/PATCH, а API отклоняет неизвестный источник (`source_not_found`). Это backend-основа под выбор источника в редакторе; шаблон `paramMap` пока не копируется автоматически в параметры кампании, чтобы не перезаписывать ручные настройки.
+
+## @claude 2026-10-30 — traffic sources PostgreSQL persistence
+
+Источники подключены к dual-storage: добавлена таблица `sources` и idempotent-миграция (`param_map`, `cost_model`, `cpc`, `cost_from_param`), загрузка и upsert используют PostgreSQL при доступной БД, JSON остаётся fallback. Тесты: 46 passed, 2 skipped, 0 failed.
+
+## @claude 2026-10-30 — traffic sources backend foundation
+
+Закрыл backend-часть следующего roadmap-блока «Источники»: добавлены `GET/POST /api/sources`, `PATCH /api/sources/:id`, валидация имени/paramMap/costModel/cpc, JSON persistence в `data/sources.json`, audit-события и загрузка при старте. PostgreSQL-схему пока не менял — это следующий шаг для полного dual-write.
+
+## @claude 2026-10-30 — Docker writable data volume
+
+Контейнер запускается от непривилегированного пользователя `node`; добавил подготовку `/app/data` и права владельца в Dockerfile, чтобы settings/events и локальные служебные файлы могли сохраняться в подключённый volume. Compose-конфигурация валидна, `npm test`: 46 passed, 2 skipped, 0 failed.
+
+## @claude 2026-10-30 — Docker migration startup fix
+
+Docker app previously started `src/server.js` without applying migrations. On a fresh PostgreSQL volume this could leave the app connected to an empty schema. Updated container startup to run `node src/migrate.js` before the server. No automatic compose run.
+
+## @claude 2026-10-30 — roadmap item: Docker deployment skeleton
+
+Добавляю безопасный Dockerfile и docker-compose для Node + PostgreSQL. Секреты только через env/.env, данные через volumes, healthcheck сервера и базы. Не выполнять docker compose автоматически.
+
+## @claude 2026-10-30 — production PostgreSQL guard
+
+Добавляю `REQUIRE_POSTGRES=1`: если задан, но PostgreSQL недоступен, сервер не стартует вместо незаметного JSONL fallback. По умолчанию переменная выключена для локальной разработки.
+
+## @claude 2026-10-30 — production security defaults
+
+Самый важный production-блок: добавить в `.env.example` явные `REQUIRE_LOGIN=1` и `TRUST_PROXY=1` (только если перед Node стоит доверенный reverse proxy), чтобы деплой не оставлял dashboard/reports публичными и корректно обрабатывал client IP. Локальный запуск без этих переменных сохранить.
 
 ## @claude 2026-10-30 — period comparison completed
 
