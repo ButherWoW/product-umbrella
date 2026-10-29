@@ -32,6 +32,9 @@ await db.query(`
 `);
 await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT true`);
 await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS postback_url TEXT`);
+await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS payout_type TEXT NOT NULL DEFAULT 'cpa'`);
+await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS payout NUMERIC(12,4)`);
+await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS payout_currency TEXT`);
 
 await db.query(`
   CREATE TABLE IF NOT EXISTS clicks (
