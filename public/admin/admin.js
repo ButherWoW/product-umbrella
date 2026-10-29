@@ -1354,6 +1354,42 @@ function pageLog(kind, params) {
   return () => table?.detach();
 }
 
+// ---------- buyers report ----------
+async function pageBuyersReport() {
+  if (!isOwnerView()) { location.hash = '#/dashboard'; return; }
+  await loadRefs();
+  await loadRates();
+  const holder = h('div');
+  let table = null;
+  put(view, h('h1', {}, 'Сводка по баерам'),
+    h('div', { class: 'toolbar' }, periodControl(() => load()), currencyControl(() => load()),
+      h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻')), holder);
+  async function load() {
+    const { from, to } = periodRange();
+    try {
+      const [s, settings] = await Promise.all([api('/stats' + qs({ from, to })), api('/api/settings').catch(() => ({ buyerSharePct: 35 }))]);
+      const sharePct = Number(settings.buyerSharePct) || 0;
+      const rows = Object.values(Object.entries(s.byCampaign || {}).reduce((acc, [cid, v]) => {
+        const owner = state.campaigns[cid]?.ownerId || '';
+        const key = owner || '__none__';
+        const row = acc[key] ||= { id: key, name: owner ? userEmail(owner) : 'Не назначен', campaigns: 0, clicks: 0, conversions: 0, revenue: 0, cost: 0 };
+        row.campaigns += 1; row.clicks += v.clicks || 0; row.conversions += v.conversions || 0; row.revenue += v.revenue || 0; row.cost += v.cost || 0;
+        return acc;
+      }, {})).sort((a, b) => (b.revenue - b.cost) - (a.revenue - a.cost));
+      table?.detach();
+      table = dataTable({ id: 'buyers-report', compact: true, pageSize: 100, rows,
+        columns: [
+          { key: 'name', label: 'Баер', fixed: true, cls: 'name', render: (r) => h('a', { href: '#/campaigns' }, r.name) },
+          { key: 'campaigns', label: 'Кампании', num: true, render: (r) => num(r.campaigns), total: (rs) => num(sum(rs, 'campaigns')) },
+          ...metricCols().filter((c) => ['clicks', 'conversions', 'revenue', 'cost', 'profit', 'roi'].includes(c.key)),
+          { key: 'earn', label: `Заработок · ${sharePct}%`, num: true, value: (r) => Math.max(0, r.revenue - r.cost) * sharePct / 100, render: (r) => money(Math.max(0, r.revenue - r.cost) * sharePct / 100), total: (rs) => money(rs.reduce((t, r) => t + Math.max(0, r.revenue - r.cost) * sharePct / 100, 0)) },
+        ] });
+      put(holder, table);
+    } catch (e) { put(holder, h('p', { class: 'err' }, 'Ошибка загрузки: ' + e.message)); }
+  }
+  load();
+}
+
 // ---------- accounts ----------
 function authScreen() {
   const setup = state.me?.setupRequired;
@@ -1468,6 +1504,7 @@ async function route() {
     else if (section === 'clicks' || section === 'conversions') cleanup = pageLog(section, params);
     else if (section === 'sources') cleanup = await pageSources();
     else if (section === 'users') cleanup = await pageUsers();
+    else if (section === 'buyers') cleanup = await pageBuyersReport();
     else cleanup = await pageDashboard();
   } catch (e) { put(view, h('p', { class: 'err' }, 'Ошибка: ' + e.message)); }
 }

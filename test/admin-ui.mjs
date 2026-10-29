@@ -183,6 +183,26 @@ try {
     await p2.locator('table.grid tbody tr', { hasText: 'buyer@example.com' }).waitFor();
     await p2.locator('[data-nav=dashboard]').click();
     await p2.getByRole('heading', { name: 'Баеры' }).waitFor();
+
+    // D9: buyers summary — 2 campaigns, 2 rows, click total matches /stats
+    const lockedApi = (path, body) => fetch(locked.url + path, { method: body ? 'POST' : 'GET', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + TOKEN }, body: body ? JSON.stringify(body) : undefined });
+    const usersData = await (await lockedApi('/api/users')).json();
+    const buyerUser = usersData.users.find((u) => u.email === 'buyer@example.com');
+    await lockedApi('/api/campaigns', { id: 'buyers-c1', name: 'Buyers C1', streams: [{ name: 'Main', offers: [{ offerId: 'o', weight: 1 }] }], ownerId: buyerUser.id });
+    await lockedApi('/api/campaigns', { id: 'buyers-c2', name: 'Buyers C2', streams: [{ name: 'Main', offers: [{ offerId: 'o', weight: 1 }] }] });
+    await fetch(locked.url + '/r/buyers-c1', { redirect: 'manual' });
+    await fetch(locked.url + '/r/buyers-c1', { redirect: 'manual' });
+    await fetch(locked.url + '/r/buyers-c2', { redirect: 'manual' });
+    await p2.goto(locked.url + '/admin#/buyers');
+    await p2.getByRole('heading', { name: 'Сводка по баерам' }).waitFor();
+    assert.ok(await p2.locator('[data-nav=buyers]').isVisible(), 'owner sees buyers summary nav item');
+    const buyersRows = await p2.locator('table.grid tbody tr').count();
+    assert.equal(buyersRows, 2, `buyers summary: expected 2 rows (buyer + unassigned), got ${buyersRows}`);
+    const lockedStats = await (await lockedApi('/stats')).json();
+    const buyersClickTotal = await p2.locator('table.grid tfoot tr').evaluateAll(
+      (rows) => { const td = rows[0]?.querySelectorAll('td')[2]; return parseInt(td?.textContent?.replace(/\D/g, '') || '0', 10) || 0; });
+    assert.equal(buyersClickTotal, lockedStats.clicks || 0, 'buyers report tfoot clicks matches /stats');
+
     await p2.getByRole('button', { name: 'Выйти' }).click();
     await p2.getByRole('heading', { name: 'Вход в Umbrella' }).waitFor();
     await p2.getByLabel('Email').fill('buyer@example.com');
@@ -190,6 +210,10 @@ try {
     await p2.getByRole('button', { name: 'Войти' }).click();
     await p2.locator('#user-box', { hasText: 'buyer@example.com' }).waitFor();
     assert.ok(await p2.locator('[data-nav=users]').isHidden(), 'buyers do not see the users section');
+    assert.ok(await p2.locator('[data-nav=buyers]').isHidden(), 'buyers do not see the buyers summary nav item');
+    // Navigating directly to #/buyers redirects buyer to dashboard
+    await p2.goto(locked.url + '/admin#/buyers');
+    await p2.getByRole('heading', { name: 'Дашборд' }).waitFor();
     await p2.locator('[data-nav=dashboard]').click();
     await p2.locator('.kpi', { hasText: 'Заработок баера' }).waitFor();
     assert.equal(await p2.getByRole('heading', { name: 'Баеры' }).count(), 0, 'buyers do not see the per-buyer table');
