@@ -197,3 +197,5 @@ body.auth-mode .view { margin-left: 0; display: grid; place-items: start center;
 .ip-allowlist h2 { margin: 0 0 8px; font-size: 16px; }
 .ip-allowlist p { margin: 6px 0; }
 .ip-allowlist code { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+.danger-zone { margin-top: 20px; padding: 14px; border: 1px solid var(--bad); border-radius: var(--radius); }
+.danger-zone h3 { margin: 0 0 6px; color: var(--bad); font-size: 14px; }

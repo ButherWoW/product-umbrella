@@ -11,6 +11,7 @@ import { readEventLog } from './event-logs.js';
 import { createConversionRecorder, hasRecordedConversion, findRecordedConversion } from './conversion-recorder.js';
 import { createEventMirror } from './event-mirror.js';
 import { createConversionCapCounter, resolveOffer } from './conversion-cap.js';
+import { createJournalGate, filterJournal, campaignPlan, retentionPlan, clearCampaignRows, retentionRows } from './retention.js';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const dataDir = process.env.DATA_DIR || join(root, 'data');
@@ -838,12 +839,41 @@ async function pauseCampaign(id, reason) {
   await event('audit', { actor: 'system', action: 'pause', entity: 'campaign', entityId: id, changes: { active: [true, false], reason: [null, reason] } });
 }
 
+// Appends hold the journal gate shared; clearing statistics and retention rewrite it exclusively (src/retention.js).
+const journalGate = createJournalGate();
 async function event(type, payload) {
   await mkdir(dataDir, { recursive: true });
-  const record = { id: randomUUID(), type, at: new Date().toISOString(), ...payload };
-  await appendFile(eventsFile, `${JSON.stringify(record)}\n`);
-  // `mirrored` settles once PostgreSQL has the event (null without a database).
-  return { mirrored: eventMirror?.enqueue(record) ?? null };
+  return journalGate.shared(async () => {
+    const record = { id: randomUUID(), type, at: new Date().toISOString(), ...payload };
+    await appendFile(eventsFile, `${JSON.stringify(record)}\n`);
+    // `mirrored` settles once PostgreSQL has the event (null without a database).
+    return { mirrored: eventMirror?.enqueue(record) ?? null };
+  });
+}
+
+// Removes events from the journal and the matching rows from PostgreSQL. New events wait meanwhile;
+// the mirror is drained first so a queued insert cannot bring a deleted row back.
+async function removeStats(plan, deleteRows) {
+  const result = await journalGate.rewrite(async () => {
+    await eventMirror?.drain();
+    let postgres = null;
+    const counts = await filterJournal(eventsFile, plan, async () => { if (db) postgres = await deleteRows(db); });
+    return { ...counts, postgres };
+  });
+  for (const offerId of offers.keys()) conversionCaps.invalidate(offerId);
+  return result;
+}
+
+// RETENTION_DAYS=N: daily removal of unconverted clicks, their landing clicks and bot events older than N days.
+const retentionDays = Number.parseInt(process.env.RETENTION_DAYS || '', 10);
+async function runRetention() {
+  const cutoff = new Date(Date.now() - retentionDays * 86400000);
+  const removed = await removeStats(retentionPlan(cutoff.getTime()), (pool) => retentionRows(pool, cutoff.toISOString()));
+  console.log(`[retention] older than ${cutoff.toISOString()}: removed ${removed.clicks} clicks, ${removed.lpClicks} lp clicks, ${removed.bots} bots from the journal`
+    + (removed.postgres ? `; PostgreSQL: ${removed.postgres.clicks} clicks, ${removed.postgres.bots} bots` : ''));
+  await event('audit', { actor: 'system', action: 'retention', entity: 'stats', entityId: 'retention',
+    changes: { days: [null, retentionDays], clicks: [null, removed.clicks], lpClicks: [null, removed.lpClicks], bots: [null, removed.bots] } });
+  return removed;
 }
 
 async function stats({ campaign = null, allowed = null, from = null, to = null, subid = null, country = null, offer = null, stream = null, currency = rates.defaultCurrency } = {}) {
@@ -1946,6 +1976,23 @@ const server = http.createServer(async (req, res) => {
       await audit(req, 'update', 'campaign', id, cur, campaigns.get(id));
       return json(res, 200, { id, ...campaigns.get(id) });
     }
+    // Keitaro «Очистка статистики»: owner only, the body must repeat the campaign id.
+    const clearStats = url.pathname.match(/^\/api\/campaigns\/([A-Za-z0-9_-]{2,80})\/clear-stats$/);
+    if (clearStats && req.method === 'POST') {
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      if (isBuyer(req)) return json(res, 403, { error: 'owner_only' });
+      const id = clearStats[1];
+      if (!campaigns.has(id)) return json(res, 404, { error: 'campaign_not_found' });
+      const body = await readJson(req);
+      if (body.confirm !== id) return json(res, 400, { error: 'confirm_mismatch' });
+      const before = body.before ?? null;
+      if (before !== null && (!/^\d{4}-\d{2}-\d{2}$/.test(String(before)) || Number.isNaN(Date.parse(`${before}T00:00:00Z`)))) return json(res, 400, { error: 'invalid_before_date' });
+      const beforeIso = before ? new Date(`${before}T00:00:00Z`).toISOString() : null;
+      const removed = await removeStats(campaignPlan(id, beforeIso ? Date.parse(beforeIso) : null), (pool) => clearCampaignRows(pool, id, beforeIso));
+      console.log(`[clear-stats] ${id}${before ? ` before ${before}` : ''}: ${JSON.stringify(removed)}`);
+      await audit(req, 'clear_stats', 'campaign', id, null, { before: before || 'all', clicks: removed.clicks, conversions: removed.conversions, lpClicks: removed.lpClicks, bots: removed.bots });
+      return json(res, 200, { ok: true, campaign: id, before, removed });
+    }
     // Dedicated streams endpoint: PUT /api/campaigns/:id/streams
     const streamsUpdate = url.pathname.match(/^\/api\/campaigns\/([A-Za-z0-9_-]{2,80})\/streams$/);
     if (streamsUpdate && req.method === 'PUT') {
@@ -2169,6 +2216,12 @@ if (db) {
 }
 if (requirePostgres && !db) throw new Error('REQUIRE_POSTGRES=1, но PostgreSQL недоступен');
 server.listen(port, '127.0.0.1', () => console.log(`Product Umbrella listening on http://127.0.0.1:${server.address().port}`));
+if (retentionDays > 0) {
+  const retentionTick = () => runRetention().catch((error) => console.warn('[retention] failed:', error.message));
+  const firstRunMs = Math.max(0, Number(process.env.RETENTION_DELAY_MS ?? 60000));
+  setTimeout(() => { retentionTick(); setInterval(retentionTick, 86400000).unref(); }, firstRunMs).unref();
+  console.log(`[retention] enabled: ${retentionDays} days`);
+}
 
 async function shutdown() { await new Promise((resolve) => server.close(resolve)); await eventMirror?.drain(); await closeDb(); process.exit(0); }
 process.on('SIGINT', shutdown);
