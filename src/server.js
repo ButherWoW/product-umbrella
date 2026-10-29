@@ -771,6 +771,10 @@ async function stats({ campaign = null, allowed = null, from = null, to = null, 
         ${where}
         GROUP BY c.campaign, c.country, c.offer_id, c.stream, c.landing_id
       `, params);
+      for (const row of rows) {
+        const offer = offers.get(row.offer_id);
+        if (offer?.payoutType === 'cpc' && offer.payout !== null) row.revenue = Number(row.revenue || 0) + Number(row.clicks || 0) * Number(offer.payout);
+      }
       const report = { ...reportFromRows(rows), currency };
       report.bySource = Object.create(null); report.byNetwork = Object.create(null);
       for (const row of rows) {
@@ -810,6 +814,17 @@ async function stats({ campaign = null, allowed = null, from = null, to = null, 
     const conversionByClick = new Map(conversions.map((item) => [item.clickId, item]));
     const lpClicked = new Set(lines.filter((item) => item.type === 'lp_click').map((item) => item.clickId));
     const report = { ...reportFromEvents(clicks.map((c) => convertClickCost(lpClicked.has(c.clickId) ? { ...c, lpClicked: true } : c, currency)), conversions.map((cv) => convertConversion(cv, currency))), currency };
+    for (const click of clicks) {
+      const offer = offers.get(click.offerId);
+      if (offer?.payoutType === 'cpc' && offer.payout !== null) {
+        const amount = Number(offer.payout) * rates.factor(offer.payoutCurrency || rates.defaultCurrency, currency);
+        report.revenue += amount;
+        report.byCampaign[click.campaign] ||= { clicks: 0, conversions: 0, revenue: 0, cost: 0, uniqueClicks: 0 };
+        report.byCampaign[click.campaign].revenue += amount;
+        report.byOffer[click.offerId] ||= { clicks: 0, conversions: 0, revenue: 0, cost: 0, uniqueClicks: 0 };
+        report.byOffer[click.offerId].revenue += amount;
+      }
+    }
     report.bySource = Object.create(null); report.byNetwork = Object.create(null);
     for (const click of clicks) { const source = campaigns.get(click.campaign)?.sourceId || 'none'; const network = offers.get(click.offerId)?.networkId || 'none'; const cv = conversionByClick.get(click.clickId); const one = reportFromEvents([click], cv ? [cv] : []); for (const [key,id] of [['bySource',source],['byNetwork',network]]) { report[key][id] ||= { clicks:0, conversions:0, revenue:0, cost:0, uniqueClicks:0 }; for (const f of ['clicks','conversions','revenue','cost','uniqueClicks','leads','sales','rejected','trash','pendingRevenue']) report[key][id][f] = (report[key][id][f] || 0) + (one[f] || 0); } }
     report.bySource = Object.fromEntries(Object.entries(report.bySource).map(([k,v]) => [k, metrics(v)])); report.byNetwork = Object.fromEntries(Object.entries(report.byNetwork).map(([k,v]) => [k, metrics(v)]));
@@ -1628,6 +1643,30 @@ const server = http.createServer(async (req, res) => {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const direction = url.searchParams.get('direction') === 'out' ? 'out' : 'in';
       return json(res, 200, { postbacks: await readPostbacks({ direction, campaign: url.searchParams.get('campaign') || null, limit: Math.min(500, Math.max(1, Number(url.searchParams.get('limit') || 200))) }) });
+    }
+    if (url.pathname === '/api/costs' && req.method === 'POST') {
+      if (!(await adminAuthorized(req)) && !req.user) return json(res, 401, { error: 'admin_authorization_required' });
+      const body = await readJson(req);
+      const campaignId = String(body.campaign || '');
+      const campaign = campaigns.get(campaignId);
+      if (!campaign) return json(res, 404, { error: 'campaign_not_found' });
+      if (!canEditCampaign(req, campaign)) return json(res, 403, { error: 'campaign_forbidden' });
+      const amount = Number(body.amount);
+      if (!Number.isFinite(amount) || amount < 0) return json(res, 400, { error: 'invalid_amount' });
+      const from = body.from ? Date.parse(`${body.from}T00:00:00Z`) : -Infinity;
+      const to = body.to ? Date.parse(`${body.to}T23:59:59.999Z`) : Infinity;
+      if (!Number.isFinite(from) && body.from || !Number.isFinite(to) && body.to) return json(res, 400, { error: 'invalid_date' });
+      let lines = [];
+      try { lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map(JSON.parse); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+      const matches = lines.filter((item) => item.type === 'click' && item.campaign === campaignId && Date.parse(item.at) >= from && Date.parse(item.at) <= to && !item.bot && (!body.filters?.offer || item.offerId === body.filters.offer) && (!body.filters?.stream || item.stream === body.filters.stream) && (!body.filters?.source || item.params?.source === body.filters.source));
+      if (!matches.length) return json(res, 200, { updated: 0, perClick: 0 });
+      const perClick = amount / matches.length;
+      const ids = new Set(matches.map((x) => x.clickId));
+      const updatedLines = lines.map((item) => ids.has(item.clickId) && item.type === 'click' ? { ...item, cost: perClick } : item);
+      await writeFile(eventsFile, updatedLines.map((x) => JSON.stringify(x)).join('\n') + '\n');
+      if (db) await db.query('UPDATE clicks SET cost = $1 WHERE campaign = $2 AND click_id = ANY($3::text[])', [perClick, campaignId, [...ids]]).catch((e) => console.warn('[db] costs update:', e.message));
+      await audit(req, 'update', 'cost', campaignId, null, { amount, clicks: matches.length, perClick, from: body.from || null, to: body.to || null });
+      return json(res, 200, { updated: matches.length, perClick, currency: body.currency || rates.defaultCurrency });
     }
     if (url.pathname === '/api/domains' && req.method === 'GET') return json(res, 200, { primary: primaryHost || null, domains: await trackingDomains() });
     if (url.pathname === '/api/rates' && req.method === 'GET') return json(res, 200, { defaultCurrency: rates.defaultCurrency, ...rates.info() });
