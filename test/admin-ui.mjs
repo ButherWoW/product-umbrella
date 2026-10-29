@@ -73,6 +73,7 @@ try {
 
   // Partner networks: generated postback is visible/copyable, and offers can be linked to a network.
   await page.goto(server.url + '/admin#/networks');
+  await page.locator('table.grid').waitFor();
   await page.getByRole('button', { name: 'Создать сеть' }).click();
   const networkDialog = page.getByRole('dialog', { name: 'Новая сеть' });
   await networkDialog.locator('input').nth(0).fill('net-ui');
