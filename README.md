@@ -232,6 +232,10 @@ npm start
 
 Если PostgreSQL недоступен, сервер продолжит работу на JSONL и покажет `storage: "jsonl"` в `/health`. Перед production нужно включить PostgreSQL и проверить миграцию на резервной базе.
 
+## Перенос кампаний из Keitaro
+
+`scripts/import-keitaro-campaigns.mjs` копирует **наши** кампании (группа Keitaro «Erland») вместе с потоками; Keitaro только читается (GET), чужие группы скрипт не импортирует. Без `--ids` — список наших кампаний, с `--ids 4982,4980` — предпросмотр, `--apply` — запись. ID кампании = alias из Keitaro, поэтому путь ссылки тот же (`/r/<alias>`). Переносятся потоки (regular/forced/default → обычный/перехватывающий/замыкающий), веса, ротация, фильтры страна/устройство/ОС/браузер/язык, параметры (`paramMap`), CPC. Не переносятся и печатаются в отчёте: лендинги (поток ведёт сразу на оффер), фильтры-исключения, домен Keitaro. Кампании создаются **выключенными**. Офферы нужно перенести заранее (`import-keitaro-offers.mjs`, id `kt-<id>`).
+
 ## Проверка на PostgreSQL
 
 CI поднимает чистый PostgreSQL (job `postgres`): миграции с нуля дважды, затем `test/postgres*.test.mjs` — данные, записанные сервером, должны вернуться из базы после перезапуска с пустым каталогом данных. Локально: `docker run -d --name umb-pg -e POSTGRES_USER=umbrella -e POSTGRES_PASSWORD=local -e POSTGRES_DB=umbrella -p 55432:5432 postgres:16-alpine`, затем `DATABASE_URL=postgresql://umbrella:local@127.0.0.1:55432/umbrella node src/migrate.js` и `TEST_DATABASE_URL=… node --test test/postgres-e2e.test.mjs`.
