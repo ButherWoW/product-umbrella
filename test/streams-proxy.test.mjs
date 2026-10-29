@@ -376,6 +376,77 @@ test('CSV export: groups, currency, formula-injection safe', { timeout: 15000 },
   });
 });
 
+test('stream filters: referrer, keyword, params, IP, User-Agent, dates and НЕ', { timeout: 15000 }, async (t) => {
+  await withServer(t, {}, async ({ url, post, hit }) => {
+    const IPHONE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Safari/604.1';
+    const WIN = 'Mozilla/5.0 (Windows NT 10.0) Chrome/126.0 Safari/537.36';
+    // One matching stream + a 404 fallback: 302 means the condition matched.
+    const camp = async (id, conditions, paramMap) => {
+      const r = await post('/api/campaigns', { id, name: id, ...(paramMap ? { paramMap } : {}), streams: [
+        { name: 'hit', conditions, offers: [{ offerId: 'offer-1' }] }, { name: 'rest', type: 'fallback', action: 'not_found' }] });
+      return (await r.json()).streams[0].conditions;
+    };
+    const ok = async (path, headers = {}) => (await hit(path, headers)).status === 302;
+
+    assert.deepEqual((await camp('ref', { referrers: ['Facebook.com/ads'] })).referrers, ['facebook.com/ads']);
+    assert.equal(await ok('/r/ref', { referer: 'https://M.FACEBOOK.com/ads/x?q=1' }), true, 'referrer: substring of host+path, case-insensitive');
+    assert.equal(await ok('/r/ref', { referer: 'https://google.com/?u=facebook.com/ads' }), false, 'referrer query string is not matched');
+    assert.equal(await ok('/r/ref'), false, 'no referrer → no match');
+
+    await camp('noref', { emptyReferrer: true });
+    assert.equal(await ok('/r/noref'), true, 'empty referrer');
+    assert.equal(await ok('/r/noref', { referer: 'https://a.example/' }), false);
+    await camp('withref', { emptyReferrer: false });
+    assert.equal(await ok('/r/withref', { referer: 'https://a.example/' }), true);
+
+    await camp('kw', { keywords: ['ninja'] }, { keyword: 'q' });
+    assert.equal(await ok('/r/kw?q=Best+NINJA+blender'), true, 'keyword after paramMap, substring, case-insensitive');
+    assert.equal(await ok('/r/kw?keyword=ninja'), false, 'raw key is not used when paramMap renames it');
+
+    const pc = await camp('prm', { params: { sub_id_3: ['fb', 'tt'], source: ['x'], bogus: ['y'] } }, { sub_id_3: 'net' });
+    assert.deepEqual(pc.params, { sub_id_3: ['fb', 'tt'], source: ['x'] }, 'unknown fields are dropped');
+    assert.equal(await ok('/r/prm?net=tt&source=x'), true, 'params: exact match after paramMap');
+    assert.equal(await ok('/r/prm?net=TT&source=x'), false, 'params are case-sensitive');
+    assert.equal(await ok('/r/prm?net=tt'), false, 'every listed param must match (AND)');
+
+    const ic = await camp('ip', { ips: ['127.0.0.0/8', 'nonsense', '10.0.0.1'] });
+    assert.deepEqual(ic.ips, ['127.0.0.0/8', '10.0.0.1']);
+    assert.equal(await ok('/r/ip'), true, 'IPv4 CIDR');
+    await camp('ip2', { ips: ['10.0.0.1'] });
+    assert.equal(await ok('/r/ip2'), false);
+
+    await camp('ua', { userAgents: ['IPHONE OS 17'] });
+    assert.equal(await ok('/r/ua', { 'user-agent': IPHONE }), true, 'User-Agent substring, case-insensitive');
+    assert.equal(await ok('/r/ua', { 'user-agent': WIN }), false);
+
+    const today = new Date().toISOString().slice(0, 10);
+    const dc = await camp('dates', { dateFrom: '2020-01-01', dateTo: today, tz: 'UTC' });
+    assert.deepEqual([dc.dateFrom, dc.dateTo, dc.tz], ['2020-01-01', today, 'UTC']);
+    assert.equal(await ok('/r/dates'), true, 'date range is inclusive');
+    await camp('future', { dateFrom: '2999-01-01' });
+    assert.equal(await ok('/r/future'), false);
+    assert.equal((await camp('baddate', { dateFrom: '2026-02-30', dateTo: 'tomorrow' })).dateFrom, undefined, 'invalid dates are dropped');
+
+    const nc = await camp('not', { os: ['ios'], countries: [], not: ['os', 'countries', 'nope'] });
+    assert.deepEqual(nc.not, ['os'], 'НЕ keeps only conditions that are set');
+    assert.equal(await ok('/r/not', { 'user-agent': WIN }), true, 'НЕ: not iOS matches Windows');
+    assert.equal(await ok('/r/not', { 'user-agent': IPHONE }), false, 'НЕ: iOS is excluded');
+    await camp('not-and', { os: ['ios'], referrers: ['spam.example'], not: ['referrers'] });
+    assert.equal(await ok('/r/not-and', { 'user-agent': IPHONE, referer: 'https://good.example/' }), true, 'AND: iOS and NOT spam referrer');
+    assert.equal(await ok('/r/not-and', { 'user-agent': IPHONE, referer: 'https://spam.example/' }), false);
+
+    await camp('not-or', { mode: 'or', os: ['ios'], languages: ['fr'], not: ['languages'] });
+    assert.equal(await ok('/r/not-or', { 'user-agent': WIN, 'accept-language': 'de' }), true, 'OR: not French is enough');
+    assert.equal(await ok('/r/not-or', { 'user-agent': IPHONE, 'accept-language': 'fr' }), true, 'OR: iOS is enough');
+    assert.equal(await ok('/r/not-or', { 'user-agent': WIN, 'accept-language': 'fr' }), false, 'OR: neither iOS nor non-French → fallback');
+
+    const long = await camp('limits', { keywords: Array.from({ length: 80 }, (_, i) => `k${i}`), userAgents: ['x'.repeat(500)] });
+    assert.deepEqual([long.keywords.length, long.userAgents[0].length], [50, 200], 'lists ≤ 50, strings ≤ 200');
+    const plain = (await (await fetch(url + '/api/campaigns')).json()).campaigns.ref.streams[1].conditions;
+    assert.ok(!('referrers' in plain) && !('not' in plain) && !('params' in plain), 'unset new conditions are not stored');
+  });
+});
+
 test('group of campaigns and offers survives PATCH of other fields', { timeout: 15000 }, async (t) => {
   await withServer(t, {}, async ({ url, post }) => {
     assert.equal((await post('/api/offers', { id: 'grp-offer', url: 'https://example.com/o', group: '  Kitchen  ' })).status, 201);

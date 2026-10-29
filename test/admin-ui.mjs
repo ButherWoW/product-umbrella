@@ -71,6 +71,21 @@ try {
   await page.locator('.editor-head .btn.primary').click();
   await page.locator('#toast', { hasText: 'Сохранено' }).waitFor();
 
+  // Stream filters with «НЕ»: everything except US, from Facebook, sub_id_3=fb.
+  await page.locator('.stream .title').first().click();
+  const filters = page.getByRole('dialog', { name: 'Редактирование потока' });
+  await filters.getByRole('tab', { name: 'Фильтры' }).click();
+  await filters.getByLabel('Страны', { exact: true }).fill('us');
+  await filters.getByLabel('Страны: НЕ', { exact: true }).check();
+  await filters.getByLabel('Реферер', { exact: true }).fill('facebook.com');
+  await filters.getByLabel('Параметры', { exact: true }).fill('sub_id_3=fb, tt');
+  await filters.getByRole('button', { name: 'Применить' }).click();
+  await page.locator('.stream', { hasText: 'Страны НЕ: US · Реферер: facebook.com · sub_id_3: fb, tt' }).waitFor();
+  await page.locator('.editor-head .btn.primary').click();
+  await page.locator('#toast', { hasText: 'Сохранено' }).waitFor();
+  const filtered = (await (await fetch(server.url + '/api/campaigns')).json()).campaigns['ui-flows'].streams[0].conditions;
+  assert.deepEqual([filtered.countries, filtered.not, filtered.referrers, filtered.params], [['US'], ['countries'], ['facebook.com'], { sub_id_3: ['fb', 'tt'] }]);
+
   // Offer conversion cap: cap, its time zone and the alternative offer from the offer dialog.
   await api('/api/offers', { id: 'ui-alt', url: 'https://alt.example.net/', name: 'Alt offer' });
   await page.goto(server.url + '/admin#/offers');

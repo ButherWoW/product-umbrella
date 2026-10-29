@@ -65,7 +65,7 @@ Tracking URL принимает `utm_source`, `utm_medium`, `utm_campaign`, `utm
 ]}
 ```
 
-Порядок выбора: первый подходящий `forced` → взвешенный выбор среди подходящих `regular` → первый подходящий `fallback`; ничего не подошло — `404 no_matching_stream`. Условия: `countries`, `devices` (mobile/tablet/desktop), `os` (android/ios/windows/macos/linux/other), `browsers` (chrome/safari/firefox/edge/opera/samsung/other), `languages` (2 буквы из Accept-Language), `isps` (часть названия провайдера без учёта регистра, нужна база `GEOIP_ASN_DB`). Без `GEOIP_DB` страна неизвестна, и поток с `countries` не срабатывает. Имя выбранного потока пишется в клик (`stream`).
+Порядок выбора: первый подходящий `forced` → взвешенный выбор среди подходящих `regular` → первый подходящий `fallback`; ничего не подошло — `404 no_matching_stream`. Условия: `countries`, `devices` (mobile/tablet/desktop), `os` (android/ios/windows/macos/linux/other), `browsers` (chrome/safari/firefox/edge/opera/samsung/other), `languages` (2 буквы из Accept-Language), `isps` (часть названия провайдера без учёта регистра, нужна база `GEOIP_ASN_DB`). Без `GEOIP_DB` страна неизвестна, и поток с `countries` не срабатывает. Остальные условия и «НЕ» — ниже. Имя выбранного потока пишется в клик (`stream`).
 
 Дополнительные поля потока (как в Keitaro):
 
@@ -76,6 +76,17 @@ Tracking URL принимает `utm_source`, `utm_medium`, `utm_campaign`, `utm
 - Кампания: `streamRotation: "weight"` (по умолчанию — обычные потоки делят трафик по весам) или `"position"` (клик забирает первый подходящий обычный поток по порядку), как «Ротация потоков» в Keitaro.
 - Расписание потока: `conditions.days` (1 = пн … 7 = вс), `conditions.hours` (0–23), `conditions.tz` (IANA, неизвестный → UTC), например `{"days":[1,2,3,4,5],"hours":[9,10,…,21],"tz":"Europe/Paris"}`.
 - `conditions.mode: "or"` — поток подходит, если сработал любой из заданных фильтров (по умолчанию все — «И»).
+- Ещё условия (списки до 50 значений, строки до 200 символов; хранятся, только если заданы):
+  - `referrers` — часть домена+пути реферера (без схемы и query), без учёта регистра: `["facebook.com", "instagram.com/ads"]`; без реферера не срабатывает;
+  - `emptyReferrer: true|false` — реферер пустой / не пустой;
+  - `keywords` — часть значения параметра `keyword` (после `paramMap` кампании), без учёта регистра;
+  - `params: {"sub_id_3": ["fb","tt"], "source": ["push"]}` — точное совпадение отслеживаемого параметра после `paramMap` (поля как в «Параметрах»: `keyword`, `source`, `external_id`, `creative_id`, `ad_campaign_id`, `sub_id_1…30`); каждый параметр — отдельный фильтр;
+  - `ips` — точный IP или IPv4 CIDR (`10.0.0.0/8`);
+  - `userAgents` — часть строки User-Agent, без учёта регистра;
+  - `dateFrom` / `dateTo` — `YYYY-MM-DD` включительно, в `conditions.tz` (или UTC).
+- `conditions.not: ["countries", "referrers", …]` — «НЕ» (режим reject в Keitaro): перечисленные условия инвертируются — поток подходит, если посетитель НЕ попал в список. Работает и с «И», и с «ИЛИ». Неизвестное значение (нет GeoIP, нет реферера) под «НЕ» подходит. Например `{"countries":["US"],"not":["countries"]}` — все страны, кроме США.
+- Условия только выбирают между потоками самой кампании; отдельных «белых/чёрных» страниц для ботов нет.
+- `POST /api/simulate` принимает `referrer` и `query` (с учётом `paramMap`) и объясняет каждое условие: `{condition, expected, actual, ok, not?}`.
 - Кампания: `redirectMethod` — `http` (302, по умолчанию), `meta` (страница с meta refresh) или `js` (location.replace + meta в noscript). URL в странице экранируется.
 
 ## Выгрузка CSV

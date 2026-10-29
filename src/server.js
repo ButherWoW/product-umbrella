@@ -133,7 +133,8 @@ function parseList(raw, normalize, valid) {
 
 function parseConditions(raw = {}) {
   const lower = (v) => String(v).toLowerCase().slice(0, 20);
-  return {
+  const text = (v) => String(v).trim().toLowerCase().slice(0, 200);
+  const out = {
     countries: parseList(raw.countries, (g) => String(g).toUpperCase().slice(0, 2), (g) => /^[A-Z]{2}$/.test(g)),
     devices: parseList(raw.devices, lower, (d) => ['mobile', 'tablet', 'desktop'].includes(d)),
     os: parseList(raw.os, lower, (o) => ['android', 'ios', 'windows', 'macos', 'linux', 'other'].includes(o)),
@@ -144,25 +145,44 @@ function parseConditions(raw = {}) {
     ...(raw.mode === 'or' ? { mode: 'or' } : {}),
     ...scheduleConditions(raw),
   };
+  // Newer conditions are stored only when set, so existing streams keep their exact shape.
+  for (const key of ['referrers', 'keywords', 'userAgents']) { const list = parseList(raw[key], text, (v) => v.length > 0); if (list.length) out[key] = list; }
+  if (typeof raw.emptyReferrer === 'boolean') out.emptyReferrer = raw.emptyReferrer;
+  const ips = parseIpRules(raw.ips).slice(0, 50);
+  if (ips.length) out.ips = ips;
+  if (raw.params && typeof raw.params === 'object' && !Array.isArray(raw.params)) {
+    const params = {};
+    for (const [f, values] of Object.entries(raw.params)) {
+      const list = TRACK_FIELDS.includes(f) ? parseList(values, (v) => String(v).trim().slice(0, 200), (v) => v.length > 0) : [];
+      if (list.length) params[f] = list;
+    }
+    if (Object.keys(params).length) out.params = params;
+  }
+  const not = [...new Set(parseList(raw.not, String, (k) => CONDITION_KEYS.includes(k) && conditionSet(out, k)))];
+  if (not.length) out.not = not;
+  return out;
 }
 
-// Day parting (Keitaro «Расписание»): ISO weekdays 1 (Mon) … 7 (Sun) and hours 0–23 in an IANA time zone.
+// Day parting (Keitaro «Расписание»): ISO weekdays 1 (Mon) … 7 (Sun), hours 0–23 and an inclusive date range, in an IANA time zone.
 // Only stored when set, so streams without a schedule keep their original shape.
 function validTimeZone(tz) {
   try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); return true; } catch { return false; }
 }
+const isoDate = (v) => (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) && !Number.isNaN(Date.parse(`${v}T00:00:00Z`))
+  && new Date(`${v}T00:00:00Z`).toISOString().startsWith(v) ? v : null);
 function scheduleConditions(raw) {
   const days = [...new Set(parseList(raw.days, Number, (d) => Number.isInteger(d) && d >= 1 && d <= 7))].sort((a, b) => a - b);
   const hours = [...new Set(parseList(raw.hours, Number, (h) => Number.isInteger(h) && h >= 0 && h <= 23))].sort((a, b) => a - b);
-  if (!days.length && !hours.length) return {};
+  const dateFrom = isoDate(raw.dateFrom); const dateTo = isoDate(raw.dateTo);
+  if (!days.length && !hours.length && !dateFrom && !dateTo) return {};
   const tz = typeof raw.tz === 'string' && validTimeZone(raw.tz) ? raw.tz : 'UTC';
-  return { ...(days.length ? { days } : {}), ...(hours.length ? { hours } : {}), tz };
+  return { ...(days.length ? { days } : {}), ...(hours.length ? { hours } : {}), ...(dateFrom ? { dateFrom } : {}), ...(dateTo ? { dateTo } : {}), tz };
 }
 const WEEKDAY = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 };
 function localDayHour(tz, date) {
-  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short', hour: 'numeric', hourCycle: 'h23' })
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short', hour: 'numeric', hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit' })
     .formatToParts(date).map((p) => [p.type, p.value]));
-  return { day: WEEKDAY[parts.weekday], hour: Number(parts.hour) };
+  return { day: WEEKDAY[parts.weekday], hour: Number(parts.hour), date: `${parts.year}-${parts.month}-${parts.day}` };
 }
 
 function parseOfferWeights(raw) {
@@ -216,19 +236,53 @@ function weightedPick(items) {
   return items[items.length - 1];
 }
 
+// Stream conditions: [label, (conditions, visitor, local time) → [actual, matched]]. Lists match any value; `not` inverts a condition.
+const includesAny = (hay, needles) => Boolean(hay) && needles.some((n) => String(hay).toLowerCase().includes(n));
+function referrerText(ref) {
+  if (!ref) return '';
+  try { const u = new URL(ref); return (u.host + u.pathname).toLowerCase(); } catch { return String(ref).toLowerCase().slice(0, 500); }
+}
+const CONDITIONS = {
+  // Unknown country (no GEOIP_DB) / ISP (no GEOIP_ASN_DB) never matches, so geo streams fall through to others.
+  countries: ['страна', (c, v) => [v.country, c.countries.includes(v.country)]],
+  devices: ['устройство', (c, v) => [v.device, c.devices.includes(v.device)]],
+  os: ['ОС', (c, v) => [v.os, c.os.includes(v.os)]],
+  browsers: ['браузер', (c, v) => [v.browser, c.browsers.includes(v.browser)]],
+  languages: ['язык', (c, v) => [v.language, c.languages.includes(v.language)]],
+  isps: ['провайдер', (c, v) => [v.isp, includesAny(v.isp, c.isps)]],
+  days: ['день недели', (c, v, t) => [t.day, c.days.includes(t.day)]],
+  hours: ['час', (c, v, t) => [t.hour, c.hours.includes(t.hour)]],
+  dateFrom: ['дата с', (c, v, t) => [t.date, t.date >= c.dateFrom], '≥'],
+  dateTo: ['дата по', (c, v, t) => [t.date, t.date <= c.dateTo], '≤'],
+  referrers: ['реферер', (c, v) => { const r = referrerText(v.referrer); return [r || null, includesAny(r, c.referrers)]; }],
+  emptyReferrer: ['пустой реферер', (c, v) => [v.referrer ? 'нет' : 'да', !v.referrer === c.emptyReferrer], '='],
+  keywords: ['ключевое слово', (c, v) => [v.params?.keyword, includesAny(v.params?.keyword, c.keywords)]],
+  ips: ['IP', (c, v) => [v.ip, Boolean(v.ip) && c.ips.some((r) => ipMatches(v.ip, r))]],
+  userAgents: ['User-Agent', (c, v) => [v.userAgent, includesAny(v.userAgent, c.userAgents)]],
+};
+const CONDITION_KEYS = [...Object.keys(CONDITIONS), 'params'];
+const conditionSet = (c, k) => (k === 'emptyReferrer' ? typeof c[k] === 'boolean' : k === 'params' ? Object.keys(c.params || {}).length > 0 : Boolean(c[k]?.length));
+function conditionChecks(c, visitor) {
+  const local = c.days?.length || c.hours?.length || c.dateFrom || c.dateTo ? localDayHour(c.tz || 'UTC', visitor.now || new Date()) : {};
+  const not = new Set(c.not || []);
+  const out = Object.entries(CONDITIONS).filter(([k]) => conditionSet(c, k)).map(([k, [label, test, op]]) => {
+    const [actual, ok] = test(c, visitor, local);
+    return { key: k, condition: label, expected: [].concat(c[k] === true ? 'да' : c[k] === false ? 'нет' : c[k]), actual: actual ?? null, ok: ok !== not.has(k), ...(op ? { op } : {}) };
+  });
+  // Each tracked parameter (after paramMap) is its own check: exact match against the listed values.
+  for (const [f, values] of Object.entries(c.params || {})) {
+    const actual = visitor.params?.[f] ?? null;
+    out.push({ key: 'params', condition: `параметр ${f}`, expected: values, actual, ok: values.includes(actual) !== not.has('params') });
+  }
+  return out;
+}
+
 function streamMatches(stream, visitor) {
   const c = stream.conditions;
   if (!c) return true;
-  // Unknown country (no GEOIP_DB) never matches a country condition, so geo streams fall through to others.
-  const local = c.days?.length || c.hours?.length ? localDayHour(c.tz || 'UTC', visitor.now || new Date()) : {};
-  const checks = [[c.countries, visitor.country], [c.devices, visitor.device], [c.os, visitor.os], [c.browsers, visitor.browser], [c.languages, visitor.language],
-    [c.days, local.day], [c.hours, local.hour]]
-    .filter(([values]) => values?.length)
-    .map(([values, actual]) => values.includes(actual));
-  // Unknown ISP (no GEOIP_ASN_DB) never matches, like an unknown country.
-  if (c.isps?.length) checks.push(Boolean(visitor.isp) && c.isps.some((i) => visitor.isp.toLowerCase().includes(i)));
+  const checks = conditionChecks(c, visitor);
   if (!checks.length) return true;
-  return c.mode === 'or' ? checks.some(Boolean) : checks.every(Boolean);
+  return c.mode === 'or' ? checks.some((x) => x.ok) : checks.every((x) => x.ok);
 }
 
 // Keitaro order: first matching forced stream → weighted among matching regular → first matching fallback.
@@ -251,14 +305,9 @@ function pickStream(streams, visitor = {}, excluded = new Set(), rotation = 'wei
 }
 
 // Traffic simulation (Keitaro «Симуляция трафика»): where would this visitor go and why. Records nothing.
-const CONDITION_LABELS = { countries: 'страна', devices: 'устройство', os: 'ОС', browsers: 'браузер', languages: 'язык', isps: 'провайдер', days: 'день недели', hours: 'час' };
 function explainStream(stream, visitor) {
   const c = stream.conditions || {};
-  const local = c.days?.length || c.hours?.length ? localDayHour(c.tz || 'UTC', visitor.now || new Date()) : {};
-  const actual = { countries: visitor.country, devices: visitor.device, os: visitor.os, browsers: visitor.browser, languages: visitor.language, isps: visitor.isp, days: local.day, hours: local.hour };
-  const checks = Object.keys(CONDITION_LABELS).filter((k) => c[k]?.length).map((k) => ({
-    condition: CONDITION_LABELS[k], expected: c[k], actual: actual[k] ?? null,
-    ok: k === 'isps' ? Boolean(visitor.isp) && c.isps.some((i) => visitor.isp.toLowerCase().includes(i)) : c[k].includes(actual[k]) }));
+  const checks = conditionChecks(c, visitor).map(({ key, ...check }) => ({ ...check, ...(c.not?.includes(key) ? { not: true } : {}) }));
   return { checks, matches: streamMatches(stream, visitor), mode: c.mode === 'or' ? 'or' : 'and' };
 }
 
@@ -271,7 +320,8 @@ async function simulateClick(input, canSee) {
   if (Number.isNaN(at.getTime())) return { error: 'invalid_at' };
   const visitor = { device: detectDevice(ua), os: detectOS(ua), browser: detectBrowser(ua), language: /^[a-z]{2}$/.test(lang) ? lang : null,
     country: /^[A-Za-z]{2}$/.test(input.country || '') ? input.country.toUpperCase() : (ip ? lookupCountry(ip) : null),
-    isp: input.isp ? String(input.isp).slice(0, 120) : network?.isp || null, now: at };
+    isp: input.isp ? String(input.isp).slice(0, 120) : network?.isp || null, now: at,
+    referrer: input.referrer ? String(input.referrer).trim().slice(0, 2048) : null, userAgent: ua, ip };
   const query = new URLSearchParams(String(input.query || '').replace(/^\?/, ''));
   const steps = [];
   const finish = (result) => ({ visitor: { ...visitor, now: at.toISOString(), datacenter: network?.datacenter ?? null }, steps, result });
@@ -282,6 +332,7 @@ async function simulateClick(input, canSee) {
     if (!c || !canSee(c)) return finish({ outcome: 'error', status: 404, reason: `кампания ${campaignId} не найдена` });
     const step = { campaign: campaignId, name: c.name, checks: [] };
     steps.push(step);
+    visitor.params = trackedParams(query, c.paramMap);
     if (!c.active) step.checks.push({ check: 'кампания включена', ok: false, note: 'на живом трафике будет 404' });
     if (ip && c.blockedIps?.some((r) => ipMatches(ip, r))) return finish({ outcome: 'blocked', status: 403, reason: 'IP в чёрном списке кампании' });
     if (ip && c.allowedIps?.length && !c.allowedIps.some((r) => ipMatches(ip, r))) return finish({ outcome: 'blocked', status: 403, reason: 'IP не в белом списке кампании' });
@@ -320,8 +371,7 @@ async function simulateClick(input, canSee) {
     }
     if (top.action === 'not_found') return finish({ outcome: 'not_found', status: 404, reason: `поток «${top.name}» отвечает 404` });
     const bot = (c.botFilter && isBot(ua)) || (c.datacenterAsBot && network?.datacenter);
-    const params = {};
-    for (const field of TRACK_FIELDS) { const v = query.get(c.paramMap?.[field] || field); if (v) params[field] = v.slice(0, 255); }
+    const params = visitor.params;
     const destinations = top.action === 'url' ? [{ url: top.url, share: 100 }]
       : (() => { const live = (top.offers || [{ offerId: top.offerId, weight: 1 }]).filter((o) => !capped.has(o.offerId)); const total = live.reduce((t, o) => t + (o.weight || 1), 0);
         return live.map((o) => { const used = routing.substitutes.get(o.offerId) || o.offerId;
@@ -362,17 +412,24 @@ function detectBrowser(ua) {
   return 'other';
 }
 
+// Tracked parameters come from the query via the campaign's paramMap, so /r/:campaign sets `params` per campaign hop.
 function visitorProfile(req) {
   const ua = req.headers['user-agent'] || '';
   const lang = String(req.headers['accept-language'] || '').trim().slice(0, 2).toLowerCase();
+  const ip = normalizeIp(clientIp(req));
   return { device: detectDevice(ua), os: detectOS(ua), browser: detectBrowser(ua), language: /^[a-z]{2}$/.test(lang) ? lang : null, country: lookupCountry(clientIp(req)),
-    isp: lookupAsn(normalizeIp(clientIp(req)))?.isp || null };
+    isp: lookupAsn(ip)?.isp || null, referrer: req.headers.referer || null, userAgent: ua, ip: ip || null, params: {} };
 }
 
 // Replace known macros in URL templates (offer URLs and S2S postback URLs).
 // Traffic-source parameters recorded per click (Keitaro "Параметры" tab). paramMap renames the query key per campaign.
 const TRACK_FIELDS = ['keyword', 'source', 'external_id', 'creative_id', 'ad_campaign_id', ...Array.from({ length: 30 }, (_, i) => `sub_id_${i + 1}`)];
 const MAPPABLE_FIELDS = [...TRACK_FIELDS, 'cost'];
+function trackedParams(query, paramMap) {
+  const params = {};
+  for (const field of TRACK_FIELDS) { const v = query.get(paramMap?.[field] || field); if (v) params[field] = v.slice(0, 255); }
+  return params;
+}
 function parseParamMap(raw) {
   const out = {};
   if (!raw || typeof raw !== 'object') return out;
@@ -1464,11 +1521,7 @@ const server = http.createServer(async (req, res) => {
       const subid = url.searchParams.get('subid') || null;
 
       // Apply URL macros then append any missing UTM params.
-      const params = {};
-      for (const field of TRACK_FIELDS) {
-        const value = url.searchParams.get(c.paramMap?.[field] || field);
-        if (value) params[field] = value.slice(0, 255);
-      }
+      const params = trackedParams(url.searchParams, c.paramMap);
       let cost = 0;
       if (c.costModel === 'cpc') {
         const rawCost = c.costFromParam ? url.searchParams.get(c.paramMap?.cost || 'cost') : null;
@@ -1512,6 +1565,7 @@ const server = http.createServer(async (req, res) => {
         const c = campaigns.get(campaignId);
         if (!c || !c.active) return json(res, 404, { error: 'campaign_not_found_or_inactive' });
         if (!c.streams?.length) return json(res, 404, { error: 'no_streams_configured' });
+        visitor.params = trackedParams(url.searchParams, c.paramMap);
         const routing = await offerRouting(c.streams);
         const picked = pickStream(c.streams, visitor, routing.excluded, c.streamRotation);
         // A conversion-capped offer hands the click to its alternative; the click is recorded with the offer actually used.

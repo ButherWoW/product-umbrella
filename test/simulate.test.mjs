@@ -42,6 +42,20 @@ test('traffic simulation explains the route and records nothing', { timeout: 150
   const bot = await simulate({ campaign: 'sim', country: 'FR', userAgent: 'Googlebot/2.1' });
   assert.equal(bot.result.outcome, 'bot', 'bots: same destination, not counted');
 
+  await post('/api/campaigns', { id: 'sim-f', name: 'Filters', paramMap: { keyword: 'q' }, streams: [
+    { name: 'FB not iOS', conditions: { referrers: ['facebook.com'], os: ['ios'], keywords: ['ninja'], params: { sub_id_2: ['a'] }, not: ['os'] }, action: 'url', url: 'https://fb.example.net/' },
+    { name: 'Rest', type: 'fallback', action: 'url', url: 'https://rest.example.net/' },
+  ] });
+  const viaFb = await simulate({ campaign: 'sim-f', userAgent: WINDOWS, referrer: 'https://m.facebook.com/story', query: 'q=ninja+pro&sub_id_2=a' });
+  assert.equal(viaFb.result.stream, 'FB not iOS', 'referrer, keyword (after paramMap), params and НЕ are simulated');
+  const fbChecks = viaFb.steps[0].streams[0].checks;
+  assert.deepEqual(fbChecks.map((c) => [c.condition, c.actual, c.ok, c.not || false]), [
+    ['ОС', 'windows', true, true], ['реферер', 'm.facebook.com/story', true, false], ['ключевое слово', 'ninja pro', true, false], ['параметр sub_id_2', 'a', true, false]]);
+  const iosFb = await simulate({ campaign: 'sim-f', userAgent: IPHONE, referrer: 'https://m.facebook.com/', query: 'q=ninja&sub_id_2=a' });
+  assert.equal(iosFb.result.stream, 'Rest', 'НЕ iOS excludes iPhones');
+  const noRef = await simulate({ campaign: 'sim-f', userAgent: WINDOWS, query: 'q=ninja&sub_id_2=a' });
+  assert.deepEqual([noRef.result.stream, noRef.steps[0].streams[0].checks[1].actual], ['Rest', null], 'no referrer → no match');
+
   assert.equal((await post('/api/simulate', { campaign: 'nope' })).status, 200);
   const stats = await (await fetch(server.url + '/stats?campaign=sim')).json();
   assert.equal(stats.clicks, 0, 'simulation records no clicks');
