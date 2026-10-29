@@ -80,3 +80,13 @@ CREATE TABLE IF NOT EXISTS landings (
   name text,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS sources (
+  id text PRIMARY KEY,
+  name text,
+  param_map jsonb NOT NULL DEFAULT '{}'::jsonb,
+  cost_model text NOT NULL DEFAULT 'none',
+  cpc numeric(12,6) NOT NULL DEFAULT 0,
+  cost_from_param boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
