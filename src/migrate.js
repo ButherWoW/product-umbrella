@@ -55,6 +55,10 @@ await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS name TEXT`);
 await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS network_id TEXT`);
 await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT false`);
 await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS "group" TEXT NOT NULL DEFAULT ''`);
+// Conversion cap per local day (lead + sale) and the alternative offer that takes traffic when it is reached.
+await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS conversion_cap INTEGER`);
+await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS cap_tz TEXT NOT NULL DEFAULT 'UTC'`);
+await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS alt_offer_id TEXT`);
 await db.query(`CREATE TABLE IF NOT EXISTS networks (id TEXT PRIMARY KEY, name TEXT NOT NULL, offer_params TEXT NOT NULL DEFAULT '', click_id_param TEXT NOT NULL DEFAULT 'sub1', payout_param TEXT NOT NULL DEFAULT 'payout', notes TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
 await db.query(`
   CREATE TABLE IF NOT EXISTS sources (
@@ -114,11 +118,32 @@ await db.query(`
   )
 `);
 await db.query(`CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id)`);
+// User permissions: read-only viewer role and per-user flags.
+await db.query(`ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check`);
+await db.query(`ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN ('owner', 'buyer', 'viewer'))`);
+await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS hide_revenue BOOLEAN NOT NULL DEFAULT false`);
+await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS offers_access TEXT NOT NULL DEFAULT 'all' CHECK (offers_access IN ('all', 'own'))`);
+await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS view_all BOOLEAN NOT NULL DEFAULT false`);
+// Per-user API keys: only the SHA-256 of the secret and its last 4 characters are stored.
+await db.query(`
+  CREATE TABLE IF NOT EXISTS api_keys (
+    id           UUID        PRIMARY KEY,
+    user_id      UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name         TEXT        NOT NULL,
+    key_hash     TEXT        NOT NULL UNIQUE,
+    last4        TEXT        NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_used_at TIMESTAMPTZ
+  )
+`);
+await db.query(`CREATE INDEX IF NOT EXISTS api_keys_user_idx ON api_keys(user_id)`);
 
 await db.query(`CREATE INDEX IF NOT EXISTS clicks_campaign_created_idx ON clicks(campaign, created_at)`);
 await db.query(`CREATE INDEX IF NOT EXISTS clicks_created_idx ON clicks(created_at)`);
 await db.query(`CREATE TABLE IF NOT EXISTS bots (id BIGSERIAL PRIMARY KEY, campaign TEXT NOT NULL, offer_id TEXT, stream TEXT, user_agent TEXT, ip TEXT, reason TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
 await db.query(`CREATE INDEX IF NOT EXISTS bots_campaign_created_idx ON bots(campaign, created_at)`);
+// Offer conversion cap counts today's conversions.
+await db.query(`CREATE INDEX IF NOT EXISTS conversions_created_idx ON conversions(created_at)`);
 
 console.log('[migrate] All tables ready');
 await db.end();

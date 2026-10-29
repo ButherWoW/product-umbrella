@@ -122,8 +122,8 @@ export function createConversionRecorder({ findClick, hasConversion, currentConv
       const payload = { clickId: id, ...values, ...(explicit || existing ? { status } : {}), ...(existing ? { previousStatus: existing.status || 'sale' } : {}) };
       // Duplicate check and successful JSONL append are inside the same lock.
       // Record failures release the lock and leave the click retryable.
-      await record(payload);
-      try { await onRecorded({ ...payload, click }); }
+      const recorded = await record(payload);
+      try { await onRecorded({ ...payload, click, recorded }); }
       catch (error) { onDeliveryError(error); }
       if (existing) return { ok: true, status, updated: true };
       return explicit ? { ok: true, status } : { ok: true };
