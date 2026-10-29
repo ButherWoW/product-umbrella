@@ -102,6 +102,17 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);
 
+CREATE TABLE IF NOT EXISTS api_keys (
+  id uuid PRIMARY KEY,
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  key_hash text NOT NULL UNIQUE,
+  last4 text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  last_used_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS api_keys_user_idx ON api_keys(user_id);
+
 CREATE TABLE IF NOT EXISTS landings (
   id text PRIMARY KEY,
   url text NOT NULL CHECK (url ~ '^https://'),
