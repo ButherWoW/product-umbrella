@@ -276,6 +276,19 @@ try {
   const attentionText = await attentionCard.innerText();
   assert.ok(/D13 Bad ROI|d13-bad/.test(attentionText) && /ROI/.test(attentionText), `attention block has campaign info, got: ${attentionText.slice(0, 100)}`);
 
+  // D18: goals progress bar on dashboard
+  await api('/api/campaigns', { id: 'd18-goals', name: 'D18 Goals', streams: [{ name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] }] });
+  const d18Click = new URL((await fetch(server.url + '/r/d18-goals', { redirect: 'manual' })).headers.get('location')).searchParams.get('click_id');
+  await fetch(`${server.url}/postback?secret=conversion-test-secret&click_id=${d18Click}&revenue=25&currency=EUR`);
+  await page.evaluate(() => localStorage.setItem('umbrella:goals', JSON.stringify({ revenueGoal: 100, profitGoal: 0 })));
+  await page.goto(server.url + '/admin#/');
+  await page.getByRole('heading', { name: 'Дашборд' }).waitFor();
+  await page.getByRole('combobox', { name: 'Кампания' }).selectOption({ value: 'd18-goals' });
+  await page.locator('.kpi', { hasText: 'Доход' }).locator('.goal-pct').waitFor({ timeout: 10000 });
+  const d18GoalText = await page.locator('.kpi', { hasText: 'Доход' }).locator('.goal-pct').innerText();
+  assert.ok(/25%/.test(d18GoalText), `expected 25% плана, got: ${d18GoalText}`);
+  await page.evaluate(() => localStorage.removeItem('umbrella:goals'));
+
   assert.deepEqual(errors, []);
 
   // Accounts: a REQUIRE_LOGIN install starts with the setup screen; owner creates a buyer; logout returns to login.

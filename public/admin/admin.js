@@ -474,7 +474,7 @@ async function pageDashboard() {
   const campSel = h('select', { class: 'select', 'aria-label': 'Кампания', onchange: () => load() }, h('option', { value: '' }, 'Все кампании'),
     Object.entries(state.campaigns).map(([id, c]) => h('option', { value: id }, c.name || id)));
   put(view, h('div', { class: 'page-head' }, h('h1', {}, 'Дашборд'),
-    h('div', { class: 'toolbar', style: 'margin:0' }, campSel, periodControl(() => load()), currencyControl(() => load()), h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'))), body);
+    h('div', { class: 'toolbar', style: 'margin:0' }, campSel, periodControl(() => load()), currencyControl(() => load()), h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'), h('button', { class: 'btn', onclick: () => goalsModal() }, 'Цели'))), body);
   async function load() {
     const { from, to } = periodRange();
     const campaign = campSel.value || null;
@@ -482,6 +482,12 @@ async function pageDashboard() {
       const [s, series, recent, team, botsData, statsBotsData] = await Promise.all([api('/stats' + qs({ from, to, campaign })), timeseries({ campaign, from, to }), api('/api/clicks' + qs({ from, to, campaign, limit: 10 })).catch(() => ({ clicks: [] })), api('/api/settings').catch(() => ({ buyerSharePct: 35 })), api('/api/bots' + qs({ from, to, campaign, limit: 1000 })).catch(() => ({ bots: [] })), api('/stats/bots' + qs({ from, to, campaign })).catch(() => ({ total: 0, byCampaign: {} }))]);
       const sharePct = Number(team.buyerSharePct) || 0;
       const profit = (s.revenue || 0) - (s.cost || 0);
+      const goals = store.get('goals', {});
+      const goalBar = (numVal, goal) => {
+        if (!goal) return null;
+        const p = Math.round(Math.max(0, Math.min(numVal / goal * 100, 100)));
+        return h('div', { class: 'goal-wrap' }, h('div', { class: 'goal-track' }, h('div', { class: 'goal-bar', style: `width:${p}%` })), h('span', { class: 'goal-pct' }, `${p}% плана`));
+      };
       // The buyer earns a share of positive net profit; a loss means 0, not a negative payout.
       const buyerEarnings = Math.max(0, profit) * sharePct / 100;
       const isOwner = state.me?.user?.role === 'owner' || !state.me?.loginRequired;
@@ -497,7 +503,10 @@ async function pageDashboard() {
       const top5 = (id, title, rows, nameOf, link) => h('div', { class: 'card' }, h('h2', {}, title), dataTable({ id: 'dash-t5-' + id, pageSize: 5, compact: true, totals: false, rows: [...rows].sort((a, b) => b.revenue - a.revenue).slice(0, 5), columns: [{ key: 'id', label: 'Название', fixed: true, cls: 'name', render: (r) => h('a', { href: link(r) }, nameOf(r)) }, ...metricCols().filter((c) => ['clicks', 'conversions', 'revenue', 'roi'].includes(c.key))] }));
       put(body, 
         h('div', { class: 'kpis' }, kpi('Клики', num(s.clicks), 'var(--k1)'), kpi('Уник. клики', num(s.uniqueClicks), 'var(--k2)'), kpi('Конверсии', num(s.conversions), 'var(--k3)'), kpi('CR', pct(ratio(s.conversions, s.clicks)), 'var(--k2)'),
-          kpi('Доход', money(s.revenue), 'var(--k5)'), kpi('Расход', money(s.cost || 0), 'var(--k4)'), kpi('Прибыль', h('span', { class: profit >= 0 ? '' : 'neg' }, money(profit)), 'var(--k8)'), kpi('ROI', pct(ratio(profit, s.cost || 0)), 'var(--k9)'), earningsTile,
+          h('div', { class: 'kpi', style: 'background:var(--k5)' }, h('div', { class: 'k' }, 'Доход'), h('div', { class: 'v' }, money(s.revenue)), goalBar(s.revenue, goals.revenueGoal)),
+          kpi('Расход', money(s.cost || 0), 'var(--k4)'),
+          h('div', { class: 'kpi', style: 'background:var(--k8)' }, h('div', { class: 'k' }, 'Прибыль'), h('div', { class: 'v' }, h('span', { class: profit >= 0 ? '' : 'neg' }, money(profit))), goalBar(profit, goals.profitGoal)),
+          kpi('ROI', pct(ratio(profit, s.cost || 0)), 'var(--k9)'), earningsTile,
           kpi('EPC', money4(ratio(s.revenue, s.clicks)), 'var(--k6)'), kpi('RPM', money(ratio(s.revenue * 1000, s.clicks)), 'var(--k7)'),
           botsData.bots?.length > 0 ? h('a', { href: '#/botlog' + (campaign ? qs({ campaign }) : ''), style: 'text-decoration:none' },
             h('div', { class: 'kpi', style: 'background:var(--bad)' }, h('div', { class: 'k' }, 'Боты'), h('div', { class: 'v' }, botsData.bots.length >= 1000 ? '1000+' : num(botsData.bots.length)))) : null),
@@ -566,6 +575,22 @@ async function pageDashboard() {
     } catch (e) { put(body, h('p', { class: 'err' }, 'Ошибка загрузки: ' + e.message)); }
   }
   load();
+  function goalsModal() {
+    const g = store.get('goals', {});
+    const rev = h('input', { class: 'input', type: 'number', min: '0', step: '0.01', value: g.revenueGoal || '', placeholder: '0' });
+    const prf = h('input', { class: 'input', type: 'number', min: '0', step: '0.01', value: g.profitGoal || '', placeholder: '0' });
+    let close;
+    close = openModal({
+      title: 'Цели на день',
+      body: h('div', { style: 'display:grid;gap:10px' },
+        h('label', { class: 'field' }, h('span', {}, 'Цель по доходу (€)'), rev),
+        h('label', { class: 'field' }, h('span', {}, 'Цель по прибыли (€)'), prf)),
+      footer: h('button', { class: 'btn primary', onclick: () => {
+        store.set('goals', { revenueGoal: parseFloat(rev.value) || 0, profitGoal: parseFloat(prf.value) || 0 });
+        close(); load();
+      } }, 'Сохранить'),
+    });
+  }
 }
 
 function shareModal(current, onSaved) {
