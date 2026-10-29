@@ -1,4 +1,4 @@
-import http from 'node:http';
+﻿import http from 'node:http';
 import { randomUUID, createHash, timingSafeEqual } from 'node:crypto';
 import { mkdir, appendFile, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -768,7 +768,17 @@ async function stats({ campaign = null, allowed = null, from = null, to = null, 
         ${where}
         GROUP BY c.campaign, c.country, c.offer_id, c.stream, c.landing_id
       `, params);
-      return { ...reportFromRows(rows), currency };
+      const report = { ...reportFromRows(rows), currency };
+      report.bySource = Object.create(null); report.byNetwork = Object.create(null);
+      for (const row of rows) {
+        const source = campaigns.get(row.campaign)?.sourceId; const network = offers.get(row.offer_id)?.networkId;
+        for (const [key, id] of [['bySource', source || 'none'], ['byNetwork', network || 'none']]) {
+          report[key][id] ||= { clicks: 0, conversions: 0, revenue: 0, cost: 0, uniqueClicks: 0 };
+          const target = report[key][id]; for (const f of ['clicks','conversions','revenue','cost','uniqueClicks','leads','sales','rejected','trash','pendingRevenue']) target[f] = (target[f] || 0) + (Number(row[f] ?? row[f.replace(/[A-Z]/g, (m) => '_' + m.toLowerCase())]) || 0);
+        }
+      }
+      report.bySource = Object.fromEntries(Object.entries(report.bySource).map(([k,v]) => [k, metrics(v)])); report.byNetwork = Object.fromEntries(Object.entries(report.byNetwork).map(([k,v]) => [k, metrics(v)]));
+      return report;
     } catch (e) {
       if (e.statusCode) throw e;
       console.warn('[db] stats fallback to JSONL:', e.message);
@@ -794,9 +804,13 @@ async function stats({ campaign = null, allowed = null, from = null, to = null, 
     });
     const visibleClickIds = new Set(clicks.map((c) => c.clickId));
     const conversions = [...latestConversions(lines).values()].filter((item) => visibleClickIds.has(item.clickId));
+    const conversionByClick = new Map(conversions.map((item) => [item.clickId, item]));
     const lpClicked = new Set(lines.filter((item) => item.type === 'lp_click').map((item) => item.clickId));
-    return { ...reportFromEvents(clicks.map((c) => convertClickCost(lpClicked.has(c.clickId) ? { ...c, lpClicked: true } : c, currency)),
-      conversions.map((cv) => convertConversion(cv, currency))), currency };
+    const report = { ...reportFromEvents(clicks.map((c) => convertClickCost(lpClicked.has(c.clickId) ? { ...c, lpClicked: true } : c, currency)), conversions.map((cv) => convertConversion(cv, currency))), currency };
+    report.bySource = Object.create(null); report.byNetwork = Object.create(null);
+    for (const click of clicks) { const source = campaigns.get(click.campaign)?.sourceId || 'none'; const network = offers.get(click.offerId)?.networkId || 'none'; const cv = conversionByClick.get(click.clickId); const one = reportFromEvents([click], cv ? [cv] : []); for (const [key,id] of [['bySource',source],['byNetwork',network]]) { report[key][id] ||= { clicks:0, conversions:0, revenue:0, cost:0, uniqueClicks:0 }; for (const f of ['clicks','conversions','revenue','cost','uniqueClicks','leads','sales','rejected','trash','pendingRevenue']) report[key][id][f] = (report[key][id][f] || 0) + (one[f] || 0); } }
+    report.bySource = Object.fromEntries(Object.entries(report.bySource).map(([k,v]) => [k, metrics(v)])); report.byNetwork = Object.fromEntries(Object.entries(report.byNetwork).map(([k,v]) => [k, metrics(v)]));
+    return report;
   } catch (error) {
     if (error.code === 'ENOENT') return { ...reportFromEvents([], []), currency };
     throw error;
@@ -1471,7 +1485,7 @@ const server = http.createServer(async (req, res) => {
       if ((from && !/^\d{4}-\d{2}-\d{2}$/.test(from)) || (to && !/^\d{4}-\d{2}-\d{2}$/.test(to))) return json(res, 400, { error: 'invalid_date' });
       const campaign = req.scope?.campaign || null;
       const allowed = req.scope?.allowed || null;
-      const GROUP_PROP = { campaign: 'byCampaign', offer: 'byOffer', stream: 'byStream', landing: 'byLanding', country: 'byCountry' };
+      const GROUP_PROP = { campaign: 'byCampaign', offer: 'byOffer', stream: 'byStream', landing: 'byLanding', country: 'byCountry', source: 'bySource', network: 'byNetwork' };
       let rows;
       if (GROUP_PROP[group]) {
         const report = await stats({ campaign, allowed, from, to, currency, subid: url.searchParams.get('subid') || null,
