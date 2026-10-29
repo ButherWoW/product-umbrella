@@ -91,7 +91,7 @@ export function conversionValues(rawRevenue, rawCurrency) {
 }
 
 export function createConversionRecorder({ findClick, hasConversion, currentConversion = null, record, windowDaysForClick = () => null,
-  onRecorded = () => {}, onDeliveryError = () => {}, now = Date.now }) {
+  defaultRevenue = () => null, onRecorded = () => {}, onDeliveryError = () => {}, now = Date.now }) {
   const lock = createKeyedLock();
   return async ({ clickId, revenue: rawRevenue, currency: rawCurrency, status: rawStatus }) => {
     if (!clickId) throw failure(400, 'click_id_required');
@@ -111,7 +111,9 @@ export function createConversionRecorder({ findClick, hasConversion, currentConv
         if (now() - clickedAt > windowDays * 86400000)
           throw failure(409, 'conversion_window_expired', { conversionWindowDays: windowDays });
       }
-      const values = conversionValues(rawRevenue, rawCurrency);
+      // No amount in the postback: a first conversion takes the offer payout (in the offer currency, else the postback one).
+      const fallback = !existing && (rawRevenue === null || rawRevenue === undefined || rawRevenue === '') ? defaultRevenue(click) : null;
+      const values = fallback ? conversionValues(fallback.revenue, fallback.currency || rawCurrency) : conversionValues(rawRevenue, rawCurrency);
       // A status-only update (no amount) keeps the amount reported earlier.
       if (values.revenue === null && existing?.revenue !== null && existing?.revenue !== undefined) {
         values.revenue = existing.revenue;

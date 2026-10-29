@@ -13,6 +13,9 @@ CREATE TABLE IF NOT EXISTS offers (
   url text NOT NULL CHECK (url ~ '^https://'),
   active boolean NOT NULL DEFAULT true,
   postback_url text,
+  payout_type text NOT NULL DEFAULT 'cpa',
+  payout numeric(12,4),
+  payout_currency text,
   daily_cap integer,
   name text,
   created_at timestamptz NOT NULL DEFAULT now()
@@ -55,6 +58,7 @@ CREATE TABLE IF NOT EXISTS clicks (
   stream text,
   params jsonb,
   cost numeric(12,6) NOT NULL DEFAULT 0,
+  revenue numeric(12,6) NOT NULL DEFAULT 0,
   landing_id text,
   lp_clicked_at timestamptz,
   is_unique_campaign boolean NOT NULL DEFAULT true,

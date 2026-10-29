@@ -32,6 +32,9 @@ await db.query(`
 `);
 await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT true`);
 await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS postback_url TEXT`);
+await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS payout_type TEXT NOT NULL DEFAULT 'cpa'`);
+await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS payout NUMERIC(12,4)`);
+await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS payout_currency TEXT`);
 
 await db.query(`
   CREATE TABLE IF NOT EXISTS clicks (
@@ -93,6 +96,8 @@ await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS connection TEXT`);
 for (const column of ['is_unique_campaign', 'is_unique_stream', 'is_unique_global']) await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS ${column} BOOLEAN NOT NULL DEFAULT true`);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS params JSONB`);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS cost NUMERIC(12,6) NOT NULL DEFAULT 0`);
+// CPC offer payout earned by the click (DEFAULT_CURRENCY).
+await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS revenue NUMERIC(12,6) NOT NULL DEFAULT 0`);
 
 await db.query(`
   CREATE TABLE IF NOT EXISTS conversions (

@@ -52,7 +52,10 @@
           "name": { "type": ["string", "null"] },
           "conversionCap": { "type": ["integer", "null"], "minimum": 1, "description": "Lead + sale conversions per local day in capTz" },
           "capTz": { "type": "string", "default": "UTC", "description": "IANA time zone of the cap day" },
-          "altOfferId": { "type": ["string", "null"], "description": "Offer that takes the traffic when the conversion cap is reached (chain up to 3 hops)" }
+          "altOfferId": { "type": ["string", "null"], "description": "Offer that takes the traffic when the conversion cap is reached (chain up to 3 hops)" },
+          "payoutType": { "type": "string", "enum": ["cpa", "cpc"], "default": "cpa", "description": "cpa: payout per conversion (used when the postback has no revenue); cpc: payout earned by every click" },
+          "payout": { "type": ["number", "null"], "minimum": 0 },
+          "payoutCurrency": { "type": ["string", "null"], "description": "ISO 4217; null = DEFAULT_CURRENCY" }
         }
       },
       "Landing": {
@@ -448,7 +451,8 @@
         "tags": ["tracking"],
         "parameters": [
           { "name": "click_id", "in": "query", "required": true, "schema": { "type": "string", "format": "uuid" } },
-          { "name": "revenue", "in": "query", "schema": { "type": "number" } },
+          { "name": "revenue", "in": "query", "schema": { "type": "number" }, "description": "Without revenue (or payout) a CPA offer's payout is recorded" },
+          { "name": "payout", "in": "query", "schema": { "type": "number" }, "description": "Alias of revenue" },
           { "name": "currency", "in": "query", "schema": { "type": "string" } },
           {
             "name": "status",
@@ -943,7 +947,10 @@
                   "name": { "type": ["string", "null"] },
                   "conversionCap": { "type": ["integer", "null"], "minimum": 1, "description": "Lead + sale conversions per local day in capTz" },
                   "capTz": { "type": "string", "default": "UTC", "description": "IANA time zone of the cap day" },
-                  "altOfferId": { "type": ["string", "null"], "description": "Offer that takes the traffic when the conversion cap is reached (chain up to 3 hops)" }
+                  "altOfferId": { "type": ["string", "null"], "description": "Offer that takes the traffic when the conversion cap is reached (chain up to 3 hops)" },
+                  "payoutType": { "type": "string", "enum": ["cpa", "cpc"], "default": "cpa", "description": "cpa: payout per conversion (used when the postback has no revenue); cpc: payout earned by every click" },
+                  "payout": { "type": ["number", "null"], "minimum": 0 },
+                  "payoutCurrency": { "type": ["string", "null"], "description": "ISO 4217; null = DEFAULT_CURRENCY" }
                 }
               }
             }
@@ -983,7 +990,10 @@
                   "name": { "type": ["string", "null"] },
                   "conversionCap": { "type": ["integer", "null"], "minimum": 1, "description": "Lead + sale conversions per local day in capTz" },
                   "capTz": { "type": "string", "default": "UTC", "description": "IANA time zone of the cap day" },
-                  "altOfferId": { "type": ["string", "null"], "description": "Offer that takes the traffic when the conversion cap is reached (chain up to 3 hops)" }
+                  "altOfferId": { "type": ["string", "null"], "description": "Offer that takes the traffic when the conversion cap is reached (chain up to 3 hops)" },
+                  "payoutType": { "type": "string", "enum": ["cpa", "cpc"], "default": "cpa", "description": "cpa: payout per conversion (used when the postback has no revenue); cpc: payout earned by every click" },
+                  "payout": { "type": ["number", "null"], "minimum": 0 },
+                  "payoutCurrency": { "type": ["string", "null"], "description": "ISO 4217; null = DEFAULT_CURRENCY" }
                 }
               }
             }
