@@ -1926,6 +1926,23 @@ await loadNetworks();
 await loadOffers();
 await loadLandings();
 await loadCampaigns();
+// One-time copy of bot events recorded before the bots table existed (only while the table is empty).
+if (db) {
+  try {
+    const { rows } = await db.query('SELECT 1 FROM bots LIMIT 1');
+    if (!rows.length) {
+      const old = (await readFile(eventsFile, 'utf8').catch(() => '')).split('\n').filter(Boolean)
+        .map((line) => { try { return JSON.parse(line); } catch { return null; } }).filter((e) => e?.type === 'bot' && e.campaign);
+      for (let i = 0; i < old.length; i += 500) {
+        const chunk = old.slice(i, i + 500); const values = [];
+        const tuples = chunk.map((e, j) => { values.push(e.campaign, e.offerId ?? null, e.stream ?? null, e.userAgent ?? null, e.ip ?? null, e.reason ?? null, e.at || new Date().toISOString());
+          const b = j * 7; return `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7})`; });
+        await db.query(`INSERT INTO bots (campaign, offer_id, stream, user_agent, ip, reason, created_at) VALUES ${tuples.join(',')}`, values);
+      }
+      if (old.length) console.log(`[db] copied ${old.length} bot events from the journal`);
+    }
+  } catch (error) { console.warn('[db] bot backfill skipped:', error.message); }
+}
 if (requirePostgres && !db) throw new Error('REQUIRE_POSTGRES=1, но PostgreSQL недоступен');
 server.listen(port, '127.0.0.1', () => console.log(`Product Umbrella listening on http://127.0.0.1:${server.address().port}`));
 
