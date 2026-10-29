@@ -40,3 +40,14 @@ test('Keitaro campaign → Umbrella: missing offers are reported and the stream 
   assert.equal(c.streams.length, 0);
   assert.ok(notes.some((n) => n.includes('kt-314') && n.includes('--ids 314')));
 });
+
+test('Keitaro campaign → Umbrella: streams that send bots or ad reviewers elsewhere are not imported (no cloaking)', () => {
+  const cloak = (name, filters) => ({ name, type: 'forced', position: 1, state: 'active', schema: 'redirect', action_payload: 'https://white.example.net/', filters });
+  const { campaign: c, notes } = mapCampaign(campaign, [
+    cloak('UA bots', [{ name: 'user_agent', mode: 'accept', payload: ['facebookexternalhit', 'Googlebot'] }]),
+    cloak('Not FB UA', [{ name: 'user_agent', mode: 'reject', payload: ['AdsBot-Google'] }]),
+    cloak('Bot IPs', [{ name: 'ip', mode: 'accept', payload: ['10.0.0.0/8'] }]),
+  ], {});
+  assert.deepEqual(c.streams.map((s) => s.name), ['Bot IPs'], 'only the stream without a bot/reviewer condition is kept');
+  assert.equal(notes.filter((n) => n.includes('клоакинг запрещён')).length, 2);
+});

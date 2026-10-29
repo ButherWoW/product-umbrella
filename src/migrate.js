@@ -85,6 +85,8 @@ await db.query(`
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
   )
 `);
+// Owner of an offer / landing / source / network: the creating user's id; NULL = team (created by the owner or ADMIN_TOKEN).
+for (const table of ['offers', 'landings', 'sources', 'networks']) await db.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS owner_id TEXT`);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS landing_id TEXT`);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS lp_clicked_at TIMESTAMPTZ`);
 for (const column of ['device', 'os', 'browser', 'language']) await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS ${column} TEXT`);

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createJournalIndex, createClickCounters, createScanQueue, readJournalRecords } from '../src/journal-index.js';
+import { createJournalIndex, createClickCounters, createScanQueue, createOldClickLookup, readJournalRecords } from '../src/journal-index.js';
 
 const today = new Date().toISOString().slice(0, 10);
 const click = (n, extra = {}) => ({ type: 'click', at: `${today}T10:00:${String(n % 60).padStart(2, '0')}Z`, clickId: `c${n}`, campaign: 'camp', offerId: n % 2 ? 'odd' : 'even', ip: `10.0.0.${n}`, ...extra });
@@ -73,4 +73,20 @@ test('scan queue runs one scan at a time, in order', async () => {
   const failing = queue.run(async () => { throw new Error('boom'); });
   assert.deepEqual(await Promise.all([job('a', 20), job('b', 1), failing.catch((e) => e.message)]), ['a', 'b', 'boom']);
   assert.deepEqual(log, ['start a', 'end a', 'start b', 'end b']);
+});
+
+test('old click lookup: requests that arrive together share one pass over the journal', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'umbrella-oldclick-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'events.jsonl');
+  await writeFile(file, [click(1), click(2), { type: 'conversion', clickId: 'c1' }].map((l) => JSON.stringify(l)).join('\n') + '\n');
+  let runs = 0;
+  const queue = createScanQueue();
+  const counted = { run: (task) => queue.run(() => { runs += 1; return task(); }) };
+  const lookup = createOldClickLookup(file, counted);
+  const [a, b, none] = await Promise.all([lookup('c1'), lookup('c2'), lookup('nope')]);
+  assert.equal(a.campaign, 'camp'); assert.equal(b.clickId, 'c2'); assert.equal(none, null);
+  assert.equal(runs, 1);
+  assert.equal((await lookup('c2')).clickId, 'c2');
+  assert.equal(runs, 2);
 });

@@ -1,4 +1,6 @@
 // Umbrella admin UI — layout and workflows modelled on Keitaro, backed by the existing tracker API.
+// The no-cloaking rule is the server's own module (src/stream-policy.js, served as /admin/stream-policy.js).
+import { cloakingCondition, cloakingMessage, disabledByPolicy } from './stream-policy.js';
 const state = { token: null, offers: {}, campaigns: {}, landings: {}, sources: {}, networks: {}, users: [] };
 // Set by the server when the tracker runs under a path prefix (BASE_PATH, e.g. /umbrella behind nginx).
 const BASE = document.querySelector('meta[name="umbrella-base"]')?.getAttribute('content') || '';
@@ -98,6 +100,10 @@ const isOwnerView = () => state.me?.user?.role === 'owner';
 const hideRev = () => Boolean(state.me?.user?.hideRevenue) && state.me.user.role !== 'owner';
 const REV_COLS = new Set(['revenue', 'profit', 'roi', 'epc', 'rpm', 'uepc', 'pendingRevenue', 'earn']);
 const ROLE_LABEL = { owner: 'Владелец', buyer: 'Баер', viewer: 'Только чтение' };
+// Offers, landings, sources and networks: a buyer changes only what they created (the server enforces it; the panel
+// only hides the controls). Without a signed-in user (ADMIN_TOKEN / fresh install) everything is editable.
+const canManage = (e) => !state.me?.user || state.me.user.role === 'owner' || (Boolean(e?.ownerId) && e.ownerId === state.me.user.id);
+const ownerBadge = (e) => (canManage(e) ? null : [' ', h('span', { class: 'badge', title: 'Только просмотр: изменить может создатель или владелец' }, e?.ownerId ? 'чужой' : 'командный')]);
 const userEmail = (id) => state.users.find((u) => u.id === id)?.email || (id ? 'удалённый пользователь' : '—');
 
 // ---------- period ----------
@@ -301,10 +307,12 @@ function dataTable({ id, columns, rows = [], selectable = false, pageSize = 50, 
   function exportMenu(cols, all) {
     const wrap = h('span', { class: 'dropdown' });
     const plain = (c, r) => { const v = valueOf(c, r); return v === null || v === undefined ? '' : String(v); };
+    // Text cells starting with = + - @ tab or CR get a leading ' so spreadsheets do not run them as formulas (numbers stay as they are).
+    const cellText = (c, r) => { const v = valueOf(c, r), text = plain(c, r); return typeof v !== 'number' && /^[=+\-@\t\r]/.test(text) ? "'" + text : text; };
     const close = () => wrap.querySelector('.menu')?.remove();
     const csv = () => {
-      const esc = (v) => (/[",\n;]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v);
-      download(id + '.csv', 'text/csv;charset=utf-8', '﻿' + [cols.map((c) => esc(c.label)).join(','), ...all.map((r) => cols.map((c) => esc(plain(c, r))).join(','))].join('\n'));
+      const esc = (v) => (/[",\n\r;]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v);
+      download(id + '.csv', 'text/csv;charset=utf-8', '﻿' + [cols.map((c) => esc(c.label)).join(','), ...all.map((r) => cols.map((c) => esc(cellText(c, r))).join(','))].join('\n'));
       close();
     };
     const html = () => {
@@ -1125,8 +1133,10 @@ function streamModal(stream, onApply, isNew = false, currentCampaignId = null) {
   s.action = s.action || 'offers';
   s.offers = s.offers || [];
   const err = h('p', { class: 'err' });
-  const offerIds = Object.keys(state.offers);
-  const landingIds = Object.keys(state.landings);
+  // Buyers may put only team entities and their own into streams; ids already in the stream stay selectable.
+  const usable = (e) => canManage(e) || !e?.ownerId;
+  const offerIds = Object.keys(state.offers).filter((id) => usable(state.offers[id]) || s.offers.some((o) => o.offerId === id));
+  const landingIds = Object.keys(state.landings).filter((id) => usable(state.landings[id]) || (s.landings || []).some((l) => l.landingId === id));
   s.landings = s.landings || [];
   const landingsBox = h('div');
   const drawLandings = () => put(landingsBox,
@@ -1160,7 +1170,7 @@ function streamModal(stream, onApply, isNew = false, currentCampaignId = null) {
         h('label', {}, h('input', { type: 'radio', name: 'scount', checked: s.countClicks === false, onchange: () => { s.countClicks = false; } }), 'Нет')),
         'В выключенном состоянии клики через этот поток не попадут в отчёты и логи.'),
       field('Состояние', h('div', { class: 'radios' },
-        h('label', {}, h('input', { type: 'radio', name: 'senabled', checked: s.enabled !== false, onchange: () => { delete s.enabled; } }), 'Включен'),
+        h('label', {}, h('input', { type: 'radio', name: 'senabled', checked: s.enabled !== false, onchange: () => { delete s.enabled; delete s.disabledBy; delete s.disabledReason; } }), 'Включен'),
         h('label', {}, h('input', { type: 'radio', name: 'senabled', checked: s.enabled === false, onchange: () => { s.enabled = false; } }), 'Выключен'))))],
     ['Схема', () => {
       const box = h('div');
@@ -1186,7 +1196,7 @@ function streamModal(stream, onApply, isNew = false, currentCampaignId = null) {
       cfield('browsers', 'Браузеры', checkGroup(COND.browsers, s.conditions.browsers, (v) => { s.conditions.browsers = v; })),
       cfield('languages', 'Языки', h('input', { class: 'input', 'aria-label': 'Языки', value: s.conditions.languages.join(', '), placeholder: 'fr, de', oninput: (e) => { s.conditions.languages = splitList(e.target.value).map((x) => x.toLowerCase()); } }), 'Два первых символа Accept-Language.'),
       cfield('isps', 'Провайдеры', h('input', { class: 'input', 'aria-label': 'Провайдеры', value: s.conditions.isps.join(', '), placeholder: 'orange, free mobile', oninput: (e) => { s.conditions.isps = splitComma(e.target.value).map((x) => x.toLowerCase()); } }), 'Часть названия провайдера, как в отчёте «Провайдер». Без базы провайдеров условие не срабатывает.'),
-      cfield('connections', 'Тип соединения', checkGroup(COND.connections, s.conditions.connections, (v) => { s.conditions.connections = v; }), 'По базе провайдеров (ASN), приблизительно: мобильными считаются только чисто мобильные сети (T-Mobile, Verizon Wireless, Free Mobile…), смешанные операторы (Orange, SFR, Bouygues) — домашний. Без базы условие не срабатывает.'),
+      cfield('connections', 'Тип соединения', checkGroup(COND.connections.filter(([v]) => v !== 'datacenter' || s.conditions.connections.includes(v)), s.conditions.connections, (v) => { s.conditions.connections = v; }), 'По базе провайдеров (ASN), приблизительно: мобильными считаются только чисто мобильные сети (T-Mobile, Verizon Wireless, Free Mobile…), смешанные операторы (Orange, SFR, Bouygues) — домашний. Без базы условие не срабатывает. Отделять дата-центры (ботов и модераторов) нельзя — клоакинг запрещён.'),
       cfield('referrers', 'Реферер', h('input', { class: 'input', 'aria-label': 'Реферер', value: s.conditions.referrers.join(', '), placeholder: 'facebook.com, instagram.com/ads', oninput: (e) => { s.conditions.referrers = splitComma(e.target.value).map((x) => x.toLowerCase()); } }), 'Часть адреса источника перехода (домен и путь), без учёта регистра.'),
       cfield('emptyReferrer', 'Пустой реферер', h('div', { class: 'radios' }, [[undefined, 'Не важно'], [true, 'Пустой'], [false, 'Не пустой']].map(([v, l]) => h('label', {},
         h('input', { type: 'radio', name: 'semptyref', checked: s.conditions.emptyReferrer === v, onchange: () => { if (v === undefined) delete s.conditions.emptyReferrer; else s.conditions.emptyReferrer = v; } }), l)))),
@@ -1216,6 +1226,9 @@ function streamModal(stream, onApply, isNew = false, currentCampaignId = null) {
       if (s.landings.some((l) => !(l.weight > 0))) { err.textContent = 'Веса лендингов должны быть больше нуля.'; return; }
       if (s.action !== 'offers' || !s.landings.length) delete s.landings;
       const cond = s.conditions;
+      // Same rule as the server: bots and ad reviewers must get what people get. Checked before cond is trimmed.
+      const cloaking = disabledByPolicy(s) ? null : cloakingCondition(cond);
+      if (cloaking) { err.textContent = cloakingMessage(s.name, cloaking); return; }
       for (const k of ['referrers', 'keywords', 'ips', 'userAgents']) if (!cond[k].length) delete cond[k];
       if (!Object.keys(cond.params).length) delete cond.params;
       for (const k of ['dateFrom', 'dateTo']) if (!cond[k]) delete cond[k];
@@ -1313,7 +1326,7 @@ async function pageCampaignEditor(id) {
       h('div', { class: 'field-row' },
         field('Дневной кап кликов', h('input', { class: 'input', type: 'number', min: 1, value: d.dailyCap ?? '', placeholder: 'нет', oninput: bind('dailyCap', 'int') })),
         field('Общий кап кликов', h('input', { class: 'input', type: 'number', min: 1, value: d.totalCap ?? '', placeholder: 'нет', oninput: bind('totalCap', 'int') }), 'При достижении кампания встаёт на паузу.')),
-      field(`Дневной кап дохода, ${currency.info?.defaultCurrency || 'EUR'}`, h('input', { class: 'input', type: 'number', min: 0, step: '0.01', value: d.revenueCap ?? '', placeholder: 'нет', oninput: bind('revenueCap', 'float') })),
+      hideRev() ? null : field(`Дневной кап дохода, ${currency.info?.defaultCurrency || 'EUR'}`, h('input', { class: 'input', type: 'number', min: 0, step: '0.01', value: d.revenueCap ?? '', placeholder: 'нет', oninput: bind('revenueCap', 'float') })),
       field('URL при достижении капа', h('input', { class: 'input', type: 'url', value: d.capUrl || '', placeholder: 'https://… (иначе ответ 429)', oninput: bind('capUrl', 'url') })))],
     ['Tracking', () => isNew ? h('p', { class: 'muted' }, 'Ссылка кампании будет доступна после её сохранения.') : h('div', {},
       field('Домен трекинга', h('select', { class: 'select', onchange: (e) => { d.domain = e.target.value || null; mark(); } },
@@ -1351,7 +1364,8 @@ async function pageCampaignEditor(id) {
         h('div', { style: 'min-width:0' },
           h('div', { class: 'title', onclick: () => streamModal(s, (next) => { d.streams[i] = next; mark(); drawStreams(); }, false, d.id) },
             `${i + 1}. ${s.name} `, h('span', { class: 'badge ' + (s.type || 'regular') }, typeLabel[s.type || 'regular']),
-            s.enabled === false ? [' ', h('span', { class: 'badge', title: s.disabledBy === 'monitor' ? 'Оффер или лендинг не отвечает; поток включится сам, когда они снова ответят' : null }, s.disabledBy === 'monitor' ? 'Выключен монитором' : 'Выключен')] : null,
+            s.enabled === false ? [' ', h('span', { class: 'badge', title: s.disabledBy === 'monitor' ? 'Оффер или лендинг не отвечает; поток включится сам, когда они снова ответят' : s.disabledBy === 'policy' ? s.disabledReason || null : null },
+              s.disabledBy === 'monitor' ? 'Выключен монитором' : s.disabledBy === 'policy' ? 'Выключен: клоакинг запрещён' : 'Выключен')] : null,
             s.countClicks === false ? [' ', h('span', { class: 'badge' }, 'Клики не считаются')] : null),
           h('div', { class: 'meta' }, summarizeConditions(s.conditions)),
           h('div', { class: 'meta' }, (s.action === 'url' ? 'Прямой URL: ' + s.url : s.action === 'campaign' ? '→ кампания ' + (state.campaigns[s.campaignId]?.name || s.campaignId) : s.action === 'not_found' ? 'Действие: ошибка 404' : (s.landings?.length ? 'Лендинги: ' + s.landings.map((l) => `${state.landings[l.landingId]?.name || l.landingId} (${l.weight ?? 1})`).join(', ') + ' → ' : '') + 'Офферы: ' + (s.offers || []).map((o) => `${o.offerId} (${o.weight ?? 1})`).join(', ')) + ((s.type || 'regular') === 'regular' ? ` · вес потока ${s.weight ?? 1}` : ''))),
@@ -1379,7 +1393,7 @@ async function pageCampaignEditor(id) {
     for (const k of ['dailyCap', 'totalCap', 'conversionWindowDays']) if (Number.isNaN(d[k]) || (d[k] !== null && d[k] < 1)) { err.textContent = 'Капы и окно конверсии — целые числа больше нуля.'; return; }
     const names = d.streams.map((s) => s.name);
     if (new Set(names).size !== names.length) { err.textContent = 'Названия потоков должны различаться — по ним строится статистика.'; return; }
-    const body = { name: d.name.trim(), group: (d.group || '').trim(), active: d.active, streams: d.streams, dailyCap: d.dailyCap, totalCap: d.totalCap, revenueCap: d.revenueCap, capUrl: d.capUrl, geoCapUrl: d.geoCapUrl,
+    const body = { name: d.name.trim(), group: (d.group || '').trim(), active: d.active, streams: d.streams, dailyCap: d.dailyCap, totalCap: d.totalCap, ...(hideRev() ? {} : { revenueCap: d.revenueCap }), capUrl: d.capUrl, geoCapUrl: d.geoCapUrl,
       allowGeos: d.allowGeos, allowDevices: d.allowDevices, allowOS: d.allowOS, allowBrowsers: d.allowBrowsers, blockedIps: d.blockedIps, allowedIps: d.allowedIps,
       dedupeWindow: d.dedupeWindow || 0, botFilter: d.botFilter, datacenterAsBot: Boolean(d.datacenterAsBot), conversionWindowDays: d.conversionWindowDays, redirectMethod: d.redirectMethod || 'http', domain: d.domain || null, uniquenessHours: d.uniquenessHours ?? 24, streamRotation: d.streamRotation || 'weight', bindVisitors: d.bindVisitors || 'off', bindTtlHours: d.bindTtlHours ?? 24, ...(isOwnerView() ? { ownerId: d.ownerId || null } : {}), paramMap: d.paramMap || {}, costModel: d.costModel || 'none', cpc: d.cpc, costFromParam: d.costFromParam || false, sourceId: d.sourceId || null,
       sourcePostbackUrl: d.sourcePostbackUrl || null, sourcePostbackStatuses: d.sourcePostbackStatuses || [], monitoring: d.monitoring || 'notify' };
@@ -1403,7 +1417,7 @@ async function pageCampaignEditor(id) {
         else if (droppedParams.length) toast('Параметры отклонены сервером: ' + droppedParams.join(', '), true);
         else toast('Сохранено');
       }
-    } catch (e) { err.textContent = 'Не сохранено: ' + e.message; }
+    } catch (e) { err.textContent = 'Не сохранено: ' + (e.data?.message || (e.message === 'revenue_hidden' ? 'поля дохода недоступны вашей роли' : e.message)); }
     finally { saveBtn.disabled = false; }
   }
 
@@ -1547,10 +1561,10 @@ async function pageSources() {
   const table = dataTable({
     id: 'sources', pageSize: 250,
     columns: [
-      { key: 'id', label: 'ID', fixed: true, render: (r) => h('a', { href: '#/sources', onclick: (e) => { e.preventDefault(); sourceModal(r.id, load); } }, r.id) },
+      { key: 'id', label: 'ID', fixed: true, render: (r) => (canManage(r) ? h('a', { href: '#/sources', onclick: (e) => { e.preventDefault(); sourceModal(r.id, load); } }, r.id) : r.id) },
       { key: 'menu', label: '', title: 'Меню', sortable: false, value: () => '', render: (r) => h('span', { class: 'row-actions' },
-        h('button', { title: 'Изменить', 'aria-label': 'Изменить', onclick: () => sourceModal(r.id, load) }, '✎')) },
-      { key: 'name', label: 'Название', cls: 'name', value: (r) => r.name || '', render: (r) => h('span', { title: r.name || '' }, r.name || '—') },
+        canManage(r) ? h('button', { title: 'Изменить', 'aria-label': 'Изменить', onclick: () => sourceModal(r.id, load) }, '✎') : null) },
+      { key: 'name', label: 'Название', cls: 'name', value: (r) => r.name || '', render: (r) => h('span', { title: r.name || '' }, r.name || '—', ownerBadge(r)) },
       { key: 'costModel', label: 'Модель', value: (r) => r.costModel === 'cpc' ? 'CPC' : 'Нет' },
       { key: 'cpc', label: 'CPC', num: true, render: (r) => (r.cpc ? money4(r.cpc) : '—') },
       { key: 'postback', label: 'Постбэк', value: (r) => (r.postbackUrl ? (r.postbackStatuses || []).join(', ') : '—') },
@@ -1694,8 +1708,8 @@ async function pageLandings() {
   const table = dataTable({
     id: 'landings', pageSize: 250,
     columns: [
-      { key: 'id', label: 'ID', fixed: true, render: (r) => h('a', { href: '#/landings', onclick: (e) => { e.preventDefault(); landingModal(r.id, load); } }, r.id) },
-      { key: 'name', label: 'Название', cls: 'name', value: (r) => r.name || '', render: (r) => r.name || '—' },
+      { key: 'id', label: 'ID', fixed: true, render: (r) => (canManage(r) ? h('a', { href: '#/landings', onclick: (e) => { e.preventDefault(); landingModal(r.id, load); } }, r.id) : r.id) },
+      { key: 'name', label: 'Название', cls: 'name', value: (r) => r.name || '', render: (r) => h('span', {}, r.name || '—', ownerBadge(r)) },
       { key: 'url', label: 'URL', cls: 'name', hidden: true },
       { key: 'clicks', label: 'Просмотры', title: 'Просмотры лендинга (клики, попавшие на лендинг)', num: true, render: (r) => num(r.clicks), total: (rs) => num(sum(rs, 'clicks')) },
       { key: 'lpClicks', label: 'Клики LP', title: 'Переходы с лендинга на оффер', num: true, render: (r) => num(r.lpClicks), total: (rs) => num(sum(rs, 'lpClicks')) },
@@ -1723,10 +1737,10 @@ async function pageLandings() {
 
 async function pageNetworks() {
   const table = dataTable({ id: 'networks', pageSize: 250, columns: [
-    { key: 'id', label: 'ID', fixed: true }, { key: 'name', label: 'Название', cls: 'name' },
+    { key: 'id', label: 'ID', fixed: true }, { key: 'name', label: 'Название', cls: 'name', render: (r) => h('span', {}, r.name || '—', ownerBadge(r)) },
     { key: 'clickIdParam', label: 'Click ID' }, { key: 'payoutParam', label: 'Payout' }, { key: 'offerParams', label: 'Параметры оффера', cls: 'name' },
     { key: 'notes', label: 'Заметки', cls: 'name' },
-    { key: 'actions', label: '', sortable: false, render: (r) => h('span', { class: 'row-actions' }, h('button', { onclick: () => networkModal(r, load) }, 'Изменить')) },
+    { key: 'actions', label: '', sortable: false, render: (r) => h('span', { class: 'row-actions' }, canManage(r) ? h('button', { onclick: () => networkModal(r, load) }, 'Изменить') : null) },
   ] });
   function networkModal(current, onSaved) {
     const n = { id: current?.id || '', name: current?.name || '', offerParams: current?.offerParams || '', clickIdParam: current?.clickIdParam || 'sub1', payoutParam: current?.payoutParam || 'payout', notes: current?.notes || '' };
@@ -1757,14 +1771,14 @@ async function pageOffers() {
   const table = dataTable({
     id: 'offers', selectable: true, pageSize: 250,
     columns: [
-      { key: 'id', label: 'ID', fixed: true, render: (r) => h('a', { href: '#/offers', onclick: (e) => { e.preventDefault(); offerModal(r.id, load); } }, r.id) },
+      { key: 'id', label: 'ID', fixed: true, render: (r) => (canManage(r) ? h('a', { href: '#/offers', onclick: (e) => { e.preventDefault(); offerModal(r.id, load); } }, r.id) : r.id) },
       { key: 'menu', label: '', title: 'Меню', sortable: false, value: () => '', render: (r) => h('span', { class: 'row-actions' },
-        h('button', { title: 'Изменить', 'aria-label': 'Изменить', onclick: () => offerModal(r.id, load) }, '✎'),
+        canManage(r) ? h('button', { title: 'Изменить', 'aria-label': 'Изменить', onclick: () => offerModal(r.id, load) }, '✎') : null,
         h('a', { href: '#/reports' + qs({ group: 'country', offer: r.id }), title: 'Отчёт', 'aria-label': 'Отчёт' }, '▥'),
         h('a', { href: '#/clicks' + qs({ offer: r.id }), title: 'Лог кликов', 'aria-label': 'Лог кликов' }, '☰'),
-        h('button', { title: 'Копировать', 'aria-label': 'Копировать', onclick: () => cloneEntity('offers', r.id, load) }, '⧉'),
-        archiveButton('offers', r, load)) },
-      { key: 'name', label: 'Название', cls: 'name', value: (r) => r.name || '', render: (r) => h('span', { title: r.name || '' }, r.name || '—') },
+        canManage(r) ? h('button', { title: 'Копировать', 'aria-label': 'Копировать', onclick: () => cloneEntity('offers', r.id, load) }, '⧉') : null,
+        canManage(r) ? archiveButton('offers', r, load) : null) },
+      { key: 'name', label: 'Название', cls: 'name', value: (r) => r.name || '', render: (r) => h('span', { title: r.name || '' }, r.name || '—', ownerBadge(r)) },
       { key: 'group', label: 'Группа', value: (r) => r.group || '', render: (r) => r.group || '—' },
       { key: 'url', label: 'URL', cls: 'name', hidden: true, render: (r) => h('span', { title: r.url }, r.url) },
       { key: 's2s', label: 'S2S', value: (r) => (r.postbackUrl ? 'да' : 'нет') },
@@ -1958,7 +1972,7 @@ async function pageReports(params) {
       h('button', { class: 'btn', title: 'Скачать CSV', 'aria-label': 'CSV', onclick: () => {
         const tbl = holder.querySelector('table.grid');
         if (!tbl) { toast('Нет данных для экспорта', true); return; }
-        const esc = (v) => { const s = String(v ?? '').trim().replace(/\r/g, ''); const fc = s[0]; if (fc === '=' || fc === '+' || fc === '-' || fc === '@') return `"'${s.replace(/"/g, '""')}"`;  if (s.includes(',') || s.includes('"') || s.includes('\n')) return `"${s.replace(/"/g, '""')}"`;  return s; };
+        const esc = (v) => { const s = String(v ?? '').trim().replace(/\r/g, ''); const fc = s[0]; if (fc === '=' || fc === '+' || fc === '-' || fc === '@' || fc === '\t' || fc === '\r') return `"'${s.replace(/"/g, '""')}"`;  if (s.includes(',') || s.includes('"') || s.includes('\n')) return `"${s.replace(/"/g, '""')}"`;  return s; };
         const hdr = [...tbl.querySelectorAll('thead tr:first-child th')].map((th) => esc(th.textContent.trim()));
         const dataRows = [...tbl.querySelectorAll('tbody tr, tfoot tr')].filter((tr) => !tr.classList.contains('sub-row')).map((tr) => [...tr.querySelectorAll('td')].map((td) => esc(td.textContent.trim())).join(','));
         const csv = '﻿' + [hdr.join(','), ...dataRows].join('\r\n');

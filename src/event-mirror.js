@@ -58,7 +58,7 @@ export function createEventMirror({ query, onError = () => {} }) {
         if (payload.params && Object.keys(payload.params).length)
           await query(`UPDATE clicks SET params = COALESCE(params, '{}'::jsonb) || $2::jsonb WHERE click_id = $1`, [payload.clickId, JSON.stringify(payload.params)]);
       }
-    }).catch((error) => { onError(type, error); });
+    }).catch((error) => { onError(type, error, payload); });
     // A logging callback must not cause an unhandled rejected mirror promise.
     const settled = task.catch(() => {});
     pending.add(settled);

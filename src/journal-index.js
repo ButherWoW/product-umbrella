@@ -242,3 +242,27 @@ export function createClickCounters({ seed, ttlMs = 60000, now = Date.now, maxId
 
   return { ensure, get, reserve, clear: () => entries.clear() };
 }
+
+// Finds clicks that are no longer in the index by streaming the journal. Lookups that arrive while a scan is
+// queued join it, so any number of requests for old (or unknown) click ids costs at most one running and one
+// queued pass over the file.
+export function createOldClickLookup(eventsFile, queue) {
+  let batch = null;
+  return function lookup(clickId) {
+    if (!batch) {
+      const current = batch = { ids: new Set(), promise: null };
+      current.promise = queue.run(async () => {
+        batch = null; // later lookups start the next pass
+        const found = new Map();
+        await scanJournalLines(eventsFile, (line) => {
+          const id = /"clickId"\s*:\s*"([^"]+)"/.exec(line)?.[1];
+          if (!id || !current.ids.has(id)) return;
+          try { const item = JSON.parse(line); if (item.type === 'click' && item.clickId === id) found.set(id, item); } catch { /* skip */ }
+        });
+        return found;
+      });
+    }
+    batch.ids.add(clickId);
+    return batch.promise.then((found) => found.get(clickId) || null);
+  };
+}
