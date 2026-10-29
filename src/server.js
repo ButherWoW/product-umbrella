@@ -359,14 +359,15 @@ function parseOffer(raw) {
   if (!/^https:\/\//i.test(urlStr)) return null;
   const postbackUrl = raw?.postbackUrl && /^https:\/\//i.test(String(raw.postbackUrl)) ? String(raw.postbackUrl).slice(0, 2048) : null;
   const dailyCap = Number.isInteger(raw?.dailyCap) && raw.dailyCap > 0 ? raw.dailyCap : null;
-  return { url: urlStr, postbackUrl, dailyCap };
+  const name = typeof raw?.name === 'string' && raw.name.trim() ? raw.name.trim().slice(0, 200) : null;
+  return { url: urlStr, postbackUrl, dailyCap, name };
 }
 
 async function loadOffers() {
   if (db) {
     try {
-      const { rows } = await db.query('SELECT id, url, postback_url, daily_cap FROM offers');
-      for (const row of rows) if (/^[a-z0-9_-]{2,80}$/i.test(row.id) && /^https:\/\//i.test(row.url)) offers.set(row.id, parseOffer({ url: row.url, postbackUrl: row.postback_url, dailyCap: row.daily_cap }));
+      const { rows } = await db.query('SELECT id, url, postback_url, daily_cap, name FROM offers');
+      for (const row of rows) if (/^[a-z0-9_-]{2,80}$/i.test(row.id) && /^https:\/\//i.test(row.url)) offers.set(row.id, parseOffer({ url: row.url, postbackUrl: row.postback_url, dailyCap: row.daily_cap, name: row.name }));
       return;
     } catch (error) { console.warn('[db] offers load fallback:', error.message); }
   }
@@ -387,7 +388,7 @@ async function saveOffers() {
 
 async function persistOffer(id, value) {
   const offer = typeof value === 'string' ? { url: value, postbackUrl: null } : value;
-  if (db) await db.query('INSERT INTO offers (id, url, postback_url, daily_cap) VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO UPDATE SET url = EXCLUDED.url, postback_url = EXCLUDED.postback_url, daily_cap = EXCLUDED.daily_cap', [id, offer.url, offer.postbackUrl, offer.dailyCap ?? null]);
+  if (db) await db.query('INSERT INTO offers (id, url, postback_url, daily_cap, name) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO UPDATE SET url = EXCLUDED.url, postback_url = EXCLUDED.postback_url, daily_cap = EXCLUDED.daily_cap, name = EXCLUDED.name', [id, offer.url, offer.postbackUrl, offer.dailyCap ?? null, offer.name ?? null]);
   else await saveOffers();
 }
 
@@ -974,7 +975,7 @@ const server = http.createServer(async (req, res) => {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const body = await readJson(req);
       if (!/^[a-z0-9_-]{2,80}$/i.test(String(body.id || '')) || !/^https:\/\//i.test(String(body.url || ''))) return json(res, 400, { error: 'id_and_https_url_required' });
-      const offer = parseOffer({ url: String(body.url), postbackUrl: body.postbackUrl, dailyCap: body.dailyCap });
+      const offer = parseOffer({ url: String(body.url), postbackUrl: body.postbackUrl, dailyCap: body.dailyCap, name: body.name });
       if (!offer) return json(res, 400, { error: 'id_and_https_url_required' });
       offers.set(String(body.id), offer);
       await persistOffer(String(body.id), offer);
@@ -990,7 +991,7 @@ const server = http.createServer(async (req, res) => {
       const newUrl = body.url !== undefined ? String(body.url) : cur.url;
       const newPostbackUrl = body.postbackUrl !== undefined ? body.postbackUrl : cur.postbackUrl;
       const newDailyCap = body.dailyCap !== undefined ? body.dailyCap : cur.dailyCap;
-      const updated = parseOffer({ url: newUrl, postbackUrl: newPostbackUrl, dailyCap: newDailyCap });
+      const updated = parseOffer({ url: newUrl, postbackUrl: newPostbackUrl, dailyCap: newDailyCap, name: body.name !== undefined ? body.name : cur.name });
       if (!updated) return json(res, 400, { error: 'invalid_url' });
       offers.set(id, updated);
       await persistOffer(id, updated);

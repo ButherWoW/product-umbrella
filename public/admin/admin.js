@@ -493,7 +493,7 @@ function streamModal(stream, onApply, isNew = false) {
   const drawOffers = () => put(offersBox, 
     s.offers.length ? s.offers.map((o, i) => h('div', { class: 'offer-row' },
       h('select', { class: 'select', 'aria-label': 'Оффер', onchange: (e) => { o.offerId = e.target.value; } },
-        h('option', { value: '' }, 'Выберите оффер'), offerIds.map((id) => h('option', { value: id, selected: o.offerId === id }, id))),
+        h('option', { value: '' }, 'Выберите оффер'), offerIds.map((id) => h('option', { value: id, selected: o.offerId === id }, state.offers[id]?.name ? `${state.offers[id].name} (${id})` : id))),
       h('input', { class: 'input', type: 'number', min: 1, value: o.weight ?? 1, 'aria-label': 'Вес', title: 'Вес', oninput: (e) => { o.weight = Number(e.target.value); } }),
       h('button', { class: 'btn danger square', 'aria-label': 'Убрать оффер', onclick: () => { s.offers.splice(i, 1); drawOffers(); } }, '✕'))) : h('p', { class: 'muted' }, 'Офферы не добавлены.'),
     h('button', { class: 'btn', onclick: () => { s.offers.push({ offerId: offerIds[0] || '', weight: 1 }); drawOffers(); } }, '+ Добавить оффер'),
@@ -677,11 +677,12 @@ async function pageCampaignEditor(id) {
 
 function offerModal(id, onSaved) {
   const isNew = !id;
-  const o = isNew ? { id: '', url: '', postbackUrl: '', dailyCap: '' } : { id, ...state.offers[id], postbackUrl: state.offers[id].postbackUrl || '', dailyCap: state.offers[id].dailyCap ?? '' };
+  const o = isNew ? { id: '', name: '', url: '', postbackUrl: '', dailyCap: '' } : { id, ...state.offers[id], name: state.offers[id].name || '', postbackUrl: state.offers[id].postbackUrl || '', dailyCap: state.offers[id].dailyCap ?? '' };
   const err = h('p', { class: 'err' });
   const body = tabs([
     ['Основные', () => h('div', {},
       field('ID оффера', h('input', { class: 'input', value: o.id, readonly: !isNew, oninput: (e) => { o.id = e.target.value.trim(); } }), isNew ? 'Латиница, цифры, - и _.' : null),
+      field('Название', h('input', { class: 'input', value: o.name, maxlength: 200, oninput: (e) => { o.name = e.target.value; } })),
       field('URL', h('input', { class: 'input', type: 'url', value: o.url, placeholder: 'https://…', oninput: (e) => { o.url = e.target.value.trim(); } }), 'Макросы: {click_id} {subid} {campaign} {offer_id} {device} {country}. Если {click_id} нет — click_id добавится параметром.'))],
     ['Настройки', () => h('div', {},
       field('Дневной кап кликов', h('input', { class: 'input', type: 'number', min: 1, value: o.dailyCap, placeholder: 'нет', oninput: (e) => { o.dailyCap = e.target.value; } }), 'Считается по всем кампаниям; в потоках капнутый оффер пропускается.'),
@@ -698,7 +699,7 @@ function offerModal(id, onSaved) {
       if (Number.isNaN(cap) || (cap !== null && cap < 1)) { err.textContent = 'Дневной кап — целое число больше нуля.'; return; }
       if (isNew && state.offers[o.id]) { err.textContent = 'Оффер с таким ID уже есть.'; return; }
       try {
-        const body2 = { url: o.url, postbackUrl: o.postbackUrl || null, dailyCap: cap };
+        const body2 = { name: o.name.trim() || null, url: o.url, postbackUrl: o.postbackUrl || null, dailyCap: cap };
         await (isNew ? api('/api/offers', { method: 'POST', body: { id: o.id, ...body2 } }) : api('/api/offers/' + encodeURIComponent(o.id), { method: 'PATCH', body: body2 }));
         toast(isNew ? 'Оффер создан' : 'Сохранено'); close(); onSaved();
       } catch (e) { err.textContent = 'Не сохранено: ' + e.message; }
@@ -715,7 +716,8 @@ async function pageOffers() {
         h('button', { title: 'Изменить', 'aria-label': 'Изменить', onclick: () => offerModal(r.id, load) }, '✎'),
         h('a', { href: '#/reports' + qs({ group: 'country', offer: r.id }), title: 'Отчёт', 'aria-label': 'Отчёт' }, '▥'),
         h('a', { href: '#/clicks' + qs({ offer: r.id }), title: 'Лог кликов', 'aria-label': 'Лог кликов' }, '☰')) },
-      { key: 'url', label: 'URL', cls: 'name', render: (r) => h('span', { title: r.url }, r.url) },
+      { key: 'name', label: 'Название', cls: 'name', value: (r) => r.name || '', render: (r) => h('span', { title: r.name || '' }, r.name || '—') },
+      { key: 'url', label: 'URL', cls: 'name', hidden: true, render: (r) => h('span', { title: r.url }, r.url) },
       { key: 's2s', label: 'S2S', value: (r) => (r.postbackUrl ? 'да' : 'нет') },
       { key: 'dailyCap', label: 'Дневной кап', num: true, render: (r) => r.dailyCap ?? '—' },
       ...metricCols(),

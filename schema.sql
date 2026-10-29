@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS offers (
   active boolean NOT NULL DEFAULT true,
   postback_url text,
   daily_cap integer,
+  name text,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 

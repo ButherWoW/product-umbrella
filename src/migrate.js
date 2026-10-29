@@ -51,6 +51,7 @@ await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS country TEXT`);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS ip TEXT`);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS stream TEXT`);
 await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS daily_cap INTEGER`);
+await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS name TEXT`);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS params JSONB`);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS cost NUMERIC(12,6) NOT NULL DEFAULT 0`);
 
