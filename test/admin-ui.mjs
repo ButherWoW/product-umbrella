@@ -111,11 +111,12 @@ try {
   }
   await page.screenshot({ path: join(tmpdir(), 'umbrella-admin-mobile.png'), fullPage: true });
 
-  // Saved reports: save two reports with different groups, reload, verify both persist and load with correct filters.
+  // Saved reports: save two reports with different groups+periods, reload, verify both persist and restore filters.
   await page.setViewportSize({ width: 1280, height: 900 });
   await page.goto(server.url + '/admin#/reports');
   await page.getByRole('heading', { name: 'Отчёт' }).waitFor();
-  // Save first report with group = Страна
+  // Save first report: group = Страна, period = Вчера
+  await page.getByLabel('Период').selectOption('yesterday');
   await page.getByRole('button', { name: 'Страна' }).click();
   await page.locator('.chip-btn.on', { hasText: 'Страна' }).waitFor();
   await page.getByRole('button', { name: '💾 Сохранить' }).click();
@@ -124,7 +125,8 @@ try {
   await repSaveDialog.getByLabel('Название отчёта').fill('Rep-1');
   await repSaveDialog.getByRole('button', { name: 'Сохранить' }).click();
   await repSaveDialog.waitFor({ state: 'detached' });
-  // Save second report with group = Оффер
+  // Save second report: group = Оффер, period = Последние 7 дней
+  await page.getByLabel('Период').selectOption('last_7_days');
   await page.getByRole('button', { name: 'Оффер' }).click();
   await page.locator('.chip-btn.on', { hasText: 'Оффер' }).waitFor();
   await page.getByRole('button', { name: '💾 Сохранить' }).click();
@@ -141,12 +143,16 @@ try {
   await page.getByRole('heading', { name: 'Отчёт' }).waitFor();
   await page.getByRole('button', { name: 'Открыть Rep-1' }).waitFor();
   await page.getByRole('button', { name: 'Открыть Rep-2' }).waitFor();
-  // Click Rep-1 → filters restore to Страна group
+  // Click Rep-1 → full page re-render: Страна group active, period = yesterday
   await page.getByRole('button', { name: 'Открыть Rep-1' }).click();
+  await page.getByRole('heading', { name: 'Отчёт' }).waitFor();
   await page.locator('.chip-btn.on', { hasText: 'Страна' }).waitFor();
-  // Click Rep-2 → filters restore to Оффер group
+  assert.equal(await page.getByLabel('Период').inputValue(), 'yesterday', 'Rep-1 period restored');
+  // Click Rep-2 → full page re-render: Оффер group active, period = last_7_days
   await page.getByRole('button', { name: 'Открыть Rep-2' }).click();
+  await page.getByRole('heading', { name: 'Отчёт' }).waitFor();
   await page.locator('.chip-btn.on', { hasText: 'Оффер' }).waitFor();
+  assert.equal(await page.getByLabel('Период').inputValue(), 'last_7_days', 'Rep-2 period restored');
 
   assert.deepEqual(errors, []);
 

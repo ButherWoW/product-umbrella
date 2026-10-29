@@ -1128,10 +1128,9 @@ async function pageReports(params) {
     savedBar.hidden = false;
     put(savedBar, saved.map((s, i) => h('span', { class: 'chip-btn', style: 'display:inline-flex;align-items:center;gap:4px' },
       h('button', { style: 'background:none;border:none;padding:0;cursor:pointer;color:inherit', 'aria-label': 'Открыть ' + s.name, onclick: () => {
-        Object.assign(f, { group: s.group, campaign: s.campaign || '', offer: s.offer || '', country: s.country || '', stream: s.stream || '', subid: s.subid || '' });
         if (s.period) { period.key = s.period.key; period.from = s.period.from; period.to = s.period.to; store.set('period', period); }
         if (s.currency) { currency.code = s.currency; store.set('currency', currency.code); }
-        drawPresets(); load();
+        location.hash = '#/reports' + qs({ group: s.group || 'campaign', campaign: s.campaign || '', offer: s.offer || '', country: s.country || '', stream: s.stream || '', subid: s.subid || '', field: s.field || '' });
       } }, s.name),
       h('button', { style: 'background:none;border:none;padding:0 2px;cursor:pointer;color:var(--fg-3)', 'aria-label': 'Удалить ' + s.name, onclick: () => { const upd = store.get('reports:saved', []).filter((_, j) => j !== i); store.set('reports:saved', upd); drawSaved(); } }, '✕'))));
   };
