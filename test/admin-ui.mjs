@@ -93,6 +93,24 @@ try {
   await offerDialog.getByRole('button', { name: 'Сохранить' }).click();
   assert.equal((await (await fetch(server.url + '/api/offers')).json()).offers['offer-1'].networkId, 'net-ui');
 
+  // Archive/clone actions for campaigns and offers.
+  await page.goto(server.url + '/admin#/campaigns');
+  const campaignRow = page.locator('table.grid tbody tr', { hasText: 'UI flows' });
+  await campaignRow.getByRole('button', { name: 'Копировать кампанию' }).click();
+  await page.locator('#toast', { hasText: 'Кампания скопирована' }).waitFor();
+  await campaignRow.getByRole('button', { name: 'В архив' }).click();
+  await page.locator('#toast', { hasText: 'Кампания архивирована' }).waitFor();
+  await page.getByLabel('Состояние').selectOption('archived');
+  await page.locator('table.grid tbody tr', { hasText: 'UI flows' }).waitFor();
+  await page.goto(server.url + '/admin#/offers');
+  const offerRow = page.locator('table.grid tbody tr', { hasText: 'offer-1' });
+  await offerRow.getByRole('button', { name: 'Копировать' }).click();
+  await page.locator('#toast', { hasText: 'Оффер скопирован' }).waitFor();
+  await offerRow.getByRole('button', { name: 'В архив' }).click();
+  await page.locator('#toast', { hasText: 'Оффер архивирован' }).waitFor();
+  await page.getByLabel('Состояние').selectOption('archived');
+  await page.locator('table.grid tbody tr', { hasText: 'offer-1' }).waitFor();
+
 
   // Currency switch on the dashboard: 25 USD = 20 EUR = 2000 RUB at the fixed test rates.
   await page.goto(server.url + '/admin#/dashboard');
