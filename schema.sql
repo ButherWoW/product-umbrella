@@ -33,6 +33,9 @@ CREATE TABLE IF NOT EXISTS clicks (
   cost numeric(12,6) NOT NULL DEFAULT 0,
   landing_id text,
   lp_clicked_at timestamptz,
+  is_unique_campaign boolean NOT NULL DEFAULT true,
+  is_unique_stream boolean NOT NULL DEFAULT true,
+  is_unique_global boolean NOT NULL DEFAULT true,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 

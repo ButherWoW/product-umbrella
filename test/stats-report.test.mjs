@@ -27,16 +27,16 @@ test('all report dimensions preserve conversions and revenue', () => {
 
 test('PostgreSQL aggregates produce the same report as JSONL events', () => {
   const rows = [
-    { campaign: 'alpha', country: 'US', offer_id: 'offer-a', stream: 'ios', clicks: 1, conversions: 1, sales: 1, revenue: '4.25' },
-    { campaign: 'alpha', country: 'US', offer_id: 'offer-b', stream: 'ios', clicks: 1, conversions: 0, revenue: 0 },
-    { campaign: 'beta', country: null, offer_id: 'offer-a', stream: null, clicks: 1, conversions: 1, sales: 1, revenue: '1.75' },
+    { campaign: 'alpha', country: 'US', offer_id: 'offer-a', stream: 'ios', clicks: 1, unique_clicks: 1, conversions: 1, sales: 1, revenue: '4.25' },
+    { campaign: 'alpha', country: 'US', offer_id: 'offer-b', stream: 'ios', clicks: 1, unique_clicks: 1, conversions: 0, revenue: 0 },
+    { campaign: 'beta', country: null, offer_id: 'offer-a', stream: null, clicks: 1, unique_clicks: 1, conversions: 1, sales: 1, revenue: '1.75' },
   ];
   assert.deepEqual(reportFromRows(rows), reportFromEvents(clicks, conversions));
 });
 
 test('empty reports always expose metrics and all dimensions', () => {
   const report = reportFromEvents([], []);
-  assert.deepEqual(report, { clicks: 0, conversions: 0, revenue: 0, cost: 0, lpClicks: 0, leads: 0, sales: 0, rejected: 0, trash: 0, pendingRevenue: 0, lpCtr: 0, profit: 0, cr: 0, epc: 0, rpm: 0, roi: 0,
+  assert.deepEqual(report, { clicks: 0, conversions: 0, revenue: 0, cost: 0, lpClicks: 0, uniqueClicks: 0, leads: 0, sales: 0, rejected: 0, trash: 0, pendingRevenue: 0, lpCtr: 0, profit: 0, cr: 0, epc: 0, rpm: 0, roi: 0,
     byCampaign: {}, byCountry: {}, byOffer: {}, byStream: {}, byLanding: {} });
 });
 
@@ -57,9 +57,9 @@ test('cost, profit and ROI aggregate per dimension and match between JSONL and P
   assert.equal(report.byCampaign.alpha.profit, 3.25);
   assert.equal(reportFromEvents(clicks, []).roi, 0, 'no cost means ROI 0, not Infinity');
   const rows = [
-    { campaign: 'alpha', country: 'US', offer_id: 'offer-a', stream: 'ios', clicks: 1, conversions: 1, sales: 1, revenue: '4.25', cost: '0.5' },
-    { campaign: 'alpha', country: 'US', offer_id: 'offer-b', stream: 'ios', clicks: 1, conversions: 0, revenue: 0, cost: 0.5 },
-    { campaign: 'beta', country: null, offer_id: 'offer-a', stream: null, clicks: 1, conversions: 1, sales: 1, revenue: '1.75', cost: 0.25 },
+    { campaign: 'alpha', country: 'US', offer_id: 'offer-a', stream: 'ios', clicks: 1, unique_clicks: 1, conversions: 1, sales: 1, revenue: '4.25', cost: '0.5' },
+    { campaign: 'alpha', country: 'US', offer_id: 'offer-b', stream: 'ios', clicks: 1, unique_clicks: 1, conversions: 0, revenue: 0, cost: 0.5 },
+    { campaign: 'beta', country: null, offer_id: 'offer-a', stream: null, clicks: 1, unique_clicks: 1, conversions: 1, sales: 1, revenue: '1.75', cost: 0.25 },
   ];
   assert.deepEqual(reportFromRows(rows), report);
 });

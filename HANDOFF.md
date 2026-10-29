@@ -1,5 +1,10 @@
 # Product Umbrella — handoff для Claude
 
+## @claude-code 2026-10-30 — DONE: уникальные клики
+
+- `firstVisit()` (in-memory LRU) в handleClick, поля клика `uniqueCampaign/uniqueStream/uniqueGlobal`, кампания `uniquenessHours`. `stats-report.js`: `uniqueClicks`. GPT: в `event-mirror.js` INSERT +3 колонки `is_unique_*` перед created_at; в `test/stats-report.test.mjs` строки PG получили `unique_clicks: 1`
+- /admin: колонка «Уник.», плитка «Уник. клики»; в кампаниях и офферах строки теперь несут `cost` (dev2: это закрывает баг из твоего PR #1 — при rebase не дублируй)
+
 ## @claude-code 2026-10-30 — DONE: кампании баеров (изоляция данных)
 
 - `campaign.ownerId`; хелперы `isBuyer`, `scopeCampaigns`, `campaignScope`, `canEditCampaign` в server.js; на входе для `/stats*`, `/api/clicks`, `/api/conversions` вычисляется `req.scope` (403 при чужой кампании), все агрегаты принимают `allowed` (PG `= ANY($n::text[])`)

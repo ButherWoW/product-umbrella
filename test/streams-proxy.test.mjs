@@ -274,3 +274,19 @@ test('multi-currency: amounts kept in their currency, reports converted at curre
   const log = (await (await fetch(server.url + '/api/conversions?campaign=demo&limit=10')).json()).conversions;
   assert.ok(log.some((c) => c.revenue === 25 && c.currency === 'USD'), 'the log keeps the original amount and currency');
 });
+
+test('unique clicks: repeat visitor within the window is not unique', { timeout: 15000 }, async (t) => {
+  await withServer(t, { TRUST_PROXY: '1' }, async ({ url, post, hit }) => {
+    await post('/api/campaigns', { id: 'uniq', name: 'Uniq', uniquenessHours: 24 });
+    const A = { 'x-forwarded-for': '198.51.100.1', 'user-agent': 'UA-1' };
+    const B = { 'x-forwarded-for': '198.51.100.2', 'user-agent': 'UA-1' };
+    await hit('/r/uniq/offer-1', A); await hit('/r/uniq/offer-1', A); await hit('/r/uniq/offer-1', B);
+    await hit('/r/demo/offer-1', A);
+    const s = await (await fetch(url + '/stats?campaign=uniq')).json();
+    assert.equal(s.clicks, 3);
+    assert.equal(s.uniqueClicks, 2, 'A twice + B once = 2 unique');
+    const demo = await (await fetch(url + '/stats?campaign=demo')).json();
+    assert.equal(demo.uniqueClicks, 1, 'uniqueness is per campaign');
+    assert.equal((await (await fetch(url + '/api/campaigns')).json()).campaigns.uniq.uniquenessHours, 24);
+  });
+});

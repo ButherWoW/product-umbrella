@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { mkdir, appendFile, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -257,6 +257,19 @@ function detectDevice(ua) {
 }
 
 // Count clicks recorded today (UTC) for a campaign. Non-fatal — returns 0 on error.
+// Unique visitors (Keitaro «Уник.»): same IP + User-Agent within the campaign's uniqueness window is not unique.
+// In-memory and bounded; after a restart the first repeat visit of a returning visitor counts as unique again.
+const seenVisitors = new Map();
+const SEEN_LIMIT = 300000;
+function firstVisit(key, windowMs, now = Date.now()) {
+  const hash = createHash('sha1').update(key).digest('base64');
+  const last = seenVisitors.get(hash);
+  seenVisitors.delete(hash);
+  seenVisitors.set(hash, now);
+  if (seenVisitors.size > SEEN_LIMIT) seenVisitors.delete(seenVisitors.keys().next().value);
+  return !(last && now - last < windowMs);
+}
+
 // Count clicks by campaign and/or offer, optionally since a UTC ISO timestamp. Non-fatal — returns 0 on error.
 async function countClicks({ campaign = null, offerId = null, since = null } = {}) {
   if (db) {
@@ -459,6 +472,7 @@ function parseCampaign(id, value) {
     // Revenue cap: stop after earning revenueCap per day
     revenueCap: typeof value.revenueCap === 'number' && value.revenueCap > 0 ? value.revenueCap : null,
     botFilter: value.botFilter === true,
+    uniquenessHours: Number.isInteger(value.uniquenessHours) && value.uniquenessHours >= 1 && value.uniquenessHours <= 720 ? value.uniquenessHours : 24,
     ownerId: /^[0-9a-f-]{36}$/i.test(String(value.ownerId || '')) ? String(value.ownerId).toLowerCase() : null,
     redirectMethod: REDIRECT_METHODS.includes(value.redirectMethod) ? value.redirectMethod : 'http',
     blockedIps: parseIpRules(value.blockedIps),
@@ -543,6 +557,7 @@ async function stats({ campaign = null, allowed = null, from = null, to = null, 
           c.landing_id,
           COUNT(c.lp_clicked_at)::int             AS lp_clicks,
           COUNT(c.click_id)::int                  AS clicks,
+          COUNT(c.click_id) FILTER (WHERE c.is_unique_campaign)::int AS unique_clicks,
           ${SQL_CONVERSIONS}::int                 AS conversions,
           ${fx.revenue}::float                    AS revenue,
           COUNT(cv.click_id) FILTER (WHERE cv.status = 'lead')::int     AS leads,
@@ -1090,6 +1105,11 @@ const server = http.createServer(async (req, res) => {
 
       // Streams with countClicks=false redirect normally but stay out of logs and reports, as in Keitaro.
       if (countClick) {
+        const visitor = `${ip}|${req.headers['user-agent'] || ''}`;
+        const windowMs = (c.uniquenessHours || 24) * 3600 * 1000;
+        const uniqueness = { uniqueCampaign: firstVisit(`c|${campaignId}|${visitor}`, windowMs), uniqueStream: firstVisit(`s|${campaignId}|${streamName || ''}|${visitor}`, windowMs),
+          uniqueGlobal: firstVisit(`g|${visitor}`, windowMs) };
+        Object.assign(extra, uniqueness);
         await event('click', { clickId, campaign: campaignId, offerId, path: url.pathname, referrer: req.headers.referer || null, userAgent: req.headers['user-agent'] || null, subid, country, ip, stream: streamName, ...extra, ...(Object.keys(params).length ? { params } : {}), ...(cost ? { cost } : {}) });
         if (totalCount !== null && totalCount + 1 >= c.totalCap) await pauseCampaign(campaignId, 'total_cap_reached');
       }
@@ -1304,6 +1324,7 @@ const server = http.createServer(async (req, res) => {
         dedupeWindow: body.dedupeWindow === undefined ? cur.dedupeWindow : body.dedupeWindow,
         revenueCap: body.revenueCap === undefined ? cur.revenueCap : body.revenueCap,
         botFilter: body.botFilter === undefined ? cur.botFilter : body.botFilter,
+        uniquenessHours: body.uniquenessHours === undefined ? cur.uniquenessHours : body.uniquenessHours,
         ownerId: body.ownerId === undefined || req.user?.role === 'buyer' ? cur.ownerId : body.ownerId,
         redirectMethod: body.redirectMethod === undefined ? cur.redirectMethod : body.redirectMethod,
         blockedIps: body.blockedIps === undefined ? cur.blockedIps : body.blockedIps,

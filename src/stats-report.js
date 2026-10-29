@@ -11,19 +11,19 @@ export function metrics(value) {
 }
 
 export function emptyReport() {
-  return { clicks: 0, conversions: 0, revenue: 0, cost: 0, lpClicks: 0, leads: 0, sales: 0, rejected: 0, trash: 0, pendingRevenue: 0,
+  return { clicks: 0, conversions: 0, revenue: 0, cost: 0, lpClicks: 0, uniqueClicks: 0, leads: 0, sales: 0, rejected: 0, trash: 0, pendingRevenue: 0,
     ...Object.fromEntries(GROUPS.map((key) => [key, Object.create(null)])) };
 }
 
 function add(report, keys, value) {
   const counts = { clicks: Number(value.clicks) || 0, conversions: Number(value.conversions) || 0,
-    revenue: Number(value.revenue) || 0, cost: Number(value.cost) || 0, lpClicks: Number(value.lpClicks ?? value.lp_clicks) || 0,
+    revenue: Number(value.revenue) || 0, cost: Number(value.cost) || 0, lpClicks: Number(value.lpClicks ?? value.lp_clicks) || 0, uniqueClicks: Number(value.uniqueClicks ?? value.unique_clicks) || 0,
     leads: Number(value.leads) || 0, sales: Number(value.sales) || 0, rejected: Number(value.rejected) || 0, trash: Number(value.trash) || 0,
     pendingRevenue: Number(value.pendingRevenue ?? value.pending_revenue) || 0 };
   for (const field of Object.keys(counts)) report[field] += counts[field];
   GROUPS.forEach((group, index) => {
     const key = keys[index];
-    report[group][key] ||= { clicks: 0, conversions: 0, revenue: 0, cost: 0, lpClicks: 0, leads: 0, sales: 0, rejected: 0, trash: 0, pendingRevenue: 0 };
+    report[group][key] ||= { clicks: 0, conversions: 0, revenue: 0, cost: 0, lpClicks: 0, uniqueClicks: 0, leads: 0, sales: 0, rejected: 0, trash: 0, pendingRevenue: 0 };
     for (const field of Object.keys(counts)) report[group][key][field] += counts[field];
   });
 }
@@ -51,7 +51,7 @@ export function reportFromEvents(clicks, conversions) {
     const amount = Number(conversion?.revenue) || 0;
     add(report, [click.campaign, click.country || 'unknown', click.offerId || 'unknown',
       click.stream || 'default', click.landingId || 'none'], { clicks: 1, conversions: status === 'lead' || status === 'sale' ? 1 : 0,
-      revenue: status === 'sale' ? amount : 0, pendingRevenue: status === 'lead' ? amount : 0, cost: click.cost ?? 0, lpClicks: click.lpClicked ? 1 : 0,
+      revenue: status === 'sale' ? amount : 0, pendingRevenue: status === 'lead' ? amount : 0, cost: click.cost ?? 0, lpClicks: click.lpClicked ? 1 : 0, uniqueClicks: click.uniqueCampaign === false ? 0 : 1,
       leads: status === 'lead' ? 1 : 0, sales: status === 'sale' ? 1 : 0, rejected: status === 'rejected' ? 1 : 0, trash: status === 'trash' ? 1 : 0 });
   }
   return finish(report);
