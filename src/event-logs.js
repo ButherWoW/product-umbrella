@@ -30,7 +30,7 @@ export function parseLogQuery(params) {
     if (value && value.length > 120) throw invalid(key);
     return value;
   };
-  return { campaign: text('campaign'), offer: text('offer'), stream: text('stream'),
+  return { campaign: text('campaign'), offer: text('offer'), stream: text('stream'), click: text('click'),
     from, until: to === null ? null : to + 86400000,
     limit: integer(params, 'limit', 50, 1, 100), offset: integer(params, 'offset', 0, 0, 1000000000) };
 }
@@ -53,6 +53,8 @@ function normalizeClick(item) {
     params: item.params ?? null, cost: Number(item.cost) || 0,
     landingId: item.landingId ?? item.landing_id ?? null,
     device: item.device ?? null, os: item.os ?? null, browser: item.browser ?? null, language: item.language ?? null, isp: item.isp ?? null,
+    uniqueCampaign: item.uniqueCampaign ?? item.is_unique_campaign ?? null, uniqueStream: item.uniqueStream ?? item.is_unique_stream ?? null,
+    uniqueGlobal: item.uniqueGlobal ?? item.is_unique_global ?? null,
     // Compatibility aliases for clients of the original PostgreSQL API.
     click_id: clickId, offer_id: offerId, created_at: at, user_agent: userAgent };
 }
@@ -72,6 +74,7 @@ function matches(item, query) {
   if (query.allowed && !query.allowed.includes(item.campaign)) return false;
   if (query.offer && item.offerId !== query.offer) return false;
   if (query.stream && item.stream !== query.stream) return false;
+  if (query.click && item.clickId !== query.click) return false;
   const at = item.at ? Date.parse(item.at) : NaN;
   if (query.from !== null && (!Number.isFinite(at) || at < query.from)) return false;
   if (query.until !== null && (!Number.isFinite(at) || at >= query.until)) return false;
@@ -128,12 +131,13 @@ async function fromPostgres(kind, query, db) {
   if (query.allowed) { params.push(query.allowed); conditions.push(`c.campaign = ANY($${params.length}::text[])`); }
   if (query.offer) add('c.offer_id =', query.offer);
   if (query.stream) add("COALESCE(NULLIF(c.stream, ''), 'default') =", query.stream);
+  if (query.click) add('c.click_id =', query.click);
   const timestamp = kind === 'clicks' ? 'c.created_at' : 'cv.created_at';
   if (query.from !== null) add(`${timestamp} >=`, new Date(query.from).toISOString());
   if (query.until !== null) add(`${timestamp} <`, new Date(query.until).toISOString());
   params.push(query.limit + 1, query.offset);
   const fields = kind === 'clicks'
-    ? 'c.click_id, c.campaign, c.offer_id, c.stream, c.path, c.referrer, c.user_agent, c.subid, c.country, c.ip, c.params, c.cost, c.landing_id, c.device, c.os, c.browser, c.language, c.isp, c.created_at'
+    ? 'c.click_id, c.campaign, c.offer_id, c.stream, c.path, c.referrer, c.user_agent, c.subid, c.country, c.ip, c.params, c.cost, c.landing_id, c.device, c.os, c.browser, c.language, c.isp, c.is_unique_campaign, c.is_unique_stream, c.is_unique_global, c.created_at'
     : 'cv.click_id, c.campaign, c.offer_id, c.stream, cv.revenue, cv.currency, cv.status, cv.tid, cv.created_at';
   const source = kind === 'clicks' ? 'clicks c' : 'conversions cv JOIN clicks c USING (click_id)';
   const { rows } = await db.query(`SELECT ${fields} FROM ${source}

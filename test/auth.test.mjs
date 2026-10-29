@@ -134,6 +134,32 @@ test('buyer share setting: owner only, validated, audited', { timeout: 20000 }, 
   assert.deepEqual(log[0].changes.buyerSharePct, [35, 40]);
 });
 
+test('daily goals in settings: owner only, validated, persisted across restarts', { timeout: 20000 }, async (t) => {
+  const { call, dataDir } = await boot(t);
+  const initial = (await call('/api/settings')).json;
+  assert.equal(initial.dailyRevenueGoal, null, 'no revenue goal by default');
+  assert.equal(initial.dailyProfitGoal, null, 'no profit goal by default');
+  const owner = (await call('/api/auth/setup', { method: 'POST', body: { email: 'o@example.com', password: 'owner-password' } })).cookie;
+  await call('/api/users', { method: 'POST', cookie: owner, body: { email: 'b@example.com', password: 'buyer-password' } });
+  const buyer = (await call('/api/auth/login', { method: 'POST', body: { email: 'b@example.com', password: 'buyer-password' } })).cookie;
+  assert.equal((await call('/api/settings', { method: 'PATCH', cookie: buyer, body: { dailyRevenueGoal: 1 } })).status, 403, 'buyers cannot set team goals');
+  assert.equal((await call('/api/settings', { method: 'PATCH', cookie: owner, body: { dailyRevenueGoal: -5 } })).status, 400, 'negative goal rejected');
+  assert.equal((await call('/api/settings', { method: 'PATCH', cookie: owner, body: { dailyProfitGoal: 'abc' } })).status, 400, 'non-numeric goal rejected');
+  assert.equal((await call('/api/settings', { method: 'PATCH', cookie: owner, body: { dailyProfitGoal: true } })).status, 400, 'boolean goal rejected');
+  const saved = await call('/api/settings', { method: 'PATCH', cookie: owner, body: { dailyRevenueGoal: 100, dailyProfitGoal: 40.555 } });
+  assert.equal(saved.status, 200);
+  assert.deepEqual([saved.json.dailyRevenueGoal, saved.json.dailyProfitGoal, saved.json.buyerSharePct], [100, 40.56, 35], 'goals saved, share untouched');
+  const cleared = await call('/api/settings', { method: 'PATCH', cookie: owner, body: { dailyProfitGoal: null } });
+  assert.deepEqual([cleared.json.dailyRevenueGoal, cleared.json.dailyProfitGoal], [100, null], 'null clears one goal, the other stays');
+  const log = (await call('/api/audit?entity=settings', { cookie: owner })).json.entries;
+  assert.deepEqual(log[1].changes.dailyRevenueGoal, [null, 100], 'goal change audited');
+  const again = await startTestServer(dataDir);
+  try {
+    const persisted = await (await fetch(again.url + '/api/settings')).json();
+    assert.deepEqual([persisted.dailyRevenueGoal, persisted.dailyProfitGoal], [100, null], 'goals survive a restart');
+  } finally { await again.stop(); }
+});
+
 test('buyers see and edit only their own campaigns; owner sees all and can reassign', { timeout: 20000 }, async (t) => {
   const { call } = await boot(t);
   const owner = (await call('/api/auth/setup', { method: 'POST', body: { email: 'o@example.com', password: 'owner-password' } })).cookie;
