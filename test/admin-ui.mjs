@@ -205,6 +205,7 @@ try {
   await fetch(server.url + '/r/d11', { redirect: 'manual' });
   await fetch(`${server.url}/postback?secret=conversion-test-secret&click_id=${d11cid}&revenue=10&currency=USD`);
   const d11Stats = await (await fetch(server.url + '/stats?campaign=d11', { headers: { authorization: 'Bearer ' + TOKEN } })).json();
+  await page.setViewportSize({ width: 1280, height: 900 }); // earlier checks leave a phone-width viewport (headers hidden)
   await page.goto(server.url + '/admin#/campaigns');
   await page.locator('table.grid tbody tr', { hasText: 'D11 Test' }).waitFor();
   await page.locator('button[aria-label="Колонки"]').click();
@@ -258,7 +259,7 @@ try {
   await attentionCard.waitFor({ timeout: 10000 });
   assert.ok(await attentionCard.isVisible(), 'attention block appears with bad-ROI campaign');
   const attentionText = await attentionCard.innerText();
-  assert.ok(attentionText.includes('D13 Bad ROI') || attentionText.includes('кл.'), `attention block has campaign info, got: ${attentionText.slice(0, 100)}`);
+  assert.ok(/D13 Bad ROI|d13-bad/.test(attentionText) && /ROI/.test(attentionText), `attention block has campaign info, got: ${attentionText.slice(0, 100)}`);
 
   assert.deepEqual(errors, []);
 
