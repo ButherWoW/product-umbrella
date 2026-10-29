@@ -1,7 +1,7 @@
 import './log-setup.js';
 import http from 'node:http';
 import { randomUUID, createHash, timingSafeEqual } from 'node:crypto';
-import { mkdir, appendFile, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, appendFile, readFile, writeFile as fsWriteFile, chmod } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { db, query, closeDb } from './db.js';
@@ -13,11 +13,12 @@ import { createConversionRecorder, hasRecordedConversion, findRecordedConversion
 import { createEventMirror } from './event-mirror.js';
 import { createConversionCapCounter, resolveOffer, zonedDayStart } from './conversion-cap.js';
 import { createJournalGate, filterJournal, campaignPlan, retentionPlan, clearCampaignRows, retentionRows } from './retention.js';
-import { createSourcePostbacks, resolveSourcePostback, parsePostbackUrl, parsePostbackStatuses, journalHasSourcePostback, sendPostback, fillPostbackMacros, stripQuery, allowPrivateFromEnv, SAMPLE_MACROS } from './source-postback.js';
+import { createSourcePostbacks, resolveSourcePostback, parsePostbackUrl, parsePostbackStatuses, journalHasSourcePostback, sendPostback, deliverWithRetry, fillPostbackMacros, stripQuery, allowPrivateFromEnv, SAMPLE_MACROS } from './source-postback.js';
 import { connectionType, CONNECTION_TYPES } from './connection-type.js';
 import { createBindingStore, bindingKey, boundChoice, streamRef, parseBindMode, parseBindTtl } from './visitor-binding.js';
 import { createMonitor, MONITOR_MODES } from './monitor.js';
 import { BOT_UA_RE, DATACENTER_RE, cloakingCondition, cloakingMessage, disabledByPolicy, streamPolicyError } from './stream-policy.js';
+import { createRateLimiter, createLoginLimiter, loginLimitsFromEnv } from './rate-limit.js';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const dataDir = process.env.DATA_DIR || join(root, 'data');
@@ -28,6 +29,15 @@ const settingsFile = join(dataDir, 'settings.json');
 const campaignsFile = join(dataDir, 'campaigns.json');
 const sourcesFile = join(dataDir, 'sources.json');
 const networksFile = join(dataDir, 'networks.json');
+// Data files hold postback URLs with network credentials, visitor IPs and settings: owner-only (0600).
+// The journal is appended with the same mode; files created by older versions are tightened at startup.
+const DATA_FILE_MODE = 0o600;
+const writeFile = (file, data, options = {}) => fsWriteFile(file, data, { mode: DATA_FILE_MODE, ...options });
+async function tightenDataFiles() {
+  for (const file of [eventsFile, offersFile, landingsFile, settingsFile, campaignsFile, sourcesFile, networksFile, join(dataDir, 'users.json'), join(dataDir, 'sessions.json'), join(dataDir, 'fx-rates.json')]) {
+    try { await chmod(file, DATA_FILE_MODE); } catch (error) { if (error.code !== 'ENOENT') console.warn('[data] chmod failed:', file, error.message); }
+  }
+}
 const port = Number(process.env.PORT || 4100);
 // Public path prefix when served behind a proxy under a subpath (nginx strips it before proxying).
 const basePath = /^\/[A-Za-z0-9_-]{1,40}$/.test(process.env.BASE_PATH || '') ? process.env.BASE_PATH : '';
@@ -36,6 +46,8 @@ const users = createUserStore({ db, dataDir });
 const requireLogin = /^(1|true|yes)$/i.test(process.env.REQUIRE_LOGIN || '');
 // Source postbacks to loopback (and plain http) only in tests: SOURCE_POSTBACK_ALLOW_PRIVATE=1.
 const sourcePostbackAllowPrivate = allowPrivateFromEnv();
+// Offer S2S postbacks go through the same hardened sender; S2S_ALLOW_PRIVATE=1 (or the flag above) is for tests only.
+const s2sAllowPrivate = sourcePostbackAllowPrivate || /^(1|true|yes)$/i.test(process.env.S2S_ALLOW_PRIVATE || '');
 // Amounts without a currency (and all click costs) are in DEFAULT_CURRENCY; reports convert to any currency at current rates.
 const rates = createRates({ dataDir, defaultCurrency: normalizeCurrency(process.env.DEFAULT_CURRENCY, 'EUR'),
   refreshMs: process.env.FX_REFRESH === '0' ? 0 : 12 * 3600 * 1000 });
@@ -68,13 +80,17 @@ const convertConversion = (cv, currency) => (cv.revenue === null || cv.revenue =
 const convertClickCost = (click, currency) => (click.cost || click.revenue ? { ...click, cost: Number(click.cost || 0) * rates.factor(rates.defaultCurrency, currency),
   revenue: Number(click.revenue || 0) * rates.factor(rates.defaultCurrency, currency) } : click);
 const SESSION_COOKIE = 'umb_session';
-const loginFailures = new Map();
+const loginLimiter = createLoginLimiter(loginLimitsFromEnv());
 const postbackSecret = process.env.POSTBACK_SECRET || '';
 const adminToken = process.env.ADMIN_TOKEN || '';
 const requirePostgres = /^(1|true|yes)$/i.test(process.env.REQUIRE_POSTGRES || '');
 const clickRateLimit = Math.max(0, Number(process.env.CLICK_RATE_LIMIT || 120));
 const clickRateWindowMs = Math.max(1000, Number(process.env.CLICK_RATE_WINDOW_MS || 60000));
-const rateBuckets = new Map();
+// Separate, more generous limits for the landing click-out and incoming postbacks (per IP and minute window; 0 = off).
+const envLimit = (name, fallback) => { const n = Number.parseInt(process.env[name] ?? '', 10); return Number.isFinite(n) && n >= 0 ? n : fallback; };
+const clickLimiter = createRateLimiter({ limit: clickRateLimit, windowMs: clickRateWindowMs });
+const lpClickLimiter = createRateLimiter({ limit: envLimit('LP_CLICK_RATE_LIMIT', 300), windowMs: Math.max(1000, envLimit('LP_CLICK_RATE_WINDOW_MS', 60000)) });
+const postbackLimiter = createRateLimiter({ limit: envLimit('POSTBACK_RATE_LIMIT', 1200), windowMs: Math.max(1000, envLimit('POSTBACK_RATE_WINDOW_MS', 60000)) });
 const adminAllowedIps = parseAdminAllowedIps(process.env.ADMIN_ALLOWED_IPS);
 const adminIpAllowed = (req) => !adminAllowedIps.length || adminAllowedIps.some((rule) => ipMatches(normalizeIp(clientIp(req)), rule));
 // Offers store { url, postbackUrl } objects. Old saves with bare strings are migrated on load.
@@ -128,18 +144,20 @@ function clientIp(req) {
   return chain[Math.max(0, chain.length - trustProxyHops)];
 }
 
-function rateLimited(ip) {
-  if (!clickRateLimit || !ip) return false;
-  const now = Date.now();
-  const bucket = (rateBuckets.get(ip) || []).filter((at) => now - at < clickRateWindowMs);
-  if (bucket.length >= clickRateLimit) { rateBuckets.set(ip, bucket); return true; }
-  bucket.push(now); rateBuckets.set(ip, bucket);
-  if (rateBuckets.size > 10000) for (const [key, values] of rateBuckets) if (!values.length || now - values.at(-1) >= clickRateWindowMs) rateBuckets.delete(key);
-  return false;
+function rateLimited(ip, limiter = clickLimiter) {
+  return limiter.hit(ip);
 }
 const campaigns = new Map([['demo', { name: 'Demo campaign', active: true, streams: [], dailyCap: null, capUrl: null, allowDevices: [], allowGeos: [], geoCapUrl: null }]]);
+// Clicks whose PostgreSQL insert failed: only for these may getClickRecord fall back to the JSONL journal.
+const unmirroredClicks = new Set();
 const eventMirror = db ? createEventMirror({ query,
-  onError: (type, error) => console.warn(`[db] ${type} insert:`, error.message) }) : null;
+  onError: (type, error, payload) => {
+    console.warn(`[db] ${type} insert:`, error.message);
+    if (type === 'click' && payload?.clickId) {
+      unmirroredClicks.add(payload.clickId);
+      if (unmirroredClicks.size > 100000) unmirroredClicks.delete(unmirroredClicks.values().next().value);
+    }
+  } }) : null;
 
 // Offer / landing monitoring: MONITOR=0 turns the timer off (POST /api/monitor/check still works).
 // MONITOR_ALLOW_PRIVATE lists private IPs that may be fetched anyway — only for tests against 127.0.0.1.
@@ -506,6 +524,37 @@ const MACRO_RE = new RegExp(`\\{(click_id|subid|campaign|offer_id|device|country
 // Values are URL-encoded: they come from visitors' query strings and must not inject extra parameters.
 function applyMacros(template, vars) {
   return template.replace(MACRO_RE, (_, k) => encodeURIComponent(vars[k] ?? ''));
+}
+// Macros in the host part (https://{source}/, https://{sub_id_1}.example.com/) would let a visitor choose where
+// a redirect or postback goes (open redirect), and encoding does not help: URL parsing decodes %2E in hosts.
+// Rule: a macro may only stand for subdomain labels in front of a literal domain of at least two labels
+// (https://{x}.example.com/ — the result must stay under .example.com). A host that is all macro, a macro
+// glued to the domain (https://{x}example.com) or a result outside the literal domain is refused.
+const AUTHORITY_RE = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i;
+function hostSafe(template, result) {
+  const authority = String(template).match(AUTHORITY_RE)?.[1];
+  if (authority === undefined) return true;
+  const host = authority.slice(authority.lastIndexOf('@') + 1);
+  const macros = [...host.matchAll(MACRO_RE)];
+  if (!macros.length) return true;
+  const last = macros.at(-1);
+  const suffix = host.slice(last.index + last[0].length).replace(/:[^:\]]*$/, '').toLowerCase();
+  if (!/^\.[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(suffix)) return false;
+  try {
+    const hostname = new URL(result).hostname.toLowerCase();
+    return hostname.endsWith(suffix) && hostname.length > suffix.length;
+  } catch { return false; }
+}
+// applyMacros for a redirect or postback target: null when a host-position macro moved the host.
+function expandUrl(template, vars) {
+  const result = applyMacros(template, vars);
+  return hostSafe(template, result) ? result : null;
+}
+// Same, for request handlers: an unsafe destination answers 404 (nothing is recorded before it).
+function expandUrlOrFail(template, vars) {
+  const result = expandUrl(template, vars);
+  if (result === null) throw Object.assign(new Error('unsafe_destination'), { statusCode: 404 });
+  return result;
 }
 
 // Classify visitor device from User-Agent header.
@@ -981,7 +1030,7 @@ async function event(type, payload) {
   await mkdir(dataDir, { recursive: true });
   return journalGate.shared(async () => {
     const record = { id: randomUUID(), type, at: new Date().toISOString(), ...payload };
-    await appendFile(eventsFile, `${JSON.stringify(record)}\n`);
+    await appendFile(eventsFile, `${JSON.stringify(record)}\n`, { mode: DATA_FILE_MODE });
     // `mirrored` settles once PostgreSQL has the event (null without a database).
     return { mirrored: eventMirror?.enqueue(record) ?? null };
   });
@@ -1197,12 +1246,22 @@ function publicBase(req) {
   return `${proto}://${req.headers.host || 'localhost'}${onTrackingDomain(req) ? '' : basePath}`;
 }
 
-// Full click record for /lp/click. PostgreSQL first; JSONL when the mirror has not caught up yet.
+// Full click record for /lp/click. PostgreSQL first. A missing row is answered from PostgreSQL alone (after the
+// mirror's queued inserts are flushed): /lp/click is public, and scanning the whole JSONL journal for every
+// unknown click id would let anyone load the server. The journal is read only when the query itself fails or
+// when this click's mirror insert failed (unmirroredClicks).
 async function getClickRecord(clickId) {
   if (db) {
     try {
-      const { rows } = await db.query('SELECT campaign, offer_id, landing_id, subid, country, params, cost FROM clicks WHERE click_id = $1', [clickId]);
-      if (rows.length) { const r = rows[0]; return { campaign: r.campaign, offerId: r.offer_id, landingId: r.landing_id, subid: r.subid, country: r.country, params: r.params, cost: Number(r.cost) || 0 }; }
+      const select = async () => {
+        const { rows } = await db.query('SELECT campaign, offer_id, landing_id, subid, country, params, cost FROM clicks WHERE click_id = $1', [clickId]);
+        const r = rows[0];
+        return r ? { campaign: r.campaign, offerId: r.offer_id, landingId: r.landing_id, subid: r.subid, country: r.country, params: r.params, cost: Number(r.cost) || 0 } : null;
+      };
+      let found = await select();
+      if (!found && eventMirror) { await eventMirror.flush(); found = await select(); }
+      if (found) return found;
+      if (!unmirroredClicks.has(clickId)) return null;
     } catch (e) { console.warn('[db] getClickRecord fallback:', e.message); }
   }
   try {
@@ -1275,24 +1334,52 @@ async function logPostback(type, payload) {
   try { await event(type, payload); } catch (error) { console.warn('[postbacks] journal not written:', error.message); }
 }
 // Outgoing S2S postback: up to 3 attempts (network error, 5xx or 429), pause S2S_RETRY_MS × attempt; every attempt is logged.
+// Sent by the hardened sender of src/source-postback.js (SSRF guard): https only, every resolved address must be
+// public and is pinned for the connection, redirects are not followed. A refusal is final and journaled.
 const S2S_ATTEMPTS = 3;
 const s2sRetryMs = Number.isFinite(Number(process.env.S2S_RETRY_MS)) && process.env.S2S_RETRY_MS !== '' ? Number(process.env.S2S_RETRY_MS) : 2000;
-async function deliverS2s(s2sUrl, meta) {
-  for (let attempt = 1; attempt <= S2S_ATTEMPTS; attempt += 1) {
-    let statusCode = null, error = null;
-    try {
-      const response = await fetch(s2sUrl, { signal: AbortSignal.timeout(10000) });
-      await response.body?.cancel();
-      statusCode = response.status;
-      if (!response.ok) error = `HTTP ${response.status}`;
-    } catch (failure) { error = String(failure.message || failure).slice(0, 300); }
-    await logPostback('postback_out', { ...meta, url: redactUrl(s2sUrl), statusCode, error, attempt });
-    if (!error) return;
-    const retryable = statusCode === null || statusCode >= 500 || statusCode === 429;
-    if (!retryable || attempt === S2S_ATTEMPTS) { console.warn('[s2s] postback failed:', error, `(attempt ${attempt})`); return; }
-    await new Promise((resolve) => setTimeout(resolve, s2sRetryMs * attempt));
-  }
+async function deliverS2s(s2sUrl, meta, send = sendPostback) {
+  const result = await deliverWithRetry(async (attempt) => {
+    let outcome;
+    if (!s2sUrl) outcome = { httpStatus: null, error: 'unsafe_destination', noRetry: true };
+    else if (!s2sAllowPrivate && !/^https:\/\//i.test(s2sUrl)) outcome = { httpStatus: null, error: 'invalid_scheme', noRetry: true };
+    else outcome = await send(s2sUrl, { allowPrivate: s2sAllowPrivate, timeoutMs: 10000 });
+    const error = outcome.error && /^http_\d+$/.test(outcome.error) ? `HTTP ${outcome.httpStatus}` : (outcome.error ? String(outcome.error).slice(0, 300) : null);
+    await logPostback('postback_out', { ...meta, url: s2sUrl ? redactUrl(s2sUrl) : null, statusCode: outcome.httpStatus, error, attempt });
+    return { ...outcome, error };
+  }, { attempts: S2S_ATTEMPTS, backoffMs: s2sRetryMs });
+  if (result.error) console.warn('[s2s] postback failed:', result.error, `(attempt ${result.attempts})`);
+  return result;
 }
+// Postbacks with a wrong secret: the first one per IP and minute is journaled as usual, the rest only counted;
+// at the end of the minute the count is journaled as one event («invalid_postback_secret ×N more»).
+const rejectedPostbacks = (() => {
+  const windows = new Map();
+  const flush = (all = false) => {
+    const now = Date.now(), writes = [];
+    for (const [ip, w] of windows) {
+      if (!all && now - w.since < 60000) continue;
+      windows.delete(ip);
+      if (w.suppressed) writes.push(logPostback('postback_in', { clickId: null, campaign: null, offerId: null, tid: null, status: null, revenue: null, currency: null,
+        url: null, statusCode: 401, error: `invalid_postback_secret ×${w.suppressed} more`, ip: ip === 'unknown' || ip === 'other' ? null : ip }));
+    }
+    return Promise.all(writes);
+  };
+  setInterval(flush, 60000).unref();
+  return {
+    // true → journal this rejection; false → counted only.
+    note(ip) {
+      const now = Date.now();
+      const w = windows.get(ip);
+      if (w && now - w.since < 60000) { w.suppressed += 1; return false; }
+      if (w) flush();
+      if (windows.size >= 10000) { const other = windows.get('other') || { since: now, suppressed: 0 }; other.suppressed += 1; windows.set('other', other); return false; }
+      windows.set(ip, { since: now, suppressed: 0 });
+      return true;
+    },
+    flush,
+  };
+})();
 // GET /api/postbacks: PostgreSQL first, the JSONL journal as fallback. Newest first.
 async function readPostbacks({ direction, campaign, allowed, from, to, limit }) {
   const fromMs = from ? Date.parse(`${from}T00:00:00Z`) : null;
@@ -1546,7 +1633,7 @@ const recordPostback = createConversionRecorder({
     sourcePostbacks.dispatch({ clickId, status: status || 'sale', revenue, currency, previousStatus, click });
     const offer = offers.get(click.offerId);
     if (!offer?.postbackUrl) return;
-    const s2sUrl = applyMacros(offer.postbackUrl, { click_id: clickId, tid: tid ?? '', revenue: revenue ?? '', currency: currency ?? '', status: status || 'sale' });
+    const s2sUrl = expandUrl(offer.postbackUrl, { click_id: clickId, tid: tid ?? '', revenue: revenue ?? '', currency: currency ?? '', status: status || 'sale' });
     deliverS2s(s2sUrl, { clickId, campaign: click.campaign ?? null, offerId: click.offerId ?? null, tid: tid || null, status: status || 'sale' })
       .catch((error) => console.warn('[s2s] postback failed:', error.message));
   },
@@ -1580,13 +1667,6 @@ function sessionCookie(req, token, maxAgeSeconds) {
 }
 
 const isPrivatePath = (p) => (p.startsWith('/api/') && !p.startsWith('/api/auth/')) || p === '/stats' || p.startsWith('/stats/') || p === '/dashboard' || p.startsWith('/assets/');
-
-function loginBlocked(ip) {
-  const now = Date.now();
-  const recent = (loginFailures.get(ip) || []).filter((t) => now - t < 15 * 60 * 1000);
-  loginFailures.set(ip, recent);
-  return recent.length >= 10;
-}
 
 async function readJson(req, maxBytes = 64 * 1024) {
   // Already read by the hideRevenue write check (with the largest route limit); the route's own limit still applies.
@@ -1781,10 +1861,12 @@ async function handleAuthRoute(req, res, url) {
   }
   if (path === '/api/auth/login' && req.method === 'POST') {
     const ip = clientIp(req) || 'unknown';
-    if (loginBlocked(ip)) return json(res, 429, { error: 'too_many_attempts' });
+    // Reserved before the (slow, async) password check: parallel guesses are counted too. See src/rate-limit.js.
+    const ticket = loginLimiter.reserve(body.email, ip);
+    if (!ticket) return json(res, 429, { error: 'too_many_attempts' });
     const user = await users.authenticate(body.email, body.password);
-    if (!user) { loginFailures.get(ip).push(Date.now()); return json(res, 401, { error: 'invalid_credentials' }); }
-    loginFailures.delete(ip);
+    if (!user) return json(res, 401, { error: 'invalid_credentials' });
+    loginLimiter.success(ticket);
     req.user = user;
     await audit(req, 'login', 'user', user.id, null, null);
     const token = await users.createSession(user.id);
@@ -1929,7 +2011,7 @@ const server = http.createServer(async (req, res) => {
       if (uaBot || dcBot) {
         await event('bot', { campaign: campaignId, offerId, stream: streamName, userAgent: req.headers['user-agent'] || null, ip: clientIp(req),
           reason: uaBot ? 'user_agent' : 'datacenter', isp: network?.isp ?? null });
-        const dest = applyMacros(targetTemplate, { campaign: campaignId, offer_id: offerId });
+        const dest = expandUrlOrFail(targetTemplate, { campaign: campaignId, offer_id: offerId });
         res.writeHead(302, { location: dest, 'cache-control': 'no-store' });
         return res.end();
       }
@@ -1956,7 +2038,7 @@ const server = http.createServer(async (req, res) => {
       // IP deduplication: skip click if same IP clicked within dedupeWindow minutes
       if (c.dedupeWindow > 0 && await isDuplicateClick(campaignId, ip, c.dedupeWindow)) {
         // Silent redirect to the same destination without recording a new click
-        res.writeHead(302, { location: applyMacros(targetTemplate, { campaign: campaignId, offer_id: offerId }), 'cache-control': 'no-store' });
+        res.writeHead(302, { location: expandUrlOrFail(targetTemplate, { campaign: campaignId, offer_id: offerId }), 'cache-control': 'no-store' });
         return res.end();
       }
 
@@ -2009,7 +2091,7 @@ const server = http.createServer(async (req, res) => {
       }
       const macroVars = { ...params, cost: cost || '', click_id: clickId, subid: subid || '', campaign: campaignId, offer_id: offerId, device, country: country || '',
         lp_click_url: `${publicBase(req)}/lp/click?click_id=${clickId}` };
-      const expanded = applyMacros(targetTemplate, macroVars);
+      const expanded = expandUrlOrFail(targetTemplate, macroVars);
       const destination = new URL(expanded);
       if (!targetTemplate.includes('{click_id}')) destination.searchParams.set('click_id', clickId);
       for (const key of ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'subid']) {
@@ -2100,14 +2182,16 @@ const server = http.createServer(async (req, res) => {
       return await handleClick(campaignId, offerId, offer.url);
     }
     if (url.pathname === '/postback' && req.method === 'GET') {
-      // Every incoming postback is journaled with its response code (G7), including rejected ones.
+      if (rateLimited(clientIp(req), postbackLimiter)) return json(res, 429, { error: 'postback_rate_limited' });
+      // Every incoming postback is journaled with its response code (G7). Rejected secrets are aggregated
+      // (one journal event per IP and minute, see rejectedPostbacks) so a flood cannot grow the journal.
       const q = (key) => (url.searchParams.get(key) || '').slice(0, 200) || null;
       const context = {};
       const logIncoming = (statusCode, error = null) => logPostback('postback_in', { clickId: q('click_id'), campaign: context.click?.campaign ?? null,
         offerId: context.click?.offerId ?? null, tid: q('tid'), status: q('status'), revenue: q('revenue') || q('payout'), currency: q('currency'),
         url: redactUrl(req.url), statusCode, error, ip: clientIp(req) || null });
       if (postbackSecret && !safeEqual(url.searchParams.get('secret'), postbackSecret)) {
-        await logIncoming(401, 'invalid_postback_secret');
+        if (rejectedPostbacks.note(clientIp(req) || 'unknown')) await logIncoming(401, 'invalid_postback_secret');
         return json(res, 401, { error: 'invalid_postback_secret' });
       }
       try {
@@ -2171,8 +2255,8 @@ const server = http.createServer(async (req, res) => {
       } else return json(res, 400, { error: 'invalid_group' });
       const columns = ['key', 'clicks', 'conversions', 'revenue', 'cost', 'cr', 'epc', 'rpm', 'uniqueClicks', 'leads', 'sales', 'rejected', 'pendingRevenue', 'profit', 'roi']
         .filter((c) => !hidesRevenue(req) || !REVENUE_KEY.test(c));
-      // Cells starting with = + - @ are prefixed so spreadsheets do not run them as formulas.
-      const cell = (v) => { let text = v === null || v === undefined ? '' : typeof v === 'number' ? String(Math.round(v * 10000) / 10000) : String(v); if (/^[=+\-@]/.test(text) && typeof v !== 'number') text = `'${text}`; return /[",\n;]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text; };
+      // Text cells starting with = + - @ tab or CR are prefixed with ' so spreadsheets do not run them as formulas.
+      const cell = (v) => { let text = v === null || v === undefined ? '' : typeof v === 'number' ? String(Math.round(v * 10000) / 10000) : String(v); if (/^[=+\-@\t\r]/.test(text) && typeof v !== 'number') text = `'${text}`; return /[",\n;]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text; };
       const csv = [['group', ...columns.slice(1)].join(','), ...rows.map((r) => columns.map((c) => cell(r[c])).join(','))].join('\n') + '\n';
       res.writeHead(200, { 'content-type': 'text/csv; charset=utf-8', 'content-disposition': `attachment; filename="umbrella-${group}-${currency}.csv"`, 'cache-control': 'no-store' });
       return res.end('\ufeff' + csv);
@@ -2234,15 +2318,16 @@ const server = http.createServer(async (req, res) => {
       }
     }
     if (url.pathname === '/lp/click' && req.method === 'GET') {
+      if (rateLimited(clientIp(req), lpClickLimiter)) return json(res, 429, { error: 'click_rate_limited' });
       const clickId = url.searchParams.get('click_id') || '';
       if (!/^[0-9a-f-]{36}$/i.test(clickId)) return json(res, 400, { error: 'click_id_required' });
       const click = await getClickRecord(clickId);
       if (!click) return json(res, 404, { error: 'click_not_found' });
       const offer = offers.get(click.offerId);
       if (!offer) return json(res, 404, { error: 'offer_not_found' });
-      await event('lp_click', { clickId, campaign: click.campaign, landingId: click.landingId ?? null });
       const vars = { ...(click.params || {}), cost: click.cost || '', click_id: clickId, subid: click.subid || '', campaign: click.campaign, offer_id: click.offerId, device: '', country: click.country || '' };
-      const destination = new URL(applyMacros(offer.url, vars));
+      const destination = new URL(expandUrlOrFail(offer.url, vars));
+      await event('lp_click', { clickId, campaign: click.campaign, landingId: click.landingId ?? null });
       if (!offer.url.includes('{click_id}')) destination.searchParams.set('click_id', clickId);
       return sendRedirect(res, destination.toString(), campaigns.get(click.campaign)?.redirectMethod);
     }
@@ -2779,6 +2864,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+await tightenDataFiles();
 await rates.start();
 await loadSettings();
 await loadSources();
@@ -2814,6 +2900,6 @@ if (retentionDays > 0) {
 }
 if (monitorEnabled) monitor.start();
 
-async function shutdown() { monitor.stop(); await new Promise((resolve) => server.close(resolve)); await eventMirror?.drain(); await closeDb(); process.exit(0); }
+async function shutdown() { monitor.stop(); await rejectedPostbacks.flush(true); await new Promise((resolve) => server.close(resolve)); await eventMirror?.drain(); await closeDb(); process.exit(0); }
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
