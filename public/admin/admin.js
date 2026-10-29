@@ -338,6 +338,54 @@ function dataTable({ id, columns, rows = [], selectable = false, pageSize = 50, 
 }
 document.getElementById('global-search').addEventListener('input', (e) => document.dispatchEvent(new CustomEvent('umbrella:search', { detail: e.target.value.trim().toLowerCase() })));
 
+// Traffic simulation: where a visitor with these properties would go and why. Nothing is recorded.
+const SIM_AGENTS = [
+  ['iPhone', 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1'],
+  ['Android', 'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Mobile Safari/537.36'],
+  ['Windows · Chrome', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36'],
+  ['Mac · Safari', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15'],
+  ['Бот (Googlebot)', 'Googlebot/2.1 (+http://www.google.com/bot.html)'],
+];
+function simulateModal(campaignId) {
+  const q = { country: 'FR', ua: SIM_AGENTS[0][1], ip: '', language: 'fr', query: '', at: '' };
+  const out = h('div', { 'aria-live': 'polite' });
+  const input = (key, attrs = {}) => h('input', { class: 'input', value: q[key], oninput: (e) => { q[key] = e.target.value.trim(); }, ...attrs });
+  const OUTCOME = { click: 'Клик засчитается', bot: 'Бот: уйдёт туда же, клик не засчитается', redirect: 'Редирект', blocked: 'Отказ', no_stream: 'Нет подходящего потока', not_found: 'Ответ 404', error: 'Ошибка' };
+  const run = async () => {
+    put(out, h('p', { class: 'muted' }, 'Считаю…'));
+    try {
+      const r = await api('/api/simulate', { method: 'POST', body: { campaign: campaignId, country: q.country, userAgent: q.ua, ip: q.ip, language: q.language, query: q.query, at: q.at ? new Date(q.at).toISOString() : undefined } });
+      const v = r.visitor || {};
+      put(out,
+        h('p', { class: 'muted' }, `Посетитель: ${v.country || 'страна ?'} · ${v.device} · ${v.os} · ${v.browser}${v.language ? ' · ' + v.language : ''}${v.isp ? ' · ' + v.isp : ''}${v.datacenter ? ' (дата-центр)' : ''}`),
+        ...r.steps.map((st) => h('div', { class: 'card', style: 'margin-bottom:10px' },
+          h('b', {}, st.name || st.campaign), st.checks?.map((c) => h('p', { class: 'err' }, `${c.check}: ${c.note}`)),
+          (st.streams || []).map((s) => h('div', { style: 'margin-top:6px' },
+            h('span', { class: s.matches && s.enabled ? 'pos' : 'muted' }, `${s.matches && s.enabled ? '✓' : '✗'} ${s.name} (${typeLabel[s.type] || s.type})`),
+            !s.enabled ? h('span', { class: 'muted' }, ' — выключен') : null,
+            s.checks.length ? h('span', { class: 'muted' }, ' — ' + s.checks.map((c) => `${c.condition}: ${c.actual ?? '?'} ${c.ok ? '∈' : '∉'} ${c.expected.join(', ')}`).join(s.mode === 'or' ? ' ИЛИ ' : '; ')) : h('span', { class: 'muted' }, ' — без условий'),
+            s.cappedOffers?.length ? h('span', { class: 'err' }, ` · кап: ${s.cappedOffers.join(', ')}`) : null)),
+          st.chosen ? h('p', {}, 'Выбор: ', st.chosen.map((c) => `${c.stream} — ${String(c.share).replace('.', ',')}%`).join(', ')) : null)),
+        h('div', { class: 'card' },
+          h('b', {}, `${OUTCOME[r.result.outcome] || r.result.outcome} · HTTP ${r.result.status}`), r.result.reason ? h('p', { class: 'muted' }, r.result.reason) : null,
+          r.result.landing ? h('p', {}, 'Лендинг: ', h('code', {}, r.result.landing)) : null,
+          (r.result.destinations || []).map((d) => h('p', {}, d.offerId ? `${d.offerId} (${String(d.share).replace('.', ',')}%): ` : '', h('code', { style: 'word-break:break-all' }, d.url || '—'))),
+          r.result.url ? h('p', {}, h('code', { style: 'word-break:break-all' }, r.result.url)) : null));
+    } catch (e) { put(out, h('p', { class: 'err' }, 'Не удалось: ' + e.message)); }
+  };
+  openModal({ title: 'Проверить маршрут', wide: true, body: h('div', {},
+    h('p', { class: 'muted' }, 'Показывает, куда уйдёт посетитель с такими свойствами и почему. Клик не записывается.'),
+    h('div', { class: 'grid2' },
+      field('Страна', input('country', { placeholder: 'FR', maxlength: 2 }), 'Пусто — определить по IP.'),
+      field('IP', input('ip', { placeholder: 'необязательно' }), 'Для провайдера, дата-центра и списков IP.'),
+      field('Браузер', h('select', { class: 'select', onchange: (e) => { q.ua = e.target.value; } }, SIM_AGENTS.map(([l, ua]) => h('option', { value: ua }, l)))),
+      field('Язык', input('language', { placeholder: 'fr', maxlength: 2 })),
+      field('Параметры ссылки', input('query', { placeholder: 'fbclid=…&utm_campaign=…' }), 'Как в ссылке кампании, после «?».'),
+      field('Время визита', input('at', { type: 'datetime-local' }), 'Пусто — сейчас. Для расписания потоков.')),
+    out),
+    footer: [h('button', { class: 'btn primary', onclick: run }, 'Проверить')] });
+}
+
 // Metric column helpers shared by stats tables.
 const metricCols = (opts = {}) => [
   { key: 'clicks', label: 'Клики', num: true, render: (r) => num(r.clicks), total: (rs) => num(sum(rs, 'clicks')) },
@@ -890,6 +938,7 @@ async function pageCampaignEditor(id) {
         h('button', { class: 'btn square', title: 'Копировать ссылку', 'aria-label': 'Копировать ссылку', disabled: isNew, onclick: () => copyText(trackingUrl(d.id)) }, '🔗'),
         isNew ? null : h('a', { class: 'btn', href: '#/clicks' + qs({ campaign: d.id }) }, 'Клики'),
         isNew ? null : h('button', { class: 'btn', onclick: () => historyModal('campaign', d.id, d.name) }, 'История'),
+        isNew ? null : h('button', { class: 'btn', onclick: () => simulateModal(d.id) }, 'Проверить маршрут'),
         isNew ? null : h('a', { class: 'btn', href: '#/reports' + qs({ group: 'stream', campaign: d.id }) }, 'Отчёт'),
         h('a', { class: 'btn', href: '#/campaigns' }, 'К списку'))),
     err,
