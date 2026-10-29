@@ -261,6 +261,21 @@ try {
   const attentionText = await attentionCard.innerText();
   assert.ok(/D13 Bad ROI|d13-bad/.test(attentionText) && /ROI/.test(attentionText), `attention block has campaign info, got: ${attentionText.slice(0, 100)}`);
 
+  // D14: conversions-by-day preset in reports
+  await api('/api/campaigns', { id: 'd14-conv', name: 'D14 Conv', streams: [{ name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] }] });
+  const d14r1 = await fetch(server.url + '/r/d14-conv', { redirect: 'manual' });
+  const d14cid1 = new URL(d14r1.headers.get('location')).searchParams.get('click_id');
+  await fetch(`${server.url}/postback?secret=conversion-test-secret&click_id=${d14cid1}&status=lead&revenue=0`);
+  await fetch(`${server.url}/postback?secret=conversion-test-secret&click_id=${d14cid1}&revenue=10&currency=USD`);
+  await page.goto(server.url + '/admin#/reports');
+  await page.getByRole('heading', { name: 'Отчёт' }).waitFor();
+  await page.locator('button.chip-btn', { hasText: 'Конверсии' }).click();
+  await page.locator('table.grid tbody tr').first().waitFor({ timeout: 5000 });
+  const convHeaders = await page.locator('table.grid thead th').allInnerTexts();
+  assert.ok(convHeaders.some((h) => /Лиды|Продажи/.test(h)), `conversions preset should show leads/sales columns, got: ${convHeaders.join(', ')}`);
+  const convRows = await page.locator('table.grid tbody tr').count();
+  assert.ok(convRows >= 1, `conversions preset should have at least one day row, got ${convRows}`);
+
   assert.deepEqual(errors, []);
 
   // Accounts: a REQUIRE_LOGIN install starts with the setup screen; owner creates a buyer; logout returns to login.

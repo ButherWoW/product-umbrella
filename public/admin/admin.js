@@ -1225,7 +1225,7 @@ async function pageReports(params) {
   const PARAM_FIELDS = ['keyword', 'source', 'external_id', 'creative_id', 'ad_campaign_id', ...Array.from({ length: 30 }, (_, i) => `sub_id_${i + 1}`)];
   const paramSel = h('select', { class: 'select', 'aria-label': 'Параметр', onchange: (e) => { f.field = e.target.value; drawPresets(); load(); } },
     h('option', { value: '' }, 'Параметр'), PARAM_FIELDS.map((n) => h('option', { value: n, selected: f.field === n }, n)));
-  const drawPresets = () => put(presets, [...GROUPS.map(([k, l]) => h('button', { class: 'chip-btn' + (f.group === k && !f.field ? ' on' : ''), onclick: () => { f.group = k; f.field = ''; paramSel.value = ''; drawPresets(); load(); } }, l)), h('button', { class: 'chip-btn' + (f.group === 'heatmap' ? ' on' : ''), onclick: () => { f.group = 'heatmap'; f.field = ''; paramSel.value = ''; drawPresets(); load(); } }, 'Карта по часам')]);
+  const drawPresets = () => put(presets, [...GROUPS.map(([k, l]) => h('button', { class: 'chip-btn' + (f.group === k && !f.field ? ' on' : ''), onclick: () => { f.group = k; f.field = ''; paramSel.value = ''; drawPresets(); load(); } }, l)), h('button', { class: 'chip-btn' + (f.group === 'heatmap' ? ' on' : ''), onclick: () => { f.group = 'heatmap'; f.field = ''; paramSel.value = ''; drawPresets(); load(); } }, 'Карта по часам'), h('button', { class: 'chip-btn' + (f.group === 'conversions' ? ' on' : ''), onclick: () => { f.group = 'conversions'; f.field = ''; paramSel.value = ''; drawPresets(); load(); } }, 'Конверсии')]);
   drawPresets();
 
   // Saved reports
@@ -1353,6 +1353,35 @@ async function pageReports(params) {
                 }))))));
         put(holder, h('div', { class: 'toolbar', style: 'margin-bottom:8px' }, tzSel, metricSel), heatTable);
       } catch (e) { put(holder, h('p', { class: 'err' }, 'Ошибка тепловой карты: ' + e.message)); }
+      return;
+    }
+    if (f.group === 'conversions') {
+      table?.detach(); table = null;
+      try {
+        const convData = await api('/api/conversions' + qs({ campaign: f.campaign, ...periodRange(), limit: 10000 }));
+        const byDay = {};
+        for (const c of convData.conversions || []) {
+          const day = String(c.at || '').slice(0, 10); if (!day) continue;
+          const r = byDay[day] ||= { id: day, leads: 0, sales: 0, rejected: 0, revenue: 0, pendingRevenue: 0 };
+          if (c.status === 'lead') { r.leads++; r.pendingRevenue += c.revenue || 0; }
+          else if (c.status === 'sale') { r.sales++; r.revenue += c.revenue || 0; }
+          else if (c.status === 'rejected') r.rejected++;
+        }
+        const convRows = Object.values(byDay).sort((a, b) => a.id < b.id ? -1 : 1);
+        table = dataTable({
+          id: 'report-conversions', pageSize: 100, rows: convRows,
+          columns: [
+            { key: 'id', label: 'Дата', fixed: true },
+            { key: 'leads', label: 'Лиды', num: true, render: (r) => num(r.leads), total: (rs) => num(rs.reduce((s, r) => s + r.leads, 0)) },
+            { key: 'sales', label: 'Продажи', num: true, render: (r) => num(r.sales), total: (rs) => num(rs.reduce((s, r) => s + r.sales, 0)) },
+            { key: 'rejected', label: 'Отклонённые', num: true, render: (r) => num(r.rejected), total: (rs) => num(rs.reduce((s, r) => s + r.rejected, 0)) },
+            { key: 'approvePct', label: 'Approve %', num: true, value: (r) => { const tot = r.leads + r.sales + r.rejected; return tot ? r.sales / tot : null; }, render: (r) => { const tot = r.leads + r.sales + r.rejected; return tot ? pct(r.sales / tot) : '—'; }, total: (rs) => { const tS = rs.reduce((s, r) => s + r.sales, 0), tT = rs.reduce((s, r) => s + r.leads + r.sales + r.rejected, 0); return tT ? pct(tS / tT) : '—'; } },
+            { key: 'revenue', label: 'Доход', num: true, render: (r) => money(r.revenue), total: (rs) => money(rs.reduce((s, r) => s + r.revenue, 0)) },
+            { key: 'pendingRevenue', label: 'Ожидаемый доход', num: true, render: (r) => money(r.pendingRevenue), total: (rs) => money(rs.reduce((s, r) => s + r.pendingRevenue, 0)) },
+          ],
+        });
+        put(holder, table);
+      } catch (e) { put(holder, h('p', { class: 'err' }, 'Ошибка конверсий: ' + e.message)); }
       return;
     }
     const [key, label, prop] = GROUPS.find((g) => g[0] === f.group) || GROUPS[0];
