@@ -159,7 +159,7 @@ const ACTION_LABEL = { create: 'Создание', update: 'Изменение',
 const FIELD_LABEL = { conversionCap: 'Кап конверсий', capTz: 'Часовой пояс капа', altOfferId: 'Запасной оффер', name: 'Название', active: 'Состояние', dailyCap: 'Дневной кап', totalCap: 'Общий кап', revenueCap: 'Кап дохода', capUrl: 'URL капа', streams: 'Потоки',
   allowGeos: 'Страны', allowDevices: 'Устройства', allowOS: 'ОС', allowBrowsers: 'Браузеры', blockedIps: 'Черный список IP', allowedIps: 'Белый список IP', botFilter: 'Фильтр ботов', datacenterAsBot: 'Дата-центры = боты',
   dedupeWindow: 'Уникальность', conversionWindowDays: 'Окно конверсии', redirectMethod: 'Способ редиректа', paramMap: 'Параметры', costModel: 'Модель затрат', cpc: 'CPC',
-  costFromParam: 'Расход из параметра', url: 'URL', postbackUrl: 'S2S постбэк', dailyCap_offer: 'Дневной кап', reason: 'Причина', email: 'Email', role: 'Роль' };
+  costFromParam: 'Расход из параметра', bindVisitors: 'Привязка посетителя', bindTtlHours: 'Срок привязки', url: 'URL', postbackUrl: 'S2S постбэк', dailyCap_offer: 'Дневной кап', reason: 'Причина', email: 'Email', role: 'Роль' };
 const showValue = (v) => (v === null || v === undefined || v === '' ? '—' : v === true ? 'да' : v === false ? 'нет' : String(v));
 async function historyModal(entity, id, title) {
   const list = h('div', {}, 'Загрузка…');
@@ -912,6 +912,10 @@ async function pageCampaignEditor(id) {
           h('label', {}, h('input', { type: 'radio', name: 'crot', checked: d.streamRotation !== 'position', onchange: () => { d.streamRotation = 'weight'; mark(); } }), 'По весу'),
           h('label', {}, h('input', { type: 'radio', name: 'crot', checked: d.streamRotation === 'position', onchange: () => { d.streamRotation = 'position'; mark(); } }), 'По позиции')),
           'По весу — обычные потоки делят трафик по весам. По позиции — клик забирает первый подходящий обычный поток сверху.'),
+        field('Привязка посетителя', h('select', { class: 'select', 'aria-label': 'Привязка посетителя', onchange: (e) => { d.bindVisitors = e.target.value; mark(); } },
+          [['off', 'Нет'], ['stream', 'К потоку'], ['stream_offer', 'К потоку и офферу']].map(([v, l]) => h('option', { value: v, selected: (d.bindVisitors || 'off') === v }, l))),
+          'Вернувшийся посетитель (те же IP и браузер) попадает в тот же поток, а при «К потоку и офферу» — и на тот же оффер и лендинг, пока поток включён и подходит, а оффер не в капе и не в архиве. Привязки хранятся в памяти и сбрасываются при перезапуске.'),
+        field('Срок привязки, часов', h('input', { class: 'input', type: 'number', min: 1, max: 720, 'aria-label': 'Срок привязки, часов', value: d.bindTtlHours ?? 24, oninput: bind('bindTtlHours', 'int') }), 'Считается от последнего визита.'),
         field('Способ редиректа', h('div', { class: 'radios' }, [['http', 'HTTP 302'], ['meta', 'Meta refresh'], ['js', 'JavaScript']].map(([v, l]) => h('label', {},
           h('input', { type: 'radio', name: 'credir', checked: (d.redirectMethod || 'http') === v, onchange: () => { d.redirectMethod = v; mark(); } }), l))),
           'Как посетитель уходит на оффер. HTTP 302 — быстрее всего; meta и JS отдают страницу, которая сама переходит дальше.'),
@@ -1009,7 +1013,7 @@ async function pageCampaignEditor(id) {
     if (new Set(names).size !== names.length) { err.textContent = 'Названия потоков должны различаться — по ним строится статистика.'; return; }
     const body = { name: d.name.trim(), group: (d.group || '').trim(), active: d.active, streams: d.streams, dailyCap: d.dailyCap, totalCap: d.totalCap, revenueCap: d.revenueCap, capUrl: d.capUrl, geoCapUrl: d.geoCapUrl,
       allowGeos: d.allowGeos, allowDevices: d.allowDevices, allowOS: d.allowOS, allowBrowsers: d.allowBrowsers, blockedIps: d.blockedIps, allowedIps: d.allowedIps,
-      dedupeWindow: d.dedupeWindow || 0, botFilter: d.botFilter, datacenterAsBot: Boolean(d.datacenterAsBot), conversionWindowDays: d.conversionWindowDays, redirectMethod: d.redirectMethod || 'http', domain: d.domain || null, uniquenessHours: d.uniquenessHours ?? 24, streamRotation: d.streamRotation || 'weight', ...(isOwnerView() ? { ownerId: d.ownerId || null } : {}), paramMap: d.paramMap || {}, costModel: d.costModel || 'none', cpc: d.cpc, costFromParam: d.costFromParam || false, sourceId: d.sourceId || null };
+      dedupeWindow: d.dedupeWindow || 0, botFilter: d.botFilter, datacenterAsBot: Boolean(d.datacenterAsBot), conversionWindowDays: d.conversionWindowDays, redirectMethod: d.redirectMethod || 'http', domain: d.domain || null, uniquenessHours: d.uniquenessHours ?? 24, streamRotation: d.streamRotation || 'weight', bindVisitors: d.bindVisitors || 'off', bindTtlHours: d.bindTtlHours ?? 24, ...(isOwnerView() ? { ownerId: d.ownerId || null } : {}), paramMap: d.paramMap || {}, costModel: d.costModel || 'none', cpc: d.cpc, costFromParam: d.costFromParam || false, sourceId: d.sourceId || null };
     saveBtn.disabled = true;
     try {
       const saved = isNew ? await api('/api/campaigns', { method: 'POST', body: { id: d.id, ...body } })

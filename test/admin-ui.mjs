@@ -520,6 +520,28 @@ try {
   assert.ok(!(await page.locator('body').innerText()).includes('[object'), 'no stringified DOM nodes on offers page');
   async function t10OffersArchived() { const o = (await (await fetch(server.url + '/api/offers')).json()).offers; return o['t10-o1'].archived && o['t10-o2'].archived; }
 
+  // Visitor binding: campaign editor fields «Привязка посетителя» and «Срок привязки, часов» round-trip through save.
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await api('/api/campaigns', { id: 'bind-ui', name: 'Bind UI', streams: [{ name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] }] });
+  await page.goto(server.url + '/admin#/campaigns/bind-ui');
+  const bindSelect = page.getByRole('combobox', { name: 'Привязка посетителя' });
+  await bindSelect.waitFor();
+  assert.equal(await bindSelect.inputValue(), 'off', 'binding is off by default');
+  assert.deepEqual(await bindSelect.locator('option').allTextContents(), ['Нет', 'К потоку', 'К потоку и офферу']);
+  await bindSelect.selectOption('stream_offer');
+  await page.getByRole('spinbutton', { name: 'Срок привязки, часов' }).fill('48');
+  await page.locator('.editor-head .btn.primary').click();
+  // The admin key lives only in tab memory; earlier reloads dropped it.
+  const bindKeyDialog = page.getByRole('dialog', { name: 'Ключ администратора' });
+  if (await bindKeyDialog.waitFor({ timeout: 1500 }).then(() => true, () => false)) {
+    await bindKeyDialog.locator('input[type=password]').fill(TOKEN);
+    await bindKeyDialog.getByRole('button', { name: 'Сохранить' }).click();
+    await page.locator('.editor-head .btn.primary').click();
+  }
+  await page.locator('#toast', { hasText: 'Сохранено' }).waitFor();
+  const bindSaved = (await (await api('/api/campaigns', undefined, 'GET')).json()).campaigns['bind-ui'];
+  assert.deepEqual([bindSaved.bindVisitors, bindSaved.bindTtlHours], ['stream_offer', 48], 'binding settings saved');
+
   assert.deepEqual(errors, []);
   console.log('Admin UI browser test passed');
 } finally {

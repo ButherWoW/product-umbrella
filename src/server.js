@@ -11,6 +11,7 @@ import { readEventLog } from './event-logs.js';
 import { createConversionRecorder, hasRecordedConversion, findRecordedConversion } from './conversion-recorder.js';
 import { createEventMirror } from './event-mirror.js';
 import { createConversionCapCounter, resolveOffer } from './conversion-cap.js';
+import { createBindingStore, bindingKey, boundChoice, streamRef, parseBindMode, parseBindTtl } from './visitor-binding.js';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const dataDir = process.env.DATA_DIR || join(root, 'data');
@@ -354,8 +355,18 @@ async function simulateClick(input, canSee) {
     const typeOf = (st) => st.type || 'regular';
     const forced = matching.find((st) => typeOf(st) === 'forced');
     const regular = matching.filter((st) => typeOf(st) === 'regular');
+    // Visitor binding is only known for a concrete visitor: IP + User-Agent, as on a live click.
+    let bound = null;
+    if (c.bindVisitors !== 'off' && ip && input.userAgent) {
+      const binding = visitorBindings.get(bindingKey(campaignId, ip, ua), c.bindTtlHours * 3600 * 1000, at.getTime());
+      bound = boundChoice({ mode: c.bindVisitors, binding, streams: c.streams || [], matches: (st) => streamMatches(st, visitor), excluded: capped,
+        pickOffer: (list) => list[0], pickLanding: (list) => list[0] });
+      step.binding = bound ? { applies: true, mode: c.bindVisitors, stream: bound.stream.name ?? null, ...(c.bindVisitors === 'stream_offer' ? { offerId: bound.offerId, landingId: bound.landingId } : {}), boundAt: new Date(binding.at).toISOString() }
+        : { applies: false, mode: c.bindVisitors, reason: binding ? 'привязанный поток или оффер больше не подходит — будет обычный выбор и новая привязка' : 'привязки нет или срок истёк' };
+    }
     let candidates;
-    if (forced) candidates = [{ stream: forced, share: 1 }];
+    if (bound) candidates = [{ stream: bound.stream, share: 1 }];
+    else if (forced) candidates = [{ stream: forced, share: 1 }];
     else if (regular.length) {
       if (c.streamRotation === 'position') candidates = [{ stream: regular[0], share: 1 }];
       else { const total = regular.reduce((t, st) => t + (st.weight || 1), 0); candidates = regular.map((st) => ({ stream: st, share: (st.weight || 1) / total })); }
@@ -373,10 +384,11 @@ async function simulateClick(input, canSee) {
     const bot = (c.botFilter && isBot(ua)) || (c.datacenterAsBot && network?.datacenter);
     const params = visitor.params;
     const destinations = top.action === 'url' ? [{ url: top.url, share: 100 }]
-      : (() => { const live = (top.offers || [{ offerId: top.offerId, weight: 1 }]).filter((o) => !capped.has(o.offerId)); const total = live.reduce((t, o) => t + (o.weight || 1), 0);
+      : (() => { const live = (top.offers || [{ offerId: top.offerId, weight: 1 }]).filter((o) => !capped.has(o.offerId) && (!bound || c.bindVisitors !== 'stream_offer' || o.offerId === bound.offerId)); const total = live.reduce((t, o) => t + (o.weight || 1), 0);
         return live.map((o) => { const used = routing.substitutes.get(o.offerId) || o.offerId;
           return { offerId: used, ...(used !== o.offerId ? { insteadOf: o.offerId } : {}), share: Math.round((o.weight || 1) / total * 1000) / 10, url: offers.get(used)?.url || null }; }); })();
-    const landing = top.landings?.length ? top.landings.map((l) => landings.get(l.landingId)?.url).filter(Boolean)[0] : null;
+    const landing = bound?.landingId && c.bindVisitors === 'stream_offer' ? landings.get(bound.landingId)?.url || null
+      : top.landings?.length ? top.landings.map((l) => landings.get(l.landingId)?.url).filter(Boolean)[0] : null;
     const vars = { ...params, click_id: 'SIMULATION', subid: query.get('subid') || '', campaign: campaignId, device: visitor.device, country: visitor.country || '', cost: '' };
     return finish({ outcome: bot ? 'bot' : 'click', status: 302, stream: top.name,
       ...(bot ? { reason: 'User-Agent бота или дата-центр при включённом фильтре' } : {}),
@@ -459,6 +471,7 @@ function detectDevice(ua) {
 // In-memory and bounded; after a restart the first repeat visit of a returning visitor counts as unique again.
 const seenVisitors = new Map();
 const SEEN_LIMIT = 300000;
+const visitorBindings = createBindingStore({ limit: SEEN_LIMIT });
 function firstVisit(key, windowMs, now = Date.now()) {
   const hash = createHash('sha1').update(key).digest('base64');
   const last = seenVisitors.get(hash);
@@ -788,6 +801,8 @@ function parseCampaign(id, value) {
     domain: DOMAIN_RE.test(String(value.domain || '').toLowerCase()) ? String(value.domain).toLowerCase() : null,
     streamRotation: value.streamRotation === 'position' ? 'position' : 'weight',
     uniquenessHours: Number.isInteger(value.uniquenessHours) && value.uniquenessHours >= 1 && value.uniquenessHours <= 720 ? value.uniquenessHours : 24,
+    bindVisitors: parseBindMode(value.bindVisitors),
+    bindTtlHours: parseBindTtl(value.bindTtlHours),
     ownerId: /^[0-9a-f-]{36}$/i.test(String(value.ownerId || '')) ? String(value.ownerId).toLowerCase() : null,
     redirectMethod: REDIRECT_METHODS.includes(value.redirectMethod) ? value.redirectMethod : 'http',
     blockedIps: parseIpRules(value.blockedIps),
@@ -1567,7 +1582,12 @@ const server = http.createServer(async (req, res) => {
         if (!c.streams?.length) return json(res, 404, { error: 'no_streams_configured' });
         visitor.params = trackedParams(url.searchParams, c.paramMap);
         const routing = await offerRouting(c.streams);
-        const picked = pickStream(c.streams, visitor, routing.excluded, c.streamRotation);
+        // Visitor binding: the stream (and offer/landing) this IP + User-Agent got last time, while still valid.
+        const bindKey = c.bindVisitors !== 'off' ? bindingKey(campaignId, normalizeIp(clientIp(req)), req.headers['user-agent'] || '') : null;
+        const picked = (bindKey && boundChoice({ mode: c.bindVisitors, binding: visitorBindings.get(bindKey, c.bindTtlHours * 3600 * 1000), streams: c.streams,
+          matches: (st) => streamMatches(st, visitor), excluded: routing.excluded, pickOffer: weightedPick, pickLanding: weightedPick }))
+          || pickStream(c.streams, visitor, routing.excluded, c.streamRotation);
+        if (bindKey && picked) visitorBindings.set(bindKey, { stream: streamRef(c.streams, picked.stream), offerId: picked.offerId, landingId: picked.landingId || null });
         // A conversion-capped offer hands the click to its alternative; the click is recorded with the offer actually used.
         if (picked?.offerId && routing.substitutes.has(picked.offerId)) picked.offerId = routing.substitutes.get(picked.offerId);
         if (!picked) return json(res, 404, { error: 'no_matching_stream' });
@@ -1930,6 +1950,8 @@ const server = http.createServer(async (req, res) => {
         domain: body.domain === undefined ? cur.domain : body.domain,
         streamRotation: body.streamRotation === undefined ? cur.streamRotation : body.streamRotation,
         uniquenessHours: body.uniquenessHours === undefined ? cur.uniquenessHours : body.uniquenessHours,
+        bindVisitors: body.bindVisitors === undefined ? cur.bindVisitors : body.bindVisitors,
+        bindTtlHours: body.bindTtlHours === undefined ? cur.bindTtlHours : body.bindTtlHours,
         ownerId: body.ownerId === undefined || req.user?.role === 'buyer' ? cur.ownerId : body.ownerId,
         sourceId: body.sourceId === undefined ? cur.sourceId : body.sourceId,
         redirectMethod: body.redirectMethod === undefined ? cur.redirectMethod : body.redirectMethod,
