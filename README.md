@@ -71,6 +71,19 @@ Tracking URL принимает `utm_source`, `utm_medium`, `utm_campaign`, `utm
 - `countClicks: false` — редирект работает, но клик не пишется в журнал и отчёты.
 - `action` — что делает поток: `offers` (по умолчанию, ротация `offers`), `url` (редирект на `url`, только https, макросы как у офферов; клик пишется с пустым `offerId`) или `not_found` (ответ `404 Not Found`, клик не пишется).
 
+## Параметры и расход
+
+Каждый клик сохраняет параметры источника: `keyword`, `source`, `external_id`, `creative_id`, `ad_campaign_id`, `sub_id_1`…`sub_id_30` (поле `params` в журнале) и расход (`cost`).
+
+- `paramMap` кампании переименовывает параметр в ссылке: `{"sub_id_1":"ad_id","cost":"bid"}` → значение `?ad_id=` попадёт в `sub_id_1`. Недопустимые имена отбрасываются.
+- `costModel: "cpc"` + `cpc: 0.12` — фиксированная цена клика; `costFromParam: true` — брать из параметра `cost` (или переименованного), при отсутствии/ошибке — `cpc`.
+- Все отчёты отдают `cost`, `profit`, `roi`. `GET /stats/params?field=sub_id_1&campaign=&from=&to=` — отчёт по значениям параметра.
+- Макросы в URL оффера: `{sub_id_N}`, `{keyword}`, `{source}`, `{external_id}`, `{creative_id}`, `{ad_campaign_id}`, `{cost}`. Значения URL-кодируются.
+
+## Импорт офферов из Keitaro
+
+`node scripts/import-keitaro-offers.mjs` — только чтение Keitaro. Без флагов показывает группы и партнёрки; `--groups`, `--networks`, `--ids` выбирают офферы; `--apply` записывает в Umbrella (`kt-<id>`, повторный запуск обновляет). Ключи — из `~/.keitaro-api-key` и `~/umbrella-admin-token.txt`. Макросы Keitaro переводятся (`{subid}` → `{click_id}`, `{campaign_id}` → `{campaign}`), неподдерживаемые удаляются с предупреждением.
+
 ## Пользователи и доступ
 
 У Umbrella своя база пользователей (таблицы `users`, `sessions` или файлы в `DATA_DIR`), не связанная с другими проектами на том же домене. Роли: `owner` (управляет пользователями) и `buyer` (кампании, офферы, отчёты).

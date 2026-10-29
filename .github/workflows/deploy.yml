@@ -3,6 +3,8 @@ name: Deploy to nespizdili.lol/umbrella
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -24,6 +26,8 @@ jobs:
 
   deploy:
     needs: test
+    # Pull requests only run tests; production deploys happen after merge into main.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
