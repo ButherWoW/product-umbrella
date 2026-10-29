@@ -1,0 +1,40 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-product_umbrella}
+      POSTGRES_USER: ${POSTGRES_USER:-umbrella}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - umbrella_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PORT: 4100
+      DATABASE_URL: postgresql://${POSTGRES_USER:-umbrella}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-product_umbrella}
+      REQUIRE_POSTGRES: "1"
+      REQUIRE_LOGIN: ${REQUIRE_LOGIN:-1}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?set ADMIN_TOKEN}
+      POSTBACK_SECRET: ${POSTBACK_SECRET:?set POSTBACK_SECRET}
+    ports:
+      - "127.0.0.1:${PORT:-4100}:4100"
+    volumes:
+      - umbrella_data:/app/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4100/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+volumes:
+  umbrella_pgdata:
+  umbrella_data:
