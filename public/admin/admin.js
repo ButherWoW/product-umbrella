@@ -479,10 +479,10 @@ function summarizeConditions(c = {}) {
   if (c.os?.length) parts.push('ОС: ' + c.os.join(', '));
   if (c.browsers?.length) parts.push('Браузеры: ' + c.browsers.join(', '));
   if (c.languages?.length) parts.push('Языки: ' + c.languages.join(', '));
-  return parts.length ? parts.join(' · ') : 'Без фильтров';
+  return parts.length ? parts.join(c.mode === 'or' ? ' ИЛИ ' : ' · ') : 'Без фильтров';
 }
 
-function streamModal(stream, onApply, isNew = false) {
+function streamModal(stream, onApply, isNew = false, currentCampaignId = null) {
   const s = structuredClone(stream);
   s.conditions = { countries: [], devices: [], os: [], browsers: [], languages: [], ...(s.conditions || {}) };
   s.action = s.action || 'offers';
@@ -517,13 +517,20 @@ function streamModal(stream, onApply, isNew = false) {
       const box = h('div');
       const draw = () => put(box, s.action === 'offers' ? [h('p', { class: 'muted' }, 'Офферы потока и их доля трафика (вес).'), offersBox]
         : s.action === 'url' ? field('URL', h('input', { class: 'input', type: 'url', value: s.url || '', placeholder: 'https://…', oninput: (e) => { s.url = e.target.value.trim(); } }), 'Редирект на этот адрес. Макросы: {click_id} {subid} {campaign} {device} {country}.')
+        : s.action === 'campaign' ? field('Кампания', h('select', { class: 'select', onchange: (e) => { s.campaignId = e.target.value; } },
+            h('option', { value: '' }, 'Выберите кампанию'),
+            Object.entries(state.campaigns).filter(([id]) => id !== currentCampaignId).map(([id, c]) => h('option', { value: id, selected: s.campaignId === id }, `${c.name || id} (${id})`))),
+          'Клик уходит в выбранную кампанию без редиректа и проходит её потоки. Учитывается в отчётах той кампании.')
         : h('p', { class: 'muted' }, 'Посетитель получит страницу 404, клик не записывается.'));
       draw();
-      return h('div', {}, h('div', { class: 'radios', style: 'margin-bottom:14px' }, [['offers', 'Офферы'], ['url', 'Прямой URL'], ['not_found', 'Ошибка 404']].map(([v, l]) => h('label', {},
+      return h('div', {}, h('div', { class: 'radios', style: 'margin-bottom:14px' }, [['offers', 'Офферы'], ['url', 'Прямой URL'], ['campaign', 'Другая кампания'], ['not_found', 'Ошибка 404']].map(([v, l]) => h('label', {},
         h('input', { type: 'radio', name: 'saction', checked: s.action === v, onchange: () => { s.action = v; draw(); } }), l))), box);
     }],
     ['Фильтры', () => h('div', {},
-      h('p', { class: 'muted' }, 'Поток получает клик, только если подошли все заданные фильтры (И). Пустой фильтр — любое значение.'),
+      field('Отношение', h('div', { class: 'radios' },
+        h('label', {}, h('input', { type: 'radio', name: 'smode', checked: s.conditions.mode !== 'or', onchange: () => { delete s.conditions.mode; } }), 'И — все фильтры'),
+        h('label', {}, h('input', { type: 'radio', name: 'smode', checked: s.conditions.mode === 'or', onchange: () => { s.conditions.mode = 'or'; } }), 'ИЛИ — любой из фильтров')),
+        'Пустой фильтр не учитывается.'),
       field('Страны', h('input', { class: 'input', value: s.conditions.countries.join(', '), placeholder: 'FR, DE, US', oninput: (e) => { s.conditions.countries = splitList(e.target.value).map((x) => x.toUpperCase()); } }), 'ISO-коды через запятую. Без базы GeoIP страна неизвестна и такой фильтр не сработает.'),
       field('Тип устройства', checkGroup(COND.devices, s.conditions.devices, (v) => { s.conditions.devices = v; })),
       field('Операционные системы', checkGroup(COND.os, s.conditions.os, (v) => { s.conditions.os = v; })),
@@ -538,8 +545,9 @@ function streamModal(stream, onApply, isNew = false) {
       if (!s.name?.trim()) { err.textContent = 'Укажите название потока.'; return; }
       if (s.action === 'offers' && !s.offers.length) { err.textContent = 'Добавьте хотя бы один оффер на вкладке «Схема».'; return; }
       if (s.action === 'url' && !/^https:\/\//i.test(s.url || '')) { err.textContent = 'Прямой URL должен начинаться с https://'; return; }
+      if (s.action === 'campaign' && !s.campaignId) { err.textContent = 'Выберите кампанию на вкладке «Схема».'; return; }
       if (s.offers.some((o) => !(o.weight > 0)) || !(s.weight > 0)) { err.textContent = 'Веса должны быть больше нуля.'; return; }
-      if (s.action === 'offers') { delete s.action; delete s.url; } else { delete s.offers; if (s.action !== 'url') delete s.url; }
+      if (s.action === 'offers') { delete s.action; delete s.url; delete s.campaignId; } else { delete s.offers; if (s.action !== 'url') delete s.url; if (s.action !== 'campaign') delete s.campaignId; }
       onApply(s); close();
     } }, 'Применить')],
   });
@@ -573,6 +581,9 @@ async function pageCampaignEditor(id) {
         h('label', {}, h('input', { type: 'radio', name: 'cstate', checked: !d.active, onchange: () => { d.active = false; mark(); } }), 'Выключена'))),
       field('Срок уникальности, минут', h('input', { class: 'input', type: 'number', min: 0, value: d.dedupeWindow || 0, oninput: bind('dedupeWindow', 'int') }), 'Повторный клик с того же IP в этом окне не считается. 0 — выключено.'),
       field('Фильтр ботов', h('label', { class: 'radios' }, h('input', { type: 'checkbox', checked: d.botFilter, onchange: (e) => { d.botFilter = e.target.checked; mark(); } }), 'Не считать клики ботов'), 'Боты уходят на тот же оффер, но не попадают в статистику.'),
+      field('Способ редиректа', h('div', { class: 'radios' }, [['http', 'HTTP 302'], ['meta', 'Meta refresh'], ['js', 'JavaScript']].map(([v, l]) => h('label', {},
+        h('input', { type: 'radio', name: 'credir', checked: (d.redirectMethod || 'http') === v, onchange: () => { d.redirectMethod = v; mark(); } }), l))),
+        'Как посетитель уходит на оффер. HTTP 302 — быстрее всего; meta и JS отдают страницу, которая сама переходит дальше.'),
       field('Окно конверсии, дней', h('input', { class: 'input', type: 'number', min: 1, max: 365, value: d.conversionWindowDays ?? '', placeholder: 'без ограничения', oninput: bind('conversionWindowDays', 'int') }), 'Постбэк на клик старше окна отклоняется.'))],
     ['Таргетинг', () => h('div', {},
       h('p', { class: 'muted' }, 'Фильтры уровня кампании: не подошедший клик не попадает ни в один поток.'),
@@ -606,15 +617,15 @@ async function pageCampaignEditor(id) {
           h('button', { 'aria-label': 'Выше', disabled: i === 0, onclick: () => { [d.streams[i - 1], d.streams[i]] = [d.streams[i], d.streams[i - 1]]; mark(); drawStreams(); } }, '▲'),
           h('button', { 'aria-label': 'Ниже', disabled: i === d.streams.length - 1, onclick: () => { [d.streams[i + 1], d.streams[i]] = [d.streams[i], d.streams[i + 1]]; mark(); drawStreams(); } }, '▼')),
         h('div', { style: 'min-width:0' },
-          h('div', { class: 'title', onclick: () => streamModal(s, (next) => { d.streams[i] = next; mark(); drawStreams(); }) },
+          h('div', { class: 'title', onclick: () => streamModal(s, (next) => { d.streams[i] = next; mark(); drawStreams(); }, false, d.id) },
             `${i + 1}. ${s.name} `, h('span', { class: 'badge ' + (s.type || 'regular') }, typeLabel[s.type || 'regular']),
             s.enabled === false ? [' ', h('span', { class: 'badge' }, 'Выключен')] : null,
             s.countClicks === false ? [' ', h('span', { class: 'badge' }, 'Клики не считаются')] : null),
           h('div', { class: 'meta' }, summarizeConditions(s.conditions)),
-          h('div', { class: 'meta' }, (s.action === 'url' ? 'Прямой URL: ' + s.url : s.action === 'not_found' ? 'Действие: ошибка 404' : 'Офферы: ' + (s.offers || []).map((o) => `${o.offerId} (${o.weight ?? 1})`).join(', ')) + ((s.type || 'regular') === 'regular' ? ` · вес потока ${s.weight ?? 1}` : ''))),
+          h('div', { class: 'meta' }, (s.action === 'url' ? 'Прямой URL: ' + s.url : s.action === 'campaign' ? '→ кампания ' + (state.campaigns[s.campaignId]?.name || s.campaignId) : s.action === 'not_found' ? 'Действие: ошибка 404' : 'Офферы: ' + (s.offers || []).map((o) => `${o.offerId} (${o.weight ?? 1})`).join(', ')) + ((s.type || 'regular') === 'regular' ? ` · вес потока ${s.weight ?? 1}` : ''))),
         h('div', { class: 'nums' }, `${num(st.clicks)} кл.`, h('br'), `${num(st.conversions)} конв.`,
           h('div', { class: 'row-actions' },
-            h('button', { title: 'Изменить', 'aria-label': 'Изменить поток', onclick: () => streamModal(s, (next) => { d.streams[i] = next; mark(); drawStreams(); }) }, '✎'),
+            h('button', { title: 'Изменить', 'aria-label': 'Изменить поток', onclick: () => streamModal(s, (next) => { d.streams[i] = next; mark(); drawStreams(); }, false, d.id) }, '✎'),
             h('button', { title: 'Удалить', 'aria-label': 'Удалить поток', onclick: (e) => {
               const b = e.currentTarget;
               if (b.dataset.armed) { d.streams.splice(i, 1); mark(); drawStreams(); return; }
@@ -638,7 +649,7 @@ async function pageCampaignEditor(id) {
     if (new Set(names).size !== names.length) { err.textContent = 'Названия потоков должны различаться — по ним строится статистика.'; return; }
     const body = { name: d.name.trim(), active: d.active, streams: d.streams, dailyCap: d.dailyCap, totalCap: d.totalCap, revenueCap: d.revenueCap, capUrl: d.capUrl, geoCapUrl: d.geoCapUrl,
       allowGeos: d.allowGeos, allowDevices: d.allowDevices, allowOS: d.allowOS, allowBrowsers: d.allowBrowsers, blockedIps: d.blockedIps, allowedIps: d.allowedIps,
-      dedupeWindow: d.dedupeWindow || 0, botFilter: d.botFilter, conversionWindowDays: d.conversionWindowDays };
+      dedupeWindow: d.dedupeWindow || 0, botFilter: d.botFilter, conversionWindowDays: d.conversionWindowDays, redirectMethod: d.redirectMethod || 'http' };
     saveBtn.disabled = true;
     try {
       const saved = isNew ? await api('/api/campaigns', { method: 'POST', body: { id: d.id, ...body } })
@@ -664,7 +675,7 @@ async function pageCampaignEditor(id) {
       h('div', { class: 'left' }, left),
       h('div', { class: 'right' },
         h('div', { class: 'toolbar' },
-          h('button', { class: 'btn primary', onclick: () => streamModal({ name: `Flow ${d.streams.length + 1}`, type: 'regular', weight: 1, conditions: {}, offers: [] }, (s) => { d.streams.push(s); mark(); drawStreams(); }, true) }, 'Создать поток'),
+          h('button', { class: 'btn primary', onclick: () => streamModal({ name: `Flow ${d.streams.length + 1}`, type: 'regular', weight: 1, conditions: {}, offers: [] }, (s) => { d.streams.push(s); mark(); drawStreams(); }, true, d.id) }, 'Создать поток'),
           h('span', { style: 'flex:1' }),
           periodControl(() => loadStreamStats())),
         streamsBox,

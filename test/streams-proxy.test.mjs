@@ -103,3 +103,49 @@ test('source parameters, macros, cost and ROI', { timeout: 15000 }, async (t) =>
     assert.ok(log.clicks.some((c) => c.params?.sub_id_1 === '123' && c.params?.creative_id === 'cr9' && c.cost === 0.5));
   });
 });
+
+test('send to campaign, OR filters and redirect methods', { timeout: 15000 }, async (t) => {
+  await withServer(t, {}, async ({ url, post, hit }) => {
+    const IPHONE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Safari/604.1';
+    await post('/api/campaigns', { id: 'target', name: 'Target', streams: [{ name: 'main', offers: [{ offerId: 'offer-1' }] }] });
+    await post('/api/campaigns', { id: 'entry', name: 'Entry', streams: [{ name: 'to-target', action: 'campaign', campaignId: 'target' }] });
+    const handed = await hit('/r/entry');
+    assert.equal(handed.status, 302);
+    assert.equal(new URL(handed.headers.get('location')).host, 'example.com');
+    const clicks = (await (await fetch(url + '/api/clicks?campaign=target')).json()).clicks;
+    assert.equal(clicks.length, 1, 'click is recorded in the final campaign');
+    assert.equal((await (await fetch(url + '/stats?campaign=entry')).json()).clicks, 0, 'not double-counted in the entry campaign');
+
+    await post('/api/campaigns', { id: 'loop-a', name: 'A', streams: [{ name: 'a', action: 'campaign', campaignId: 'loop-b' }] });
+    await post('/api/campaigns', { id: 'loop-b', name: 'B', streams: [{ name: 'b', action: 'campaign', campaignId: 'loop-a' }] });
+    const loop = await hit('/r/loop-a');
+    assert.equal(loop.status, 508);
+    assert.equal((await loop.json()).error, 'campaign_loop');
+    await post('/api/campaigns/target', { active: false }, 'PATCH');
+    assert.equal((await hit('/r/entry')).status, 404, 'inactive target stops the hand-off');
+    const badHop = await (await post('/api/campaigns', { id: 'bad-hop', name: 'x', streams: [{ name: 'x', action: 'campaign', campaignId: '../evil' }] })).json();
+    assert.equal(badHop.streams.length, 0, 'invalid target campaign id is rejected');
+
+    await post('/api/campaigns', { id: 'or-camp', name: 'OR', streams: [
+      { name: 'ios-or-fr', conditions: { mode: 'or', os: ['ios'], languages: ['fr'] }, offers: [{ offerId: 'offer-1' }] },
+      { name: 'rest', type: 'fallback', action: 'not_found' },
+    ] });
+    assert.equal((await hit('/r/or-camp', { 'user-agent': IPHONE, 'accept-language': 'en' })).status, 302, 'OR: iOS alone is enough');
+    assert.equal((await hit('/r/or-camp', { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0) Chrome/126.0', 'accept-language': 'fr-FR' })).status, 302, 'OR: French alone is enough');
+    assert.equal((await hit('/r/or-camp', { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0) Chrome/126.0', 'accept-language': 'de' })).status, 404, 'OR: neither → fallback');
+
+    await post('/api/offers', { id: 'xss-offer', url: 'https://shop.example.net/?q="><script>alert(1)</script>&s={subid}' });
+    await post('/api/campaigns', { id: 'meta-camp', name: 'Meta', redirectMethod: 'meta' });
+    const meta = await hit('/r/meta-camp/xss-offer?subid=a"b');
+    assert.equal(meta.status, 200);
+    const metaHtml = await meta.text();
+    assert.match(metaHtml, /http-equiv="refresh"/);
+    assert.ok(!metaHtml.includes('<script>alert'), 'offer URL is escaped in HTML');
+    await post('/api/campaigns', { id: 'js-camp', name: 'JS', redirectMethod: 'js' });
+    const js = await (await hit('/r/js-camp/xss-offer')).text();
+    assert.match(js, /location\.replace\(/);
+    assert.ok(!js.includes('</script><script>alert'), 'URL cannot break out of the script tag');
+    await post('/api/campaigns', { id: 'weird', name: 'W', redirectMethod: 'iframe' });
+    assert.equal((await (await fetch(url + '/api/campaigns')).json()).campaigns.weird.redirectMethod, 'http', 'unknown method falls back to http');
+  });
+});

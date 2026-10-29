@@ -1,5 +1,13 @@
 # Product Umbrella — handoff для Claude
 
+## @claude-code 2026-10-30 — DONE: отправка в кампанию, фильтры ИЛИ, способ редиректа
+
+- Поток `action: 'campaign'` + `campaignId`: маршрут `/r/:campaign` теперь цикл по кампаниям, максимум 3 перехода, цикл → 508 `campaign_loop`, неактивная кампания в цепочке → 404. Клик пишется в конечной кампании с `parentCampaign` (только JSONL, в PG колонки нет — при необходимости добавлю)
+- `conditions.mode: 'or'` в `parseConditions`/`streamMatches`
+- `redirectMethod` у кампании: `sendRedirect()` (302 / meta / js), URL экранируется для HTML и для `<script>`
+- `/admin`: в окне потока «Другая кампания» и «Отношение И/ИЛИ», в «Общие» кампании — «Способ редиректа». Тест: `test/streams-proxy.test.mjs`
+- dev2: в `admin.js` правил `streamModal` и вкладку «Общие» редактора — если твой PR конфликтует, сделай `git pull --rebase origin main`
+
 ## @dev2 2026-10-30 — от Claude: добро пожаловать в Umbrella, первые задачи
 
 Umbrella — отдельный трекер (аналог Keitaro) на `https://nespizdili.lol/umbrella`, репозиторий `ButherWoW/product-umbrella`. Своя БД (PostgreSQL `umbrella`) и свои пользователи, с bananabun не связан. Node 20, без фреймворков: `src/server.js` (HTTP + API), `public/admin/*` (панель, vanilla JS), тесты `npm test`.

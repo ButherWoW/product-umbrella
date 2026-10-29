@@ -73,7 +73,10 @@ const eventMirror = db ? createEventMirror({ query,
 
 const OFFER_ID_RE = /^[a-z0-9_-]{2,80}$/i;
 const STREAM_TYPES = ['forced', 'regular', 'fallback'];
-const STREAM_ACTIONS = ['offers', 'url', 'not_found'];
+const STREAM_ACTIONS = ['offers', 'url', 'not_found', 'campaign'];
+const REDIRECT_METHODS = ['http', 'meta', 'js'];
+// Hops allowed through "send to campaign" streams before giving up (protects against A → B → A loops).
+const MAX_CAMPAIGN_HOPS = 3;
 
 function parseList(raw, normalize, valid) {
   return Array.isArray(raw) ? raw.map(normalize).filter(valid).slice(0, 50) : [];
@@ -87,6 +90,7 @@ function parseConditions(raw = {}) {
     os: parseList(raw.os, lower, (o) => ['android', 'ios', 'windows', 'macos', 'linux', 'other'].includes(o)),
     browsers: parseList(raw.browsers, lower, (b) => ['chrome', 'safari', 'firefox', 'edge', 'opera', 'samsung', 'other'].includes(b)),
     languages: parseList(raw.languages, (l) => String(l).toLowerCase().slice(0, 2), (l) => /^[a-z]{2}$/.test(l)),
+    ...(raw.mode === 'or' ? { mode: 'or' } : {}),
   };
 }
 
@@ -115,6 +119,10 @@ function parseStreams(raw) {
           if (!/^https:\/\//i.test(String(s.url || ''))) continue;
           stream.url = String(s.url).slice(0, 2048);
         }
+        if (action === 'campaign') {
+          if (!OFFER_ID_RE.test(String(s.campaignId || ''))) continue;
+          stream.campaignId = String(s.campaignId);
+        }
       }
       // Defaults are omitted so existing stored streams keep their exact shape.
       if (s.enabled === false) stream.enabled = false;
@@ -139,12 +147,11 @@ function streamMatches(stream, visitor) {
   const c = stream.conditions;
   if (!c) return true;
   // Unknown country (no GEOIP_DB) never matches a country condition, so geo streams fall through to others.
-  if (c.countries.length && !c.countries.includes(visitor.country)) return false;
-  if (c.devices.length && !c.devices.includes(visitor.device)) return false;
-  if (c.os.length && !c.os.includes(visitor.os)) return false;
-  if (c.browsers.length && !c.browsers.includes(visitor.browser)) return false;
-  if (c.languages.length && !c.languages.includes(visitor.language)) return false;
-  return true;
+  const checks = [[c.countries, visitor.country], [c.devices, visitor.device], [c.os, visitor.os], [c.browsers, visitor.browser], [c.languages, visitor.language]]
+    .filter(([values]) => values?.length)
+    .map(([values, actual]) => values.includes(actual));
+  if (!checks.length) return true;
+  return c.mode === 'or' ? checks.some(Boolean) : checks.every(Boolean);
 }
 
 // Keitaro order: first matching forced stream → weighted among matching regular → first matching fallback.
@@ -413,6 +420,7 @@ function parseCampaign(id, value) {
     // Revenue cap: stop after earning revenueCap per day
     revenueCap: typeof value.revenueCap === 'number' && value.revenueCap > 0 ? value.revenueCap : null,
     botFilter: value.botFilter === true,
+    redirectMethod: REDIRECT_METHODS.includes(value.redirectMethod) ? value.redirectMethod : 'http',
     blockedIps: parseIpRules(value.blockedIps),
     allowedIps: parseIpRules(value.allowedIps),
     totalCap: Number.isInteger(value.totalCap) && value.totalCap > 0 ? value.totalCap : null,
@@ -713,6 +721,20 @@ function dashboard(res) {
   </script><script type="module" src="/assets/stream-editor.js"></script><script type="module" src="/assets/event-logs.js"></script></html>`);
 }
 
+const htmlAttr = (v) => String(v).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
+
+// Keitaro-style redirect methods: plain 302, meta refresh, or JavaScript (with meta fallback).
+function sendRedirect(res, location, method = 'http') {
+  if (method === 'meta' || method === 'js') {
+    const meta = `<meta http-equiv="refresh" content="0;url=${htmlAttr(location)}">`;
+    const script = method === 'js' ? `<script>location.replace(${JSON.stringify(location).replace(/</g, '\\u003c')})</script><noscript>${meta}</noscript>` : meta;
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-robots-tag': 'noindex' });
+    return res.end(`<!doctype html><html><head><meta charset="utf-8"><meta name="robots" content="noindex">${script}</head><body><a href="${htmlAttr(location)}">Continue</a></body></html>`);
+  }
+  res.writeHead(302, { location, 'cache-control': 'no-store' });
+  return res.end();
+}
+
 async function handleAuthRoute(req, res, url) {
   const path = url.pathname;
   const csrfOk = req.headers['x-requested-with'] === 'umbrella' || bearerAuthorized(req);
@@ -794,7 +816,7 @@ const server = http.createServer(async (req, res) => {
       return res.end(await readFile(join(root, 'public', 'stream-editor.js')));
     }
     // Shared click handler for both stream and explicit-offer routes.
-    async function handleClick(campaignId, offerId, targetTemplate, streamName = null, countClick = true) {
+    async function handleClick(campaignId, offerId, targetTemplate, streamName = null, countClick = true, extra = {}) {
       const c = campaigns.get(campaignId);
       if (!c || !c.active) return json(res, 404, { error: 'campaign_not_found_or_inactive' });
       if (rateLimited(clientIp(req))) return json(res, 429, { error: 'click_rate_limited' });
@@ -901,31 +923,41 @@ const server = http.createServer(async (req, res) => {
 
       // Streams with countClicks=false redirect normally but stay out of logs and reports, as in Keitaro.
       if (countClick) {
-        await event('click', { clickId, campaign: campaignId, offerId, path: url.pathname, referrer: req.headers.referer || null, userAgent: req.headers['user-agent'] || null, subid, country, ip, stream: streamName, ...(Object.keys(params).length ? { params } : {}), ...(cost ? { cost } : {}) });
+        await event('click', { clickId, campaign: campaignId, offerId, path: url.pathname, referrer: req.headers.referer || null, userAgent: req.headers['user-agent'] || null, subid, country, ip, stream: streamName, ...extra, ...(Object.keys(params).length ? { params } : {}), ...(cost ? { cost } : {}) });
         if (totalCount !== null && totalCount + 1 >= c.totalCap) await pauseCampaign(campaignId, 'total_cap_reached');
       }
-      res.writeHead(302, { location: destination.toString(), 'cache-control': 'no-store' });
-      return res.end();
+      return sendRedirect(res, destination.toString(), c.redirectMethod);
     }
 
-    // /r/:campaign — stream-based routing (Keitaro-style)
+    // /r/:campaign — stream-based routing (Keitaro-style). A stream may hand the click to another campaign.
     const matchStream = url.pathname.match(/^\/r\/([^/]+)$/);
     if (matchStream && req.method === 'GET') {
-      const [, campaignId] = matchStream;
-      const c = campaigns.get(campaignId);
-      if (!c) return json(res, 404, { error: 'campaign_not_found_or_inactive' });
-      if (!c.streams?.length) return json(res, 404, { error: 'no_streams_configured' });
-      const picked = pickStream(c.streams, visitorProfile(req), await cappedOffers(c.streams));
-      if (!picked) return json(res, 404, { error: 'no_matching_stream' });
-      const countClick = picked.stream.countClicks !== false;
-      if (picked.stream.action === 'not_found') {
-        res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
-        return res.end('Not Found');
+      const visitor = visitorProfile(req);
+      const visited = [];
+      let campaignId = matchStream[1];
+      for (;;) {
+        const c = campaigns.get(campaignId);
+        if (!c || !c.active) return json(res, 404, { error: 'campaign_not_found_or_inactive' });
+        if (!c.streams?.length) return json(res, 404, { error: 'no_streams_configured' });
+        const picked = pickStream(c.streams, visitor, await cappedOffers(c.streams));
+        if (!picked) return json(res, 404, { error: 'no_matching_stream' });
+        const countClick = picked.stream.countClicks !== false;
+        const extra = visited.length ? { parentCampaign: visited[0] } : {};
+        if (picked.stream.action === 'campaign') {
+          visited.push(campaignId);
+          if (visited.length > MAX_CAMPAIGN_HOPS || visited.includes(picked.stream.campaignId)) return json(res, 508, { error: 'campaign_loop', path: [...visited, picked.stream.campaignId] });
+          campaignId = picked.stream.campaignId;
+          continue;
+        }
+        if (picked.stream.action === 'not_found') {
+          res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+          return res.end('Not Found');
+        }
+        if (picked.stream.action === 'url') return await handleClick(campaignId, '', picked.stream.url, picked.stream.name || null, countClick, extra);
+        const offer = offers.get(picked.offerId);
+        if (!offer) return json(res, 404, { error: 'offer_not_found' });
+        return await handleClick(campaignId, picked.offerId, offer.url, picked.stream.name || null, countClick, extra);
       }
-      if (picked.stream.action === 'url') return await handleClick(campaignId, '', picked.stream.url, picked.stream.name || null, countClick);
-      const offer = offers.get(picked.offerId);
-      if (!offer) return json(res, 404, { error: 'offer_not_found' });
-      return await handleClick(campaignId, picked.offerId, offer.url, picked.stream.name || null, countClick);
     }
     // /r/:campaign/:offer — explicit offer routing (backward compat)
     const match = url.pathname.match(/^\/r\/([^/]+)\/([^/]+)$/);
@@ -1027,6 +1059,7 @@ const server = http.createServer(async (req, res) => {
         dedupeWindow: body.dedupeWindow === undefined ? cur.dedupeWindow : body.dedupeWindow,
         revenueCap: body.revenueCap === undefined ? cur.revenueCap : body.revenueCap,
         botFilter: body.botFilter === undefined ? cur.botFilter : body.botFilter,
+        redirectMethod: body.redirectMethod === undefined ? cur.redirectMethod : body.redirectMethod,
         blockedIps: body.blockedIps === undefined ? cur.blockedIps : body.blockedIps,
         allowedIps: body.allowedIps === undefined ? cur.allowedIps : body.allowedIps,
         totalCap: body.totalCap === undefined ? cur.totalCap : body.totalCap,
