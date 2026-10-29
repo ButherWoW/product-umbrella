@@ -116,6 +116,8 @@ CREATE TABLE IF NOT EXISTS cost_imports (
 
 CREATE INDEX IF NOT EXISTS clicks_campaign_created_idx ON clicks(campaign, created_at);
 CREATE INDEX IF NOT EXISTS clicks_created_idx ON clicks(created_at);
+CREATE INDEX IF NOT EXISTS clicks_offer_created_idx ON clicks(offer_id, created_at);
+CREATE INDEX IF NOT EXISTS clicks_campaign_ip_created_idx ON clicks(campaign, ip, created_at);
 CREATE INDEX IF NOT EXISTS conversions_created_idx ON conversions(created_at);
 
 CREATE TABLE IF NOT EXISTS users (
