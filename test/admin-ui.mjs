@@ -760,6 +760,10 @@ try {
       await hid.pg.locator('table.grid tbody tr', { hasText: 'Perm camp' }).waitFor();
       const heads = await hid.pg.locator('table.grid thead').innerText();
       assert.ok(!/Доход|Прибыль|ROI|EPC/.test(heads), `revenue columns hidden: ${heads}`);
+      await hid.pg.goto(permSrv.url + '/admin#/reports?group=conversions');
+      await hid.pg.locator('table.grid thead th', { hasText: 'Лиды' }).waitFor();
+      const convHeads = await hid.pg.locator('table.grid thead').innerText();
+      assert.ok(!/Доход/.test(convHeads), `conversions report hides revenue: ${convHeads}`);
       await hid.ctx.close();
 
       const ro = await login('perm-viewer@example.com', 'user-password-1');
@@ -925,6 +929,34 @@ try {
       await rm(pbDir, { recursive: true, force: true });
     }
   }
+  // D14: «Конверсии» preset — conversions by day. A lead that became a sale the same day counts once, as a sale (as /stats does).
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await api('/api/campaigns', { id: 'd14-conv', name: 'D14 Conv', streams: [{ name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] }] });
+  const d14cid = new URL((await fetch(server.url + '/r/d14-conv', { redirect: 'manual' })).headers.get('location')).searchParams.get('click_id');
+  await fetch(server.url + '/r/d14-conv', { redirect: 'manual' });
+  await fetch(`${server.url}/postback?secret=conversion-test-secret&click_id=${d14cid}&status=lead&revenue=10&currency=EUR`);
+  await fetch(`${server.url}/postback?secret=conversion-test-secret&click_id=${d14cid}&status=sale&revenue=10&currency=EUR`);
+  const d14Stats = await (await fetch(server.url + '/stats?campaign=d14-conv', { headers: { authorization: 'Bearer ' + TOKEN } })).json();
+  assert.deepEqual([d14Stats.leads, d14Stats.sales], [0, 1], '/stats: the lead turned into a sale');
+  await page.goto(server.url + '/admin#/reports?group=conversions&campaign=d14-conv');
+  await page.getByRole('heading', { name: 'Отчёт' }).waitFor();
+  await page.getByRole('combobox', { name: 'Период' }).selectOption('today');
+  await page.getByRole('combobox', { name: 'Валюта' }).selectOption('USD'); // amounts are converted: 10 EUR = 12,50 $ at the test rate
+  assert.ok(await page.locator('button.chip-btn.on', { hasText: 'Конверсии' }).isVisible(), 'conversions preset is active');
+  const d14Today = new Date().toISOString().slice(0, 10);
+  await page.locator('table.grid tbody tr', { hasText: d14Today }).waitFor();
+  const d14Cells = await page.evaluate((today) => {
+    const ths = [...document.querySelectorAll('table.grid thead th')].map((th) => th.textContent.trim());
+    const row = [...document.querySelectorAll('table.grid tbody tr')].find((r) => r.textContent.includes(today));
+    const tds = [...row.querySelectorAll('td')].map((td) => td.textContent.trim());
+    return Object.fromEntries(ths.map((t, i) => [t, tds[i]]));
+  }, d14Today);
+  assert.equal(await page.locator('table.grid tbody tr').count(), 1, 'one day row');
+  assert.deepEqual([d14Cells['Клики'], d14Cells['Лиды'], d14Cells['Продажи'], d14Cells['Отклонённые']], ['2', String(d14Stats.leads), String(d14Stats.sales), '0'], `day row matches /stats: ${JSON.stringify(d14Cells)}`);
+  assert.equal(d14Cells['Approve %'], '100,00%');
+  assert.match(d14Cells['Доход'] || '', /^12,50\s?\$$/, `revenue of the sale in USD: ${d14Cells['Доход']}`);
+  assert.match(d14Cells['Доход (ожидаемый)'] || '', /^0,00\s?\$$/, 'nothing pending');
+  assert.ok((await page.locator('table.grid tfoot').innerText()).includes('1'), 'totals row');
 
   // Connection type: stream filter checkboxes (with «НЕ») and the «Тип соединения» report grouping.
   await page.setViewportSize({ width: 1280, height: 900 });
