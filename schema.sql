@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS sources (
   cost_model TEXT NOT NULL DEFAULT 'none',
   cpc NUMERIC(12,6),
   cost_from_param BOOLEAN NOT NULL DEFAULT false,
+  postback_url TEXT,
+  postback_statuses JSONB NOT NULL DEFAULT '["sale"]'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -78,7 +80,7 @@ CREATE TABLE IF NOT EXISTS conversions (
 );
 CREATE TABLE IF NOT EXISTS bots (
   id BIGSERIAL PRIMARY KEY, campaign TEXT NOT NULL, offer_id TEXT, stream TEXT,
-  user_agent TEXT, ip TEXT, reason TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  user_agent TEXT, ip TEXT, reason TEXT, isp TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS bots_campaign_created_idx ON bots(campaign, created_at);
 

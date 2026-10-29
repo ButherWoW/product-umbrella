@@ -24,10 +24,12 @@ test('PostgreSQL: sources, networks, clones, archive and groups survive a restar
   const call = (path, body, method = body ? 'POST' : 'GET') => fetch(server.url + path, {
     method, headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
   try {
-    assert.equal((await call('/api/sources', { id: ids.source, name: 'FB', costModel: 'cpc', cpc: 0.1, costFromParam: true, paramMap: { sub_id_1: 'ad_id' } })).status, 201);
+    assert.equal((await call('/api/sources', { id: ids.source, name: 'FB', costModel: 'cpc', cpc: 0.1, costFromParam: true, paramMap: { sub_id_1: 'ad_id' },
+      postbackUrl: 'https://pb.example.com/c?id={external_id}&s={status}', postbackStatuses: ['lead', 'sale'] })).status, 201);
     assert.equal((await call('/api/networks', { id: ids.network, name: 'Net', offerParams: 'sub1={click_id}', clickIdParam: '{sub1}', payoutParam: '{payout}' })).status, 201);
     assert.equal((await call('/api/offers', { id: ids.offer, url: 'https://example.com/o', networkId: ids.network, group: 'Kitchen' })).status, 201);
-    assert.equal((await call('/api/campaigns', { id: ids.campaign, name: 'C', sourceId: ids.source, group: 'FR', streams: [{ name: 'm', offers: [{ offerId: ids.offer }] }] })).status, 201);
+    assert.equal((await call('/api/campaigns', { id: ids.campaign, name: 'C', sourceId: ids.source, group: 'FR', streams: [{ name: 'm', offers: [{ offerId: ids.offer }] }],
+      sourcePostbackUrl: 'https://pb.example.com/camp?s={status}', sourcePostbackStatuses: ['trash'] })).status, 201);
     const clone = await (await call(`/api/campaigns/${ids.campaign}/clone`, {})).json();
     assert.equal(clone.id, `${ids.campaign}-copy`);
     const offerClone = await (await call(`/api/offers/${ids.offer}/clone`, {})).json();
@@ -39,6 +41,7 @@ test('PostgreSQL: sources, networks, clones, archive and groups survive a restar
   try {
     const { sources } = await (await call('/api/sources')).json();
     assert.deepEqual([sources[ids.source]?.cpc, sources[ids.source]?.costFromParam, sources[ids.source]?.paramMap], [0.1, true, { sub_id_1: 'ad_id' }]);
+    assert.deepEqual([sources[ids.source]?.postbackUrl, sources[ids.source]?.postbackStatuses], ['https://pb.example.com/c?id={external_id}&s={status}', ['lead', 'sale']], 'source postback stored in PostgreSQL');
     const { networks } = await (await call('/api/networks')).json();
     assert.equal(networks[ids.network]?.clickIdParam, '{sub1}');
     const { offers } = await (await call('/api/offers')).json();
@@ -48,6 +51,7 @@ test('PostgreSQL: sources, networks, clones, archive and groups survive a restar
     const c = campaigns[ids.campaign];
     assert.deepEqual([c?.sourceId, c?.group, c?.costModel, c?.cpc, c?.costFromParam, c?.paramMap], [ids.source, 'FR', 'cpc', 0.1, true, { sub_id_1: 'ad_id' }], 'source defaults applied and stored');
     assert.equal(campaigns[`${ids.campaign}-copy`]?.active, false, 'clone starts disabled');
+    assert.deepEqual([c?.sourcePostbackUrl, c?.sourcePostbackStatuses], ['https://pb.example.com/camp?s={status}', ['trash']], 'campaign postback override stored');
   } finally { await server.stop(); }
 });
 
