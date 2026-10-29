@@ -232,6 +232,10 @@ npm start
 
 Если PostgreSQL недоступен, сервер продолжит работу на JSONL и покажет `storage: "jsonl"` в `/health`. Перед production нужно включить PostgreSQL и проверить миграцию на резервной базе.
 
+## Проверка на PostgreSQL
+
+CI поднимает чистый PostgreSQL (job `postgres`): миграции с нуля дважды, затем `test/postgres*.test.mjs` — данные, записанные сервером, должны вернуться из базы после перезапуска с пустым каталогом данных. Локально: `docker run -d --name umb-pg -e POSTGRES_USER=umbrella -e POSTGRES_PASSWORD=local -e POSTGRES_DB=umbrella -p 55432:5432 postgres:16-alpine`, затем `DATABASE_URL=postgresql://umbrella:local@127.0.0.1:55432/umbrella node src/migrate.js` и `TEST_DATABASE_URL=… node --test test/postgres-e2e.test.mjs`.
+
 ## Бэкапы
 
 Каждую ночь (03:30 UTC, systemd timer `umbrella-backup.timer`) `deploy/backup.sh` делает дамп своей базы (`pg_dump -Fc umbrella`) и архив каталога данных (`/opt/umbrella/data`: журнал событий, настройки). Файлы лежат на сервере в `/opt/umbrella/backups` (доступ только root), хранятся 14 дней. Деплой ставит таймер и сразу делает первый бэкап, если за последние сутки его не было. Восстановление: `pg_restore --clean --if-exists -d umbrella файл.dump` и `tar -xzf файл-data.tar.gz -C /opt/umbrella` при остановленном сервисе.

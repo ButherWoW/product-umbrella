@@ -28,8 +28,31 @@ jobs:
           if grep -l $'^\xEF\xBB\xBF' src/*.js public/admin/*.js public/admin/*.html scripts/*.mjs 2>/dev/null; then echo "::error::UTF-8 BOM found in the files above"; exit 1; fi
       - run: npm test
 
+  postgres:
+    # Same app against a real, throwaway PostgreSQL: migrations from an empty database, twice (idempotent),
+    # then data must survive a server restart with an empty data directory.
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: postgres:16-alpine
+        env: { POSTGRES_USER: umbrella, POSTGRES_PASSWORD: ci-only-password, POSTGRES_DB: umbrella }
+        ports: ['5432:5432']
+        options: --health-cmd "pg_isready -U umbrella" --health-interval 2s --health-timeout 5s --health-retries 20
+    env:
+      DATABASE_URL: postgresql://umbrella:ci-only-password@127.0.0.1:5432/umbrella
+      TEST_DATABASE_URL: postgresql://umbrella:ci-only-password@127.0.0.1:5432/umbrella
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm ci --no-audit --no-fund
+      - name: Migrate an empty database, then again
+        run: node src/migrate.js && node src/migrate.js
+      - name: PostgreSQL tests
+        run: node --test $(ls test/postgres*.test.mjs)
+
   deploy:
-    needs: test
+    needs: [test, postgres]
     # Pull requests only run tests; production deploys happen after merge into main.
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest

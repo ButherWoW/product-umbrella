@@ -62,8 +62,6 @@ await db.query(`
 `);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS landing_id TEXT`);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS lp_clicked_at TIMESTAMPTZ`);
-await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'sale'`);
-await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ`);
 for (const column of ['device', 'os', 'browser', 'language']) await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS ${column} TEXT`);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS asn INTEGER`);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS isp TEXT`);
@@ -80,6 +78,8 @@ await db.query(`
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
   )
 `);
+await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'sale'`);
+await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ`);
 
 await db.query(`
   CREATE TABLE IF NOT EXISTS users (
