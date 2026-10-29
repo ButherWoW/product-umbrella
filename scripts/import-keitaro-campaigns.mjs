@@ -7,7 +7,8 @@
 //   node scripts/import-keitaro-campaigns.mjs --ids 4982 --apply    # import
 //
 // Not carried over on purpose: landings (retailer look-alike pages are not imported — streams go straight to the offer),
-// reject filters (Umbrella has no "everything except"), the Keitaro tracking domain. All of this is printed per campaign.
+// filters without an Umbrella counterpart (the whole stream is skipped), the Keitaro tracking domain. All of this is printed per campaign.
+// Reject-mode filters become `conditions.not`.
 // Offers must already be in Umbrella as kt-<id> (scripts/import-keitaro-offers.mjs).
 import { pathToFileURL } from 'node:url';
 import { readFile } from 'node:fs/promises';
@@ -33,7 +34,15 @@ const FILTERS = {
   os: ['os', (v) => OS[String(v).toLowerCase()]],
   browser: ['browsers', (v) => BROWSERS[String(v).toLowerCase()]],
   language: ['languages', (v) => String(v).toLowerCase().slice(0, 2)],
+  // Umbrella matches the referrer's host+path, so the scheme is dropped.
+  referrer: ['referrers', (v) => String(v).trim().toLowerCase().replace(/^[a-z]+:\/\//, '').slice(0, 200)],
+  keyword: ['keywords', (v) => String(v).trim().toLowerCase().slice(0, 200)],
+  user_agent: ['userAgents', (v) => String(v).trim().toLowerCase().slice(0, 200)],
+  ip: ['ips', (v) => (IP_RE.test(String(v).trim()) ? String(v).trim() : null)],
 };
+// Exact IPv4/IPv6 or IPv4 CIDR; Keitaro ranges like 1.2.3.1-1.2.3.9 are not carried over.
+const IP_RE = /^(?:\d{1,3}(?:\.\d{1,3}){3}(?:\/\d{1,2})?|[0-9a-f:]*:[0-9a-f:]*)$/i;
+const DATE_RE = /^\d{4}-\d{2}-\d{2}/;
 // Keitaro campaign parameter → Umbrella tracked field (paramMap renames the query key).
 const PARAM_FIELDS = ['keyword', 'source', 'external_id', 'creative_id', 'ad_campaign_id', ...Array.from({ length: 30 }, (_, i) => `sub_id_${i + 1}`)];
 
@@ -54,14 +63,29 @@ export function mapCampaign(c, streams, umbrellaOffers) {
     if (!type) { notes.push(`${label}: тип ${s.type} не поддерживается — пропущен`); continue; }
     const conditions = {};
     let skip = false;
+    const not = [];
     for (const f of s.filters || []) {
+      const reject = f.mode === 'reject';
+      if (f.mode && !['accept', 'reject'].includes(f.mode)) { notes.push(`${label}: фильтр «${f.name}» с режимом ${f.mode} не поддерживается — поток пропущен`); skip = true; break; }
+      if (f.name === 'empty_referrer') { conditions.emptyReferrer = !reject; continue; }
+      if (f.name === 'interval') {
+        // Dates only: {from, to[, timezone]} with YYYY-MM-DD prefixes. "Outside the range" cannot be expressed with AND.
+        const p = f.payload || {};
+        const from = DATE_RE.test(p.from || '') ? p.from.slice(0, 10) : null; const to = DATE_RE.test(p.to || '') ? p.to.slice(0, 10) : null;
+        if (reject || (!from && !to)) { notes.push(`${label}: фильтр «interval»${reject ? ' с исключением' : ''} не перенесён (${JSON.stringify(f.payload)}) — поток пропущен`); skip = true; break; }
+        Object.assign(conditions, from ? { dateFrom: from } : {}, to ? { dateTo: to } : {}, { tz: p.timezone || 'UTC' });
+        continue;
+      }
       const map = FILTERS[f.name];
       if (!map) { notes.push(`${label}: фильтр «${f.name}» не поддерживается — поток пропущен`); skip = true; break; }
-      if (f.mode && f.mode !== 'accept') { notes.push(`${label}: фильтр «${f.name}» с исключением (${f.mode}) не поддерживается — поток пропущен`); skip = true; break; }
-      const values = [].concat(f.payload || []).map(map[1]).filter(Boolean);
+      const raw = [].concat(f.payload || []);
+      const values = raw.map(map[1]).filter(Boolean);
       if (!values.length) { notes.push(`${label}: значения фильтра «${f.name}» не распознаны — поток пропущен`); skip = true; break; }
+      if (values.length < raw.length) notes.push(`${label}: часть значений фильтра «${f.name}» не перенесена (${raw.filter((v) => !map[1](v)).join(', ')})`);
       conditions[map[0]] = values;
+      if (reject) not.push(map[0]);
     }
+    if (not.length) conditions.not = not;
     if (skip) continue;
     if (s.filter_or) conditions.mode = 'or';
     const base = { name: String(s.name || 'Flow').slice(0, 80), type, ...(type === 'regular' ? { weight: Math.max(1, Number(s.weight) || 1) } : {}), conditions };

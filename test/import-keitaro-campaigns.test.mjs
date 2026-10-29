@@ -9,21 +9,29 @@ const streams = [
   { name: 'Main', type: 'regular', position: 1, weight: 100, state: 'active', schema: 'landings', filters: [{ name: 'country', mode: 'accept', payload: ['fr'] }, { name: 'device_type', mode: 'accept', payload: ['mobile'] }],
     offers: [{ offer_id: 313, share: 70, state: 'active' }, { offer_id: 314, share: 30, state: 'active' }], landings: [{ landing_id: 2809, share: 100 }] },
   { name: 'Not US', type: 'regular', position: 3, state: 'active', schema: 'offers', filters: [{ name: 'country', mode: 'reject', payload: ['US'] }], offers: [{ offer_id: 313, share: 100 }] },
+  { name: 'Sources', type: 'regular', position: 5, state: 'active', schema: 'redirect', action_payload: 'https://src.example.net/', filters: [
+    { name: 'referrer', mode: 'accept', payload: ['https://Facebook.com/ads'] }, { name: 'empty_referrer', mode: 'reject', payload: null },
+    { name: 'keyword', mode: 'reject', payload: ['Spam'] }, { name: 'ip', mode: 'reject', payload: ['10.0.0.0/8', '1.2.3.1-1.2.3.9'] },
+    { name: 'user_agent', mode: 'accept', payload: ['FBAN'] }, { name: 'interval', mode: 'accept', payload: { from: '2026-11-01 00:00', to: '2026-11-30', timezone: 'Europe/Paris' } }] },
+  { name: 'Odd', type: 'regular', position: 6, state: 'active', schema: 'redirect', action_payload: 'https://odd.example.net/', filters: [{ name: 'sub_id_1', mode: 'accept', payload: ['x'] }] },
   { name: 'Off', type: 'forced', position: 4, state: 'disabled', schema: 'redirect', action_payload: 'https://example.com/' },
 ];
 
-test('Keitaro campaign → Umbrella: streams, filters, params, cost; landings and reject filters are reported, not copied', () => {
+test('Keitaro campaign → Umbrella: streams, filters (reject → НЕ), params, cost; landings and unknown filters are reported, not copied', () => {
   const { campaign: c, notes } = mapCampaign(campaign, streams, { 'kt-313': {}, 'kt-314': {} });
   assert.equal(c.id, 'foodiflex-promo', 'alias keeps the /r/<alias> link');
   assert.equal(c.active, false, 'imported campaigns start disabled');
   assert.equal(c.streamRotation, 'position');
   assert.deepEqual(c.paramMap, { external_id: 'fbclid', ad_campaign_id: 'utm_campaign' });
   assert.deepEqual([c.costModel, c.costFromParam], ['cpc', true]);
-  assert.equal(c.streams.length, 2, 'reject-filter and disabled streams are skipped');
+  assert.equal(c.streams.length, 4, 'unknown-filter and disabled streams are skipped');
   assert.deepEqual(c.streams[0], { name: 'Main', type: 'regular', weight: 100, conditions: { countries: ['FR'], devices: ['mobile'] },
     offers: [{ offerId: 'kt-313', weight: 70 }, { offerId: 'kt-314', weight: 30 }] });
   assert.deepEqual(c.streams[1], { name: 'Fallback', type: 'fallback', conditions: {}, action: 'url', url: 'https://www.sharkninja.fr/?s={click_id}&x=' });
-  for (const part of ['лендинг не перенесён', 'reject', 'выключен', 'домен Keitaro', '{os}']) assert.ok(notes.some((n) => n.includes(part)), `note about ${part}`);
+  assert.deepEqual(c.streams[2], { name: 'Not US', type: 'regular', weight: 1, conditions: { countries: ['US'], not: ['countries'] }, offers: [{ offerId: 'kt-313', weight: 100 }] }, 'reject → not');
+  assert.deepEqual(c.streams[3].conditions, { referrers: ['facebook.com/ads'], emptyReferrer: false, keywords: ['spam'], ips: ['10.0.0.0/8'], userAgents: ['fban'],
+    dateFrom: '2026-11-01', dateTo: '2026-11-30', tz: 'Europe/Paris', not: ['keywords', 'ips'] });
+  for (const part of ['лендинг не перенесён', 'выключен', 'домен Keitaro', '{os}', '«sub_id_1» не поддерживается', '1.2.3.1-1.2.3.9']) assert.ok(notes.some((n) => n.includes(part)), `note about ${part}`);
 });
 
 test('Keitaro campaign → Umbrella: missing offers are reported and the stream is skipped', () => {
