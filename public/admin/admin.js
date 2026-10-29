@@ -2032,8 +2032,9 @@ async function pageReports(params) {
       return;
     }
     if (f.group === 'conversions') {
-      // Conversions by day (D14): grouped by the conversion's own time, not the click's. A click's lead that later became
-      // a sale counts once, as a sale — only the latest status of each click counts, as in /stats.
+      // Conversions by day (D14): grouped by the conversion's own time (its first postback), not the click's.
+      // /api/conversions has one row per conversion (click, tid) with its latest status, so a lead that later became
+      // a sale counts once, as a sale — as in /stats; upsells (other tids) count separately.
       table?.detach(); table = null;
       try {
         const base = { campaign: f.campaign, offer: f.offer, stream: f.stream, from, to, limit: 100 };
@@ -2046,20 +2047,18 @@ async function pageReports(params) {
         }
         if (more) note.textContent = `Показаны последние ${num(events.length)} конверсий — сузьте период или выберите кампанию.`;
         const ts = await api('/stats/timeseries' + qs({ campaign: f.campaign, offer: f.offer, from, to })).catch(() => ({ series: [] }));
-        // The log is newest first; events with the same timestamp keep the journal order (oldest first),
-        // so a click's current status is the last of its events with the newest time.
-        const latest = new Map();
-        for (const c of events) { const cur = latest.get(c.clickId); if (!cur || (c.at || '') >= (cur.at || '')) latest.set(c.clickId, c); }
         const info = currency.info || { defaultCurrency: currency.code, rates: {} };
         const fx = (amount, from) => { const a = info.rates?.[from || info.defaultCurrency]; const b = info.rates?.[currency.code]; return (Number(amount) || 0) * (a && b ? b / a : 1); };
         const byDay = {};
         const day = (id) => (byDay[id] ||= { id, clicks: 0, leads: 0, sales: 0, rejected: 0, revenue: 0, pendingRevenue: 0 });
         for (const p of ts.series || []) if (p.date) day(String(p.date).slice(0, 10)).clicks += p.clicks || 0;
-        for (const c of latest.values()) {
+        for (const c of events) {
           const d = String(c.at || '').slice(0, 10); if (!d) continue;
           const r = day(d);
-          if (c.status === 'lead') { r.leads++; r.pendingRevenue += fx(c.revenue, c.currency); }
-          else if (c.status === 'sale') { r.sales++; r.revenue += fx(c.revenue, c.currency); }
+          // revenueIgnored: a CPC offer's postback amount — not revenue (the offer earns per click).
+          const value = c.revenueIgnored ? 0 : fx(c.revenue, c.currency);
+          if (c.status === 'lead') { r.leads++; r.pendingRevenue += value; }
+          else if (c.status === 'sale') { r.sales++; r.revenue += value; }
           else if (c.status === 'rejected') r.rejected++;
         }
         const convRows = Object.values(byDay).sort((a, b) => (a.id < b.id ? 1 : -1));
@@ -2219,8 +2218,11 @@ function pageLog(kind, params) {
     { key: 'campaign', label: 'Кампания', cls: 'name', render: (r) => h('a', { href: '#/campaigns/' + encodeURIComponent(r.campaign) }, state.campaigns[r.campaign]?.name || r.campaign) },
     { key: 'stream', label: 'Поток' }, { key: 'offerId', label: 'Оффер' },
     { key: 'status', label: 'Статус', value: (r) => ({ lead: 'Лид', sale: 'Продажа', rejected: 'Отклонена', trash: 'Мусор' })[r.status] || r.status || 'Продажа' },
-    { key: 'revenue', label: 'Сумма', title: 'Сумма в валюте конверсии', num: true, render: (r) => (r.revenue == null ? '—' : amount(r.revenue)), total: () => '' },
+    { key: 'revenue', label: 'Сумма', title: 'Сумма в валюте конверсии', num: true,
+      render: (r) => (r.revenue == null ? '—' : r.revenueIgnored ? h('span', { class: 'muted', title: 'CPC-оффер: доход считается по кликам, сумма постбэка не учитывается' }, amount(r.revenue) + ' (не учит.)') : amount(r.revenue)), total: () => '' },
     { key: 'currency', label: 'Валюта' },
+    { key: 'tid', label: 'TID', hidden: true },
+    { key: 'updatedAt', label: 'Обновлена', title: 'Время последнего постбэка (статус и сумма — по нему)', hidden: true, render: (r) => (r.updatedAt && r.updatedAt !== r.at ? dt(r.updatedAt) : '') },
   ];
   const paging = {
     hasPrev: () => offset > 0, hasNext: () => last.hasMore,
@@ -2292,7 +2294,7 @@ function clickCard(r) {
   api('/api/conversions' + qs({ click: r.clickId, limit: 5 })).then((d) => {
     const list = d.conversions || [];
     put(conversion, list.length ? list.map((c) => h('div', {}, [CONVERSION_STATUS[c.status] || c.status || 'Продажа',
-      c.revenue == null ? null : amount(c.revenue) + (c.currency ? ' ' + c.currency : ''), dt(c.at)].filter(Boolean).join(' · '))) : 'нет');
+      c.revenue == null ? null : amount(c.revenue) + (c.currency ? ' ' + c.currency : '') + (c.revenueIgnored ? ' (не учитывается: CPC)' : ''), dt(c.at)].filter(Boolean).join(' · '))) : 'нет');
     conversion.className = '';
   }).catch((e) => { put(conversion, 'Ошибка загрузки: ' + e.message); conversion.className = 'err'; });
 }

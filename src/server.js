@@ -45,8 +45,9 @@ function sqlFx(params, currency) {
   const n = params.length;
   const amount = `cv.revenue * COALESCE(($${n - 2}::jsonb ->> COALESCE(cv.currency, $${n - 1}))::float, 1)`;
   return {
-    revenue: `COALESCE(SUM(${amount}) FILTER (WHERE cv.status = 'sale'), 0)`,
-    pending: `COALESCE(SUM(${amount}) FILTER (WHERE cv.status = 'lead'), 0)`,
+    // revenue_ignored: a CPC offer's postback amount — the offer earns per click (clickRevenue), never per postback.
+    revenue: `COALESCE(SUM(${amount}) FILTER (WHERE cv.status = 'sale' AND NOT cv.revenue_ignored), 0)`,
+    pending: `COALESCE(SUM(${amount}) FILTER (WHERE cv.status = 'lead' AND NOT cv.revenue_ignored), 0)`,
     cost: `COALESCE(SUM(c.cost), 0) * $${n}::float`,
     // CPC offer payout booked on the click itself (stored in DEFAULT_CURRENCY, like cost).
     clickRevenue: `COALESCE(SUM(c.revenue), 0) * $${n}::float`,
@@ -56,13 +57,15 @@ function sqlFx(params, currency) {
         COUNT(*) FILTER (WHERE x.status IN ('lead', 'sale')) AS conversions,
         COUNT(*) FILTER (WHERE x.status = 'lead') AS leads, COUNT(*) FILTER (WHERE x.status = 'sale') AS sales,
         COUNT(*) FILTER (WHERE x.status = 'rejected') AS rejected, COUNT(*) FILTER (WHERE x.status = 'trash') AS trash,
-        COALESCE(SUM(${amount.replaceAll('cv.', 'x.')}) FILTER (WHERE x.status = 'sale'), 0) AS revenue,
-        COALESCE(SUM(${amount.replaceAll('cv.', 'x.')}) FILTER (WHERE x.status = 'lead'), 0) AS pending
+        COALESCE(SUM(${amount.replaceAll('cv.', 'x.')}) FILTER (WHERE x.status = 'sale' AND NOT x.revenue_ignored), 0) AS revenue,
+        COALESCE(SUM(${amount.replaceAll('cv.', 'x.')}) FILTER (WHERE x.status = 'lead' AND NOT x.revenue_ignored), 0) AS pending
       FROM conversions x WHERE x.click_id = c.click_id) cvs ON true`,
     sum: (column) => `COALESCE(SUM(cvs.${column}), 0)`,
   };
 }
 // JSONL equivalents.
+// `to` dates are inclusive: a range ends before the next midnight (UTC), the same bound in SQL and in the journal.
+const dayEndIso = (day) => new Date(Date.parse(`${day}T00:00:00Z`) + 86400000).toISOString();
 const convertConversion = (cv, currency) => (cv.revenue === null || cv.revenue === undefined ? cv : { ...cv, revenue: Number(cv.revenue) * rates.factor(cv.currency, currency) });
 const convertClickCost = (click, currency) => (click.cost || click.revenue ? { ...click, cost: Number(click.cost || 0) * rates.factor(rates.defaultCurrency, currency),
   revenue: Number(click.revenue || 0) * rates.factor(rates.defaultCurrency, currency) } : click);
@@ -699,7 +702,8 @@ function applyClickUpdates(lines) {
   });
 }
 const conversionCounts = (cv) => ['lead', 'sale'].includes(cv?.status || 'sale');
-const saleRevenue = (cv) => ((cv?.status || 'sale') === 'sale' ? Number(cv.revenue) || 0 : 0);
+// revenueIgnored (CPC offer postback): the amount is stored but is not revenue — the offer earns per click.
+const saleRevenue = (cv) => ((cv?.status || 'sale') === 'sale' && !cv.revenueIgnored ? Number(cv.revenue) || 0 : 0);
 
 async function todayRevenue(campaign) {
   const today = new Date().toISOString().slice(0, 10);
@@ -993,7 +997,7 @@ async function stats({ campaign = null, allowed = null, from = null, to = null, 
       if (campaign) { params.push(campaign); conditions.push(`c.campaign = $${params.length}`); }
       if (allowed) { params.push(allowed); conditions.push(`c.campaign = ANY($${params.length}::text[])`); }
       if (from) { params.push(`${from}T00:00:00Z`); conditions.push(`c.created_at >= $${params.length}`); }
-      if (to) { params.push(`${to}T23:59:59Z`); conditions.push(`c.created_at <= $${params.length}`); }
+      if (to) { params.push(dayEndIso(to)); conditions.push(`c.created_at < $${params.length}`); }
       if (subid) { params.push(subid); conditions.push(`c.subid = $${params.length}`); }
       if (country) { params.push(country.toUpperCase()); conditions.push(`c.country = $${params.length}`); }
       if (offer) { params.push(offer); conditions.push(`c.offer_id = $${params.length}`); }
@@ -1043,7 +1047,7 @@ async function stats({ campaign = null, allowed = null, from = null, to = null, 
   try {
     const lines = applyClickUpdates((await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map(JSON.parse));
     const fromMs = from ? Date.parse(`${from}T00:00:00Z`) : null;
-    const toMs = to ? Date.parse(`${to}T23:59:59Z`) : null;
+    const toMs = to ? Date.parse(dayEndIso(to)) : null;
     const allClicks = lines.filter((item) => item.type === 'click');
     const clicks = allClicks.filter((item) => {
       if (campaign && item.campaign !== campaign) return false;
@@ -1054,16 +1058,19 @@ async function stats({ campaign = null, allowed = null, from = null, to = null, 
       if (stream && (item.stream || 'default') !== stream) return false;
       const t = item.at ? Date.parse(item.at) : null;
       if (fromMs !== null && (t === null || t < fromMs)) return false;
-      if (toMs !== null && (t === null || t > toMs)) return false;
+      if (toMs !== null && (t === null || t >= toMs)) return false;
       return true;
     });
     const visibleClickIds = new Set(clicks.map((c) => c.clickId));
     const conversions = [...latestConversions(lines).values()].filter((item) => visibleClickIds.has(item.clickId));
-    const conversionByClick = conversionsByClick(conversions);
     const lpClicked = new Set(lines.filter((item) => item.type === 'lp_click').map((item) => item.clickId));
-    const report = { ...reportFromEvents(clicks.map((c) => convertClickCost(lpClicked.has(c.clickId) ? { ...c, lpClicked: true } : c, currency)), conversions.map((cv) => convertConversion(cv, currency))), currency };
+    // Amounts in the report currency, for the totals and for bySource/byNetwork alike.
+    const reportClicks = clicks.map((c) => convertClickCost(lpClicked.has(c.clickId) ? { ...c, lpClicked: true } : c, currency));
+    const reportConversions = conversions.map((cv) => convertConversion(cv, currency));
+    const conversionByClick = conversionsByClick(reportConversions);
+    const report = { ...reportFromEvents(reportClicks, reportConversions), currency };
     report.bySource = Object.create(null); report.byNetwork = Object.create(null);
-    for (const click of clicks) { const source = campaigns.get(click.campaign)?.sourceId || 'none'; const network = offers.get(click.offerId)?.networkId || 'none'; const one = reportFromEvents([click], conversionByClick.get(click.clickId) || []); for (const [key,id] of [['bySource',source],['byNetwork',network]]) { report[key][id] ||= { clicks:0, conversions:0, revenue:0, cost:0, uniqueClicks:0 }; for (const f of ['clicks','conversions','revenue','cost','uniqueClicks','leads','sales','rejected','trash','pendingRevenue']) report[key][id][f] = (report[key][id][f] || 0) + (one[f] || 0); } }
+    for (const click of reportClicks) { const source = campaigns.get(click.campaign)?.sourceId || 'none'; const network = offers.get(click.offerId)?.networkId || 'none'; const one = reportFromEvents([click], conversionByClick.get(click.clickId) || []); for (const [key,id] of [['bySource',source],['byNetwork',network]]) { report[key][id] ||= { clicks:0, conversions:0, revenue:0, cost:0, uniqueClicks:0 }; for (const f of ['clicks','conversions','revenue','cost','uniqueClicks','leads','sales','rejected','trash','pendingRevenue']) report[key][id][f] = (report[key][id][f] || 0) + (one[f] || 0); } }
     report.bySource = Object.fromEntries(Object.entries(report.bySource).map(([k,v]) => [k, metrics(v)])); report.byNetwork = Object.fromEntries(Object.entries(report.byNetwork).map(([k,v]) => [k, metrics(v)]));
     return report;
   } catch (error) {
@@ -1083,7 +1090,7 @@ async function paramReport({ field, campaign, allowed = null, from, to, currency
       if (campaign) { values.push(campaign); conditions.push(`c.campaign = $${values.length}`); }
       if (allowed) { values.push(allowed); conditions.push(`c.campaign = ANY($${values.length}::text[])`); }
       if (from) { values.push(`${from}T00:00:00Z`); conditions.push(`c.created_at >= $${values.length}`); }
-      if (to) { values.push(`${to}T23:59:59Z`); conditions.push(`c.created_at <= $${values.length}`); }
+      if (to) { values.push(dayEndIso(to)); conditions.push(`c.created_at < $${values.length}`); }
       const fx = sqlFx(values, currency);
       const { rows } = await db.query(`
         SELECT ${isColumn ? `COALESCE(c.${field}, '')` : "COALESCE(c.params->>$1, '')"} AS value, COUNT(c.click_id)::int AS clicks, COUNT(c.click_id) FILTER (WHERE c.is_unique_campaign IS DISTINCT FROM false)::int AS unique_clicks, ${fx.sum('conversions')}::int AS conversions,
@@ -1091,21 +1098,22 @@ async function paramReport({ field, campaign, allowed = null, from, to, currency
         FROM clicks c ${fx.join}
         ${conditions.length ? 'WHERE ' + conditions.join(' AND ') : ''}
         GROUP BY 1 ORDER BY clicks DESC LIMIT 500`, values);
-      return rows.map(metrics);
+      // Same fields as the JSONL rows below (uniqueClicks only, no SQL alias).
+      return rows.map(({ unique_clicks: uniqueClicks, ...row }) => metrics({ ...row, uniqueClicks }));
     } catch (e) { console.warn('[db] paramReport fallback:', e.message); }
   }
   let lines = [];
   try { lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); }
   catch (error) { if (error.code !== 'ENOENT') throw error; }
   const fromMs = from ? Date.parse(`${from}T00:00:00Z`) : null;
-  const toMs = to ? Date.parse(`${to}T23:59:59Z`) : null;
+  const toMs = to ? Date.parse(dayEndIso(to)) : null;
   lines = applyClickUpdates(lines);
   const conv = conversionsByClick(latestConversions(lines).values());
   const groups = new Map();
   for (const click of lines) {
     if (click.type !== 'click' || (campaign && click.campaign !== campaign) || (allowed && !allowed.includes(click.campaign))) continue;
     const t = Date.parse(click.at);
-    if ((fromMs !== null && t < fromMs) || (toMs !== null && t > toMs)) continue;
+    if ((fromMs !== null && t < fromMs) || (toMs !== null && t >= toMs)) continue;
     const key = (isColumn ? click[field] : click.params?.[field]) ?? '';
     const g = groups.get(key) || { value: key, clicks: 0, uniqueClicks: 0, conversions: 0, revenue: 0, cost: 0 };
     g.clicks += 1; if (click.uniqueCampaign !== false) g.uniqueClicks += 1; g.cost += (Number(click.cost) || 0) * rates.factor(rates.defaultCurrency, currency);
@@ -1265,7 +1273,7 @@ async function deliverS2s(s2sUrl, meta) {
 // GET /api/postbacks: PostgreSQL first, the JSONL journal as fallback. Newest first.
 async function readPostbacks({ direction, campaign, allowed, from, to, limit }) {
   const fromMs = from ? Date.parse(`${from}T00:00:00Z`) : null;
-  const toMs = to ? Date.parse(`${to}T23:59:59.999Z`) : null;
+  const toMs = to ? Date.parse(dayEndIso(to)) : null;
   if (db) {
     try {
       const conditions = ['direction = $1'], values = [direction];
@@ -1273,7 +1281,7 @@ async function readPostbacks({ direction, campaign, allowed, from, to, limit }) 
       if (campaign) add('campaign = ?', campaign);
       if (allowed) add('campaign = ANY(?::text[])', allowed);
       if (fromMs !== null) add('created_at >= ?', new Date(fromMs).toISOString());
-      if (toMs !== null) add('created_at <= ?', new Date(toMs).toISOString());
+      if (toMs !== null) add('created_at < ?', new Date(toMs).toISOString());
       values.push(limit);
       const { rows } = await db.query(`SELECT click_id, campaign, offer_id, tid, status, revenue, currency, url, status_code, error, attempt, ip, created_at
         FROM postbacks WHERE ${conditions.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT $${values.length}`, values);
@@ -1292,7 +1300,7 @@ async function readPostbacks({ direction, campaign, allowed, from, to, limit }) 
     if (campaign && item.campaign !== campaign) continue;
     if (allowed && !allowed.includes(item.campaign)) continue;
     const t = Date.parse(item.at);
-    if ((fromMs !== null && !(t >= fromMs)) || (toMs !== null && !(t <= toMs))) continue;
+    if ((fromMs !== null && !(t >= fromMs)) || (toMs !== null && !(t < toMs))) continue;
     out.push({ at: item.at, direction, clickId: item.clickId ?? null, campaign: item.campaign ?? null, offerId: item.offerId ?? null, tid: item.tid ?? null,
       status: item.status ?? null, revenue: item.revenue ?? null, currency: item.currency ?? null, url: item.url ?? null, statusCode: item.statusCode ?? null,
       error: item.error ?? null, attempt: item.attempt ?? null, ip: item.ip ?? null });
@@ -1507,6 +1515,8 @@ const recordPostback = createConversionRecorder({
     return offer?.payoutType === 'cpa' && offer.payout !== null && offer.payout !== undefined
       ? { revenue: String(offer.payout), currency: offer.payoutCurrency } : null;
   },
+  // CPC offers: revenue comes only from clicks; a postback still sets the status, its amount is kept but not counted.
+  ignoreRevenue: (click) => offers.get(click.offerId)?.payoutType === 'cpc',
   record: (payload) => event('conversion', payload),
   onRecorded: ({ click, clickId, tid, revenue, currency, status, previousStatus, recorded }) => {
     // Recount the offer's conversion cap now and again once PostgreSQL has the conversion.
@@ -1990,7 +2000,8 @@ const server = http.createServer(async (req, res) => {
       if (c.costModel === 'cpc') {
         const rawCost = c.costFromParam ? url.searchParams.get(c.paramMap?.cost || 'cost') : null;
         const fromParam = rawCost === null || rawCost.trim() === '' ? NaN : Number(rawCost);
-        cost = Number.isFinite(fromParam) && fromParam >= 0 && fromParam < 1000 ? fromParam : c.cpc;
+        // Rounded like PostgreSQL clicks.cost NUMERIC(12,6), so the journal and the database hold the same amount.
+        cost = round6(Number.isFinite(fromParam) && fromParam >= 0 && fromParam < 1000 ? fromParam : c.cpc);
       }
       const macroVars = { ...params, cost: cost || '', click_id: clickId, subid: subid || '', campaign: campaignId, offer_id: offerId, device, country: country || '',
         lp_click_url: `${publicBase(req)}/lp/click?click_id=${clickId}` };
@@ -2191,7 +2202,7 @@ const server = http.createServer(async (req, res) => {
           if (botCampaign) add('campaign = ?', botCampaign);
           if (req.scope?.allowed) add('campaign = ANY(?::text[])', req.scope.allowed);
           if (botFrom) add('created_at >= ?', `${botFrom}T00:00:00Z`);
-          if (botTo) add('created_at <= ?', `${botTo}T23:59:59Z`);
+          if (botTo) add('created_at < ?', dayEndIso(botTo));
           values.push(limit);
           const { rows } = await db.query(`SELECT created_at, campaign, offer_id, stream, reason, isp, user_agent, ip FROM bots ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
             ORDER BY created_at DESC, id DESC LIMIT $${values.length}`, values);
@@ -2202,14 +2213,14 @@ const server = http.createServer(async (req, res) => {
       try {
         const lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
         const fromMs = botFrom ? Date.parse(`${botFrom}T00:00:00Z`) : null;
-        const toMs = botTo ? Date.parse(`${botTo}T23:59:59Z`) : null;
+        const toMs = botTo ? Date.parse(dayEndIso(botTo)) : null;
         const bots = lines.filter((item) => {
           if (item.type !== 'bot') return false;
           if (botCampaign && item.campaign !== botCampaign) return false;
           if (req.scope?.allowed && !req.scope.allowed.includes(item.campaign)) return false;
           const t = item.at ? Date.parse(item.at) : null;
           if (fromMs !== null && (t === null || t < fromMs)) return false;
-          if (toMs !== null && (t === null || t > toMs)) return false;
+          if (toMs !== null && (t === null || t >= toMs)) return false;
           return true;
         }).reverse().slice(0, limit).map(botRow);
         return json(res, 200, { bots });
@@ -2584,7 +2595,7 @@ const server = http.createServer(async (req, res) => {
           if (tsOffer) { params.push(tsOffer); conds.push(`c.offer_id = $${params.length}`); }
           if (req.scope?.allowed) { params.push(req.scope.allowed); conds.push(`c.campaign = ANY($${params.length}::text[])`); }
           if (tsFrom) { params.push(`${tsFrom}T00:00:00Z`); conds.push(`c.created_at >= $${params.length}`); }
-          if (tsTo) { params.push(`${tsTo}T23:59:59Z`); conds.push(`c.created_at <= $${params.length}`); }
+          if (tsTo) { params.push(dayEndIso(tsTo)); conds.push(`c.created_at < $${params.length}`); }
           const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
           const trunc = granularity === 'hour' ? 'hour' : 'day';
           const fx = sqlFx(params, tsCurrency);
@@ -2608,7 +2619,7 @@ const server = http.createServer(async (req, res) => {
       try {
         const lines = applyClickUpdates((await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map(JSON.parse));
         const fromMs = tsFrom ? Date.parse(`${tsFrom}T00:00:00Z`) : null;
-        const toMs = tsTo ? Date.parse(`${tsTo}T23:59:59Z`) : null;
+        const toMs = tsTo ? Date.parse(dayEndIso(tsTo)) : null;
         const allClicks = lines.filter((item) => item.type === 'click');
         const clicks = allClicks.filter((item) => {
           if (tsCampaign && item.campaign !== tsCampaign) return false;
@@ -2616,7 +2627,7 @@ const server = http.createServer(async (req, res) => {
           if (req.scope?.allowed && !req.scope.allowed.includes(item.campaign)) return false;
           const t = item.at ? Date.parse(item.at) : null;
           if (fromMs !== null && (t === null || t < fromMs)) return false;
-          if (toMs !== null && (t === null || t > toMs)) return false;
+          if (toMs !== null && (t === null || t >= toMs)) return false;
           return true;
         });
         const visibleClickIds = new Set(clicks.map((c) => c.clickId));
@@ -2627,7 +2638,7 @@ const server = http.createServer(async (req, res) => {
           const b = (click.at || '').slice(0, granularity === 'hour' ? 13 : 10);
           buckets[b] ||= { clicks: 0, uniqueClicks: 0, conversions: 0, revenue: 0, cost: 0 };
           buckets[b].clicks += 1;
-          if (click.uniqueCampaign) buckets[b].uniqueClicks += 1;
+          if (click.uniqueCampaign !== false) buckets[b].uniqueClicks += 1;
           buckets[b].cost += Number(click.cost) * rates.factor(rates.defaultCurrency, tsCurrency) || 0;
           buckets[b].revenue += Number(click.revenue) * rates.factor(rates.defaultCurrency, tsCurrency) || 0;
         }
@@ -2685,14 +2696,14 @@ const server = http.createServer(async (req, res) => {
       const campaign = url.searchParams.get('campaign') || null;
       const from = url.searchParams.get('from') || null; const to = url.searchParams.get('to') || null;
       if ((from && !/^\d{4}-\d{2}-\d{2}$/.test(from)) || (to && !/^\d{4}-\d{2}-\d{2}$/.test(to))) return json(res, 400, { error: 'invalid_date' });
-      const fromMs = from ? Date.parse(`${from}T00:00:00Z`) : -Infinity; const toMs = to ? Date.parse(`${to}T23:59:59Z`) : Infinity;
+      const fromMs = from ? Date.parse(`${from}T00:00:00Z`) : -Infinity; const toMs = to ? Date.parse(dayEndIso(to)) : Infinity;
       if (db) {
         try {
           const values = []; const where = [];
           if (campaign) { values.push(campaign); where.push(`campaign = $${values.length}`); }
           if (req.scope?.allowed) { values.push(req.scope.allowed); where.push(`campaign = ANY($${values.length}::text[])`); }
           if (from) { values.push(`${from}T00:00:00Z`); where.push(`created_at >= $${values.length}`); }
-          if (to) { values.push(`${to}T23:59:59Z`); where.push(`created_at <= $${values.length}`); }
+          if (to) { values.push(dayEndIso(to)); where.push(`created_at < $${values.length}`); }
           const { rows } = await db.query(`SELECT campaign, COUNT(*)::int AS count FROM bots ${where.length ? 'WHERE ' + where.join(' AND ') : ''} GROUP BY campaign`, values);
           const byCampaign = Object.fromEntries(rows.map((r) => [r.campaign, r.count]));
           return json(res, 200, { total: rows.reduce((sum, r) => sum + r.count, 0), byCampaign });
@@ -2702,7 +2713,7 @@ const server = http.createServer(async (req, res) => {
         const lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map(JSON.parse);
         const byCampaign = {};
         for (const item of lines) if (item.type === 'bot' && (!campaign || item.campaign === campaign) && (!req.scope?.allowed || req.scope.allowed.includes(item.campaign))) {
-          const at = Date.parse(item.at || item.created_at || ''); if (at < fromMs || at > toMs) continue;
+          const at = Date.parse(item.at || item.created_at || ''); if (at < fromMs || at >= toMs) continue;
           byCampaign[item.campaign] = (byCampaign[item.campaign] || 0) + 1;
         }
         return json(res, 200, { total: Object.values(byCampaign).reduce((a, b) => a + b, 0), byCampaign });

@@ -47,13 +47,14 @@ export function createEventMirror({ query, onError = () => {} }) {
         await query('UPDATE clicks SET lp_clicked_at = COALESCE(lp_clicked_at, $2) WHERE click_id = $1', [payload.clickId, at]);
       } else {
         // One row per (click, tid): a new tid is an upsell, the same tid a status update (lead → sale → rejected)
-        // that overwrites the row; the keyed lock keeps journal order.
-        await query(`INSERT INTO conversions (click_id, tid, revenue, currency, status, params, created_at)
-          VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7) ON CONFLICT (click_id, tid) DO UPDATE
+        // that overwrites the row; the keyed lock keeps journal order. created_at stays the first postback's time,
+        // updated_at is the journal time of the latest one (as /api/conversions reads them from the journal).
+        await query(`INSERT INTO conversions (click_id, tid, revenue, currency, status, params, revenue_ignored, created_at)
+          VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8) ON CONFLICT (click_id, tid) DO UPDATE
           SET revenue = EXCLUDED.revenue, currency = EXCLUDED.currency, status = EXCLUDED.status,
-            params = COALESCE(EXCLUDED.params, conversions.params), updated_at = now()`,
+            params = COALESCE(EXCLUDED.params, conversions.params), revenue_ignored = EXCLUDED.revenue_ignored, updated_at = EXCLUDED.created_at`,
         [payload.clickId, payload.tid ?? '', payload.revenue ?? null, payload.currency ?? null, payload.status || 'sale',
-          payload.params ? JSON.stringify(payload.params) : null, at]);
+          payload.params ? JSON.stringify(payload.params) : null, payload.revenueIgnored === true, at]);
         // sub_id_N from the postback overwrite the click's parameters, so reports by sub_id show the network's values.
         if (payload.params && Object.keys(payload.params).length)
           await query(`UPDATE clicks SET params = COALESCE(params, '{}'::jsonb) || $2::jsonb WHERE click_id = $1`, [payload.clickId, JSON.stringify(payload.params)]);

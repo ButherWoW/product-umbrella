@@ -98,7 +98,7 @@ export function conversionValues(rawRevenue, rawCurrency) {
 }
 
 export function createConversionRecorder({ findClick, hasConversion, currentConversion = null, record, windowDaysForClick = () => null,
-  defaultRevenue = () => null, onRecorded = () => {}, onDeliveryError = () => {}, now = Date.now }) {
+  defaultRevenue = () => null, ignoreRevenue = () => false, onRecorded = () => {}, onDeliveryError = () => {}, now = Date.now }) {
   const lock = createKeyedLock();
   return async ({ clickId, tid: rawTid = null, revenue: rawRevenue, currency: rawCurrency, status: rawStatus, params = null, context = null }) => {
     if (!clickId) throw failure(400, 'click_id_required');
@@ -132,7 +132,9 @@ export function createConversionRecorder({ findClick, hasConversion, currentConv
       // Without an explicit status a first conversion is written exactly as before statuses existed (implicitly a sale).
       const explicit = rawStatus !== null && rawStatus !== undefined && rawStatus !== '';
       // tid and postback sub_id_N values are written only when present, so legacy journal lines stay identical.
-      const payload = { clickId: id, ...(tid ? { tid } : {}), ...(params && Object.keys(params).length ? { params } : {}), ...values, ...(explicit || existing ? { status } : {}), ...(existing ? { previousStatus: existing.status || 'sale' } : {}) };
+      // revenueIgnored: the amount is kept for the log, but reports do not count it (CPC offers earn per click).
+      const payload = { clickId: id, ...(tid ? { tid } : {}), ...(params && Object.keys(params).length ? { params } : {}), ...values, ...(explicit || existing ? { status } : {}), ...(existing ? { previousStatus: existing.status || 'sale' } : {}),
+        ...(ignoreRevenue(click) ? { revenueIgnored: true } : {}) };
       // Duplicate check and successful JSONL append are inside the same lock.
       // Record failures release the lock and leave the click retryable.
       const recorded = await record(payload);

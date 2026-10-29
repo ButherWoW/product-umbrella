@@ -56,7 +56,8 @@ export function reportFromEvents(clicks, conversions) {
     for (const conversion of byClick.get(click.clickId) || []) {
       // Latest status wins; conversions without a status (written before statuses existed) are sales.
       const status = conversion.status || 'sale';
-      const amount = Number(conversion.revenue) || 0;
+      // A CPC offer's postback amount is not revenue (the payout is booked on the click).
+      const amount = conversion.revenueIgnored ? 0 : Number(conversion.revenue) || 0;
       if (status === 'lead' || status === 'sale') counts.conversions += 1;
       if (status === 'sale') { counts.revenue += amount; counts.sales += 1; }
       if (status === 'lead') { counts.pendingRevenue += amount; counts.leads += 1; }

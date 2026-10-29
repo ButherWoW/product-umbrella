@@ -40,6 +40,12 @@ test('clear-stats removes only one campaign\'s events, respects `before`, keeps 
     line('bot', old, { campaign: 'camp-a', offerId: 'offer-1', reason: 'ua' }),
     line('click', old, { clickId: ids.b1, campaign: 'camp-b', offerId: 'offer-1' }),
     line('bot', old, { campaign: 'camp-b', offerId: 'offer-1', reason: 'ua' }),
+    // Postback journal and cost updates go with the campaign, as in PostgreSQL (clearCampaignRows).
+    line('postback_in', '2026-01-11T10:00:00.000Z', { clickId: ids.a1, campaign: 'camp-a', statusCode: 200 }),
+    line('postback_out', '2026-01-11T10:00:01.000Z', { clickId: ids.a1, campaign: 'camp-a', statusCode: 200, attempt: 1 }),
+    line('postback_in', '2026-07-01T10:00:00.000Z', { clickId: ids.a1, campaign: 'camp-a', statusCode: 409 }),
+    line('cost_update', '2026-01-12T10:00:00.000Z', { campaign: 'camp-a', clickIds: [ids.a1, ids.a2], cost: 0.1 }),
+    line('cost_update', '2026-01-12T10:00:00.000Z', { campaign: 'camp-b', clickIds: [ids.b1], cost: 0.1 }),
   ]);
   const owner = (await call('/api/auth/setup', { method: 'POST', body: { email: 'o@example.com', password: 'owner-password' } })).cookie;
   for (const id of ['camp-a', 'camp-b']) assert.equal((await call('/api/campaigns', { method: 'POST', cookie: owner, body: { id, name: id, streams: [{ name: 'Main', offers: [{ offerId: 'offer-1' }] }] } })).status, 201);
@@ -68,18 +74,20 @@ test('clear-stats removes only one campaign\'s events, respects `before`, keeps 
 
   const partial = await clear({ confirm: 'camp-a', before: '2026-06-01' });
   assert.equal(partial.status, 200);
-  assert.deepEqual(partial.json.removed, { clicks: 2, conversions: 1, lpClicks: 1, bots: 1, postgres: null });
+  assert.deepEqual(partial.json.removed, { clicks: 2, conversions: 1, lpClicks: 1, bots: 1, postbacks: 2, postgres: null });
   assert.deepEqual([(await stats('camp-a')).clicks, (await stats('camp-a')).conversions], [2, 1], 'clicks after `before` stay');
   let journal = await readJournal(dataDir);
-  assert.ok(!journal.some((e) => e.clickId === ids.a1 || e.clickId === ids.a2), 'old camp-a events are gone');
+  assert.ok(!journal.some((e) => !e.type.startsWith('postback_') && (e.clickId === ids.a1 || e.clickId === ids.a2)), 'old camp-a events are gone');
   assert.ok(journal.some((e) => e.clickId === ids.b1), 'other campaign intact');
+  assert.deepEqual(journal.filter((e) => e.type === 'cost_update').map((e) => e.campaign), ['camp-b'], 'cost update of removed clicks is gone');
+  assert.deepEqual(journal.filter((e) => e.type === 'postback_in' && e.clickId === ids.a1).map((e) => e.at), ['2026-07-01T10:00:00.000Z'], 'postbacks after `before` stay (PostgreSQL: by postback time)');
 
   // Clicks keep coming while the whole campaign is cleared.
   const during = Array.from({ length: 30 }, () => hit('camp-b'));
   const all = await clear({ confirm: 'camp-a' });
   await Promise.all(during);
   assert.equal(all.status, 200);
-  assert.deepEqual([all.json.removed.clicks, all.json.removed.conversions], [2, 1]);
+  assert.deepEqual([all.json.removed.clicks, all.json.removed.conversions, all.json.removed.postbacks], [2, 1, 2]);
   const a = await stats('camp-a');
   assert.deepEqual([a.clicks, a.conversions, a.revenue], [0, 0, 0], 'stats show 0 afterwards');
   assert.equal((await stats('camp-b')).clicks, 32, 'old + live + concurrent camp-b clicks all recorded');
@@ -87,6 +95,7 @@ test('clear-stats removes only one campaign\'s events, respects `before`, keeps 
   assert.equal((await stats('camp-a')).clicks, 1, 'the campaign keeps tracking after a clear');
   journal = await readJournal(dataDir);
   assert.equal(journal.filter((e) => e.type === 'bot' && e.campaign === 'camp-b').length, 1, 'other campaign bots intact');
+  assert.equal(journal.filter((e) => e.type.startsWith('postback_') && e.campaign === 'camp-a').length, 0, 'the campaign postback journal is gone');
   assert.equal(new Set(journal.filter((e) => e.type === 'click').map((e) => e.clickId)).size, journal.filter((e) => e.type === 'click').length, 'no duplicated lines');
 
   const audit = (await call('/api/audit?entity=campaign&id=camp-a', { cookie: owner })).json.entries.filter((e) => e.action === 'clear_stats');

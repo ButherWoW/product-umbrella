@@ -93,11 +93,11 @@ test('PostgreSQL: clear-stats deletes one campaign\'s rows (with `before`), othe
 
     assert.equal((await call(`/api/campaigns/${a}/clear-stats`, { confirm: b })).status, 400);
     const partial = await (await call(`/api/campaigns/${a}/clear-stats`, { confirm: a, before: '2026-06-01' })).json();
-    assert.deepEqual(partial.removed.postgres, { clicks: 2, conversions: 1, lpClicks: 1, bots: 1 });
+    assert.deepEqual(partial.removed.postgres, { clicks: 2, conversions: 1, lpClicks: 1, bots: 1, postbacks: 0 });
     let s = await (await call(`/stats?campaign=${a}`)).json();
     assert.deepEqual([s.clicks, s.conversions], [1, 1], 'clicks after `before` stay');
     const all = await (await call(`/api/campaigns/${a}/clear-stats`, { confirm: a })).json();
-    assert.deepEqual([all.removed.postgres.clicks, all.removed.postgres.conversions, all.removed.clicks], [1, 1, 1], 'database and journal both cleared');
+    assert.deepEqual([all.removed.postgres.clicks, all.removed.postgres.conversions, all.removed.clicks, all.removed.postgres.postbacks, all.removed.postbacks], [1, 1, 1, 1, 1], 'database and journal both cleared (incl. the postback journal)');
     await hit(b);
   } finally { await server.stop(); }
 
