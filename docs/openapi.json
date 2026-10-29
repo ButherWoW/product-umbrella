@@ -184,7 +184,10 @@
         "properties": {
           "id": { "type": "string", "format": "uuid" },
           "email": { "type": "string", "format": "email" },
-          "role": { "type": "string", "enum": ["owner", "buyer"] }
+          "role": { "type": "string", "enum": ["owner", "buyer", "viewer"], "description": "viewer is read-only: every non-GET panel request answers 403 read_only" },
+          "hideRevenue": { "type": "boolean", "description": "Revenue, profit, ROI, EPC, payouts and offer/postback URLs are removed from this user's responses" },
+          "offersAccess": { "type": "string", "enum": ["all", "own"], "description": "own: /api/offers lists only offers used in the user's campaigns" },
+          "viewAll": { "type": "boolean", "description": "viewer only: sees all campaigns instead of its own" }
         }
       },
       "AuditEntry": {
@@ -1410,7 +1413,10 @@
                 "properties": {
                   "email": { "type": "string", "format": "email" },
                   "password": { "type": "string", "minLength": 1 },
-                  "role": { "type": "string", "enum": ["owner", "buyer"], "default": "buyer" }
+                  "role": { "type": "string", "enum": ["owner", "buyer", "viewer"], "default": "buyer" },
+                  "hideRevenue": { "type": "boolean", "default": false },
+                  "offersAccess": { "type": "string", "enum": ["all", "own"], "default": "all" },
+                  "viewAll": { "type": "boolean", "default": false }
                 }
               }
             }
@@ -1430,6 +1436,55 @@
       }
     },
     "/api/users/{id}": {
+      "patch": {
+        "summary": "Change a user's role and permissions",
+        "description": "Owner only. Cannot change your own role or demote the last owner.",
+        "operationId": "updateUser",
+        "tags": ["users"],
+        "security": [{ "bearerAuth": [] }, { "cookieAuth": [] }],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "role": { "type": "string", "enum": ["owner", "buyer", "viewer"] },
+                  "hideRevenue": { "type": "boolean" },
+                  "offersAccess": { "type": "string", "enum": ["all", "own"] },
+                  "viewAll": { "type": "boolean" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated user",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "user": { "$ref": "#/components/schemas/User" } } } } }
+          },
+          "400": {
+            "description": "Invalid role or flag",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" }, "example": { "error": "invalid_role" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": {
+            "description": "Owner only",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "404": {
+            "description": "User not found",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" }, "example": { "error": "user_not_found" } } }
+          },
+          "409": {
+            "description": "Own role or last owner",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" }, "example": { "error": "last_owner" } } }
+          }
+        }
+      },
       "delete": {
         "summary": "Delete a user",
         "description": "Owner only. Cannot delete yourself or the last owner.",
