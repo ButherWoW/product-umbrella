@@ -118,6 +118,19 @@ await db.query(`
   )
 `);
 await db.query(`CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id)`);
+// Per-user API keys: only the SHA-256 of the secret and its last 4 characters are stored.
+await db.query(`
+  CREATE TABLE IF NOT EXISTS api_keys (
+    id           UUID        PRIMARY KEY,
+    user_id      UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name         TEXT        NOT NULL,
+    key_hash     TEXT        NOT NULL UNIQUE,
+    last4        TEXT        NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_used_at TIMESTAMPTZ
+  )
+`);
+await db.query(`CREATE INDEX IF NOT EXISTS api_keys_user_idx ON api_keys(user_id)`);
 
 await db.query(`CREATE INDEX IF NOT EXISTS clicks_campaign_created_idx ON clicks(campaign, created_at)`);
 await db.query(`CREATE INDEX IF NOT EXISTS clicks_created_idx ON clicks(created_at)`);

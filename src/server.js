@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { db, query, closeDb } from './db.js';
 import { reportFromRows, reportFromEvents, metrics } from './stats-report.js';
-import { createUserStore, readCookie, SESSION_TTL_MS } from './auth.js';
+import { createUserStore, readCookie, SESSION_TTL_MS, API_KEY_PREFIX } from './auth.js';
 import { createRates, normalizeCurrency } from './currency.js';
 import { readEventLog } from './event-logs.js';
 import { createConversionRecorder, hasRecordedConversion, findRecordedConversion } from './conversion-recorder.js';
@@ -53,6 +53,8 @@ const requirePostgres = /^(1|true|yes)$/i.test(process.env.REQUIRE_POSTGRES || '
 const clickRateLimit = Math.max(0, Number(process.env.CLICK_RATE_LIMIT || 120));
 const clickRateWindowMs = Math.max(1000, Number(process.env.CLICK_RATE_WINDOW_MS || 60000));
 const rateBuckets = new Map();
+const adminAllowedIps = parseAdminAllowedIps(process.env.ADMIN_ALLOWED_IPS);
+const adminIpAllowed = (req) => !adminAllowedIps.length || adminAllowedIps.some((rule) => ipMatches(normalizeIp(clientIp(req)), rule));
 // Offers store { url, postbackUrl } objects. Old saves with bare strings are migrated on load.
 const offers = new Map([
   ['offer-1', { url: process.env.OFFER_1_URL || 'https://example.com/', postbackUrl: null }],
@@ -554,6 +556,19 @@ function ipMatches(ip, rule) {
   if (bits === 0) return true;
   const block = 2 ** (32 - bits);
   return Math.floor(ipInt / block) === Math.floor(baseInt / block);
+}
+
+// ADMIN_ALLOWED_IPS: comma-separated IPs / IPv4 CIDRs allowed to reach the panel, /api and /stats.
+// Env only, so nobody can lock the team out from the UI. A typo must not silently open the panel,
+// so any invalid rule stops the server instead of being dropped.
+function parseAdminAllowedIps(raw) {
+  const items = String(raw || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const rules = parseIpRules(items);
+  if (rules.length !== items.length) {
+    const bad = items.filter((item) => !rules.includes(normalizeIp(item)));
+    throw new Error(`ADMIN_ALLOWED_IPS: неверные правила: ${bad.join(', ')}`);
+  }
+  return rules;
 }
 
 function parseIpRules(raw) {
@@ -1115,6 +1130,8 @@ async function sessionUser(req) {
 // X-Requested-With: umbrella — a cross-site form cannot set it, which blocks CSRF.
 async function adminAuthorized(req) {
   if (bearerAuthorized(req)) return true;
+  // A personal API key arrives in the Authorization header, which a cross-site form cannot set.
+  if (req.apiKey) return true;
   if (req.user) return req.method === 'GET' || req.headers['x-requested-with'] === 'umbrella';
   return !adminToken && !requireLogin && (await users.count()) === 0;
 }
@@ -1284,7 +1301,7 @@ async function readAudit({ entity, id, limit }) {
 
 async function handleAuthRoute(req, res, url) {
   const path = url.pathname;
-  const csrfOk = req.headers['x-requested-with'] === 'umbrella' || bearerAuthorized(req);
+  const csrfOk = req.headers['x-requested-with'] === 'umbrella' || bearerAuthorized(req) || Boolean(req.apiKey);
   if (path === '/api/auth/me' && req.method === 'GET') {
     const count = await users.count();
     return json(res, 200, { user: req.user, setupRequired: count === 0, loginRequired: requireLogin || count > 0 });
@@ -1342,6 +1359,37 @@ async function handleAuthRoute(req, res, url) {
     await audit(req, 'delete', 'user', id, { email: target.email, role: target.role }, null);
     return json(res, 200, { ok: true });
   }
+  // Read-only: the allowlist comes from ADMIN_ALLOWED_IPS only.
+  if (path === '/api/security' && req.method === 'GET') {
+    if (!isOwner) return json(res, 403, { error: 'owner_only' });
+    return json(res, 200, { adminAllowedIps, clientIp: normalizeIp(clientIp(req)) || null, trustProxy: trustProxyHops });
+  }
+  // Personal API keys: everyone manages their own, the owner (and ADMIN_TOKEN) sees and revokes all.
+  if (path === '/api/keys' || path.startsWith('/api/keys/')) {
+    if (!req.user && !bearerAuthorized(req)) return json(res, 401, { error: 'login_required' });
+    if (path === '/api/keys' && req.method === 'GET') {
+      const all = url.searchParams.get('all') === '1';
+      if (all && !isOwner) return json(res, 403, { error: 'owner_only' });
+      return json(res, 200, { keys: await users.listApiKeys(all || !req.user ? null : req.user.id) });
+    }
+    if (path === '/api/keys' && req.method === 'POST') {
+      if (!req.user) return json(res, 400, { error: 'user_required' });
+      // A leaked key must not be able to mint more keys that outlive its revocation.
+      if (req.apiKey) return json(res, 403, { error: 'session_required' });
+      const { key, secret } = await users.createApiKey(req.user.id, body.name);
+      await audit(req, 'create', 'api_key', key.id, null, { name: key.name, userId: key.userId, last4: key.last4 });
+      return json(res, 201, { key, secret });
+    }
+    const keyDelete = path.match(/^\/api\/keys\/([0-9a-f-]{36})$/);
+    if (keyDelete && req.method === 'DELETE') {
+      const target = await users.getApiKey(keyDelete[1]);
+      // Someone else's key looks the same as a missing one.
+      if (!target || (!isOwner && target.userId !== req.user?.id)) return json(res, 404, { error: 'key_not_found' });
+      await users.deleteApiKey(target.id);
+      await audit(req, 'delete', 'api_key', target.id, { name: target.name, userId: target.userId, last4: target.last4 }, null);
+      return json(res, 200, { ok: true });
+    }
+  }
   return json(res, 404, { error: 'not_found' });
 }
 
@@ -1353,7 +1401,14 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
       return res.end('Not Found');
     }
-    req.user = await sessionUser(req);
+    if (!isTrackingPath(url.pathname) && !adminIpAllowed(req)) return json(res, 403, { error: 'admin_ip_not_allowed' });
+    const authorization = String(req.headers.authorization || '');
+    if (!isTrackingPath(url.pathname) && authorization.startsWith(`Bearer ${API_KEY_PREFIX}`)) {
+      const found = await users.userForApiKey(authorization.slice('Bearer '.length));
+      if (!found) return json(res, 401, { error: 'invalid_api_key' });
+      req.user = found.user;
+      req.apiKey = found.key;
+    } else req.user = await sessionUser(req);
     if (requireLogin && isPrivatePath(url.pathname) && !req.user && !bearerAuthorized(req)) {
       if (url.pathname === '/dashboard') { res.writeHead(302, { location: `${basePath}/admin` }); return res.end(); }
       return json(res, 401, { error: 'login_required' });
@@ -1362,7 +1417,8 @@ const server = http.createServer(async (req, res) => {
       req.scope = campaignScope(req, url.searchParams.get('campaign') || null);
       if (req.scope.forbidden) return json(res, 403, { error: 'campaign_not_yours' });
     }
-    if (url.pathname.startsWith('/api/auth/') || url.pathname === '/api/users' || url.pathname.startsWith('/api/users/')) {
+    if (url.pathname.startsWith('/api/auth/') || url.pathname === '/api/users' || url.pathname.startsWith('/api/users/')
+      || url.pathname === '/api/keys' || url.pathname.startsWith('/api/keys/') || url.pathname === '/api/security') {
       return await handleAuthRoute(req, res, url);
     }
     const logAsset = new Map([['/assets/event-logs.js', ['event-logs.js', 'text/javascript']],

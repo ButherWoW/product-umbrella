@@ -446,3 +446,18 @@ test('stream filters: referrer, keyword, params, IP, User-Agent, dates and НЕ'
     assert.ok(!('referrers' in plain) && !('not' in plain) && !('params' in plain), 'unset new conditions are not stored');
   });
 });
+
+test('group of campaigns and offers survives PATCH of other fields', { timeout: 15000 }, async (t) => {
+  await withServer(t, {}, async ({ url, post }) => {
+    assert.equal((await post('/api/offers', { id: 'grp-offer', url: 'https://example.com/o', group: '  Kitchen  ' })).status, 201);
+    assert.equal((await post('/api/campaigns', { id: 'grp-camp', name: 'Grp', group: 'FR', streams: [{ name: 'Main', offers: [{ offerId: 'grp-offer' }] }] })).status, 201);
+    assert.equal((await (await post('/api/offers/grp-offer', { dailyCap: 5, name: 'Renamed' }, 'PATCH')).json()).group, 'Kitchen');
+    assert.equal((await (await post('/api/campaigns/grp-camp', { active: false, dailyCap: 10 }, 'PATCH')).json()).group, 'FR');
+    const offers = (await (await fetch(url + '/api/offers')).json()).offers;
+    const campaigns = (await (await fetch(url + '/api/campaigns')).json()).campaigns;
+    assert.deepEqual([offers['grp-offer'].group, offers['grp-offer'].dailyCap], ['Kitchen', 5]);
+    assert.deepEqual([campaigns['grp-camp'].group, campaigns['grp-camp'].active], ['FR', false]);
+    assert.equal((await (await post('/api/offers/grp-offer', { group: 'x'.repeat(80) }, 'PATCH')).json()).group.length, 60, 'group is capped at 60 chars');
+    assert.equal((await (await post('/api/campaigns/grp-camp', { group: '' }, 'PATCH')).json()).group, '', 'empty group clears it');
+  });
+});

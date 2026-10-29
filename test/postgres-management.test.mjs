@@ -99,3 +99,48 @@ test('PostgreSQL: offer conversion cap fields persist and the cap is counted fro
     assert.equal(capped.status, 404, 'no alternative → the stream has no usable offer');
   } finally { await server.stop(); }
 });
+
+test('PostgreSQL: API keys survive a restart, only their hash is stored', { skip: !databaseUrl && 'set TEST_DATABASE_URL to run', timeout: 30000 }, async (t) => {
+  const dirs = [];
+  const start = async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'umbrella-pgk-')); dirs.push(dir);
+    return startTestServer(dir, { DATABASE_URL: databaseUrl, REQUIRE_POSTGRES: '1', ADMIN_TOKEN: TOKEN, REQUIRE_LOGIN: '1' });
+  };
+  t.after(async () => { for (const dir of dirs) await rm(dir, { recursive: true, force: true }); });
+  const run = Date.now().toString(36);
+  const email = `key-${run}@example.com`;
+  let server = await start();
+  const call = (path, { method = 'GET', body, bearer = TOKEN, cookie } = {}) => fetch(server.url + path, { method,
+    headers: { 'content-type': 'application/json', 'x-requested-with': 'umbrella', ...(bearer ? { authorization: `Bearer ${bearer}` } : {}), ...(cookie ? { cookie } : {}) },
+    body: body ? JSON.stringify(body) : undefined });
+  let secret, keyId;
+  try {
+    assert.equal((await call('/api/users', { method: 'POST', body: { email, password: 'buyer-password-pg' } })).status, 201);
+    const login = await call('/api/auth/login', { method: 'POST', bearer: null, body: { email, password: 'buyer-password-pg' } });
+    const cookie = (login.headers.get('set-cookie').match(/umb_session=[^;]*/) || [])[0];
+    const created = await (await call('/api/keys', { method: 'POST', bearer: null, cookie, body: { name: 'pg key' } })).json();
+    ({ secret } = created); keyId = created.key.id;
+    assert.match(secret, /^umb_/);
+    assert.equal((await (await call('/api/auth/me', { bearer: secret })).json()).user.email, email);
+  } finally { await server.stop(); }
+
+  const { default: pg } = await import('pg');
+  const client = new pg.Client({ connectionString: databaseUrl });
+  await client.connect();
+  try {
+    const { rows } = await client.query('SELECT * FROM api_keys WHERE id = $1', [keyId]);
+    assert.equal(rows.length, 1);
+    assert.ok(!JSON.stringify(rows[0]).includes(secret), 'secret is not stored');
+    assert.equal(rows[0].last4, secret.slice(-4));
+    assert.ok(rows[0].last_used_at, 'last use recorded');
+  } finally { await client.end(); }
+
+  server = await start();
+  try {
+    assert.equal((await (await call('/api/auth/me', { bearer: secret })).json()).user.email, email, 'key works after a restart with an empty data directory');
+    const keys = (await (await call('/api/keys?all=1')).json()).keys;
+    assert.ok(keys.some((k) => k.id === keyId && k.email === email && k.lastUsedAt));
+    assert.equal((await call(`/api/keys/${keyId}`, { method: 'DELETE' })).status, 200);
+    assert.equal((await call('/api/campaigns', { bearer: secret })).status, 401);
+  } finally { await server.stop(); }
+});
