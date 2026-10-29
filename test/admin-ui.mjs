@@ -232,6 +232,32 @@ try {
     assert.match(approvePct || '', /100/, `Approve % should show 100% for 1 sale, got: ${approvePct}`);
   }
 
+  // D12: expandable rows in reports
+  await api('/api/campaigns', { id: 'd12', name: 'D12 Expand', streams: [{ name: 'S1', offers: [{ offerId: 'offer-1', weight: 1 }] }, { name: 'S2', type: 'fallback', offers: [{ offerId: 'offer-1', weight: 1 }] }] });
+  for (let i = 0; i < 4; i++) await fetch(server.url + '/r/d12', { redirect: 'manual' });
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto(server.url + '/admin#/reports?group=campaign');
+  await page.getByRole('heading', { name: 'Отчёт' }).waitFor();
+  await page.locator('table.grid tbody tr', { hasText: 'D12 Expand' }).waitFor();
+  const d12Row = page.locator('table.grid tbody tr', { hasText: 'D12 Expand' }).first();
+  const d12ExpandBtn = d12Row.locator('button[aria-label="Развернуть"]');
+  await d12ExpandBtn.waitFor();
+  const d12CampClicks = await d12Row.evaluate((tr) => {
+    const ths = [...tr.closest('table').querySelectorAll('th')];
+    const idx = ths.findIndex((th) => th.textContent.trim() === 'Клики');
+    return idx >= 0 ? Number((tr.querySelectorAll('td')[idx]?.textContent || '0').replace(/\s/g, '')) || 0 : 0;
+  });
+  await d12ExpandBtn.click();
+  await page.locator('tr.expand-row').waitFor();
+  const d12SubClicks = await page.evaluate(() => {
+    const expandTr = document.querySelector('tr.expand-row');
+    if (!expandTr) return -1;
+    const ths = [...expandTr.querySelectorAll('th')];
+    const idx = ths.findIndex((th) => th.textContent.trim() === 'Клики');
+    return [...expandTr.querySelectorAll('tbody tr')].reduce((s, tr2) => s + (Number((tr2.querySelectorAll('td')[idx]?.textContent || '0').replace(/\s/g, '')) || 0), 0);
+  });
+  assert.equal(d12SubClicks, d12CampClicks, `sum of stream clicks (${d12SubClicks}) should equal campaign clicks (${d12CampClicks})`);
+
   assert.deepEqual(errors, []);
 
   // Accounts: a REQUIRE_LOGIN install starts with the setup screen; owner creates a buyer; logout returns to login.

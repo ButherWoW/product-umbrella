@@ -1201,6 +1201,12 @@ async function pageReports(params) {
   const sync = () => { const next = '#/reports' + qs(f); if (location.hash !== next) history.replaceState(null, '', next); };
   const presets = h('div', { class: 'toolbar' });
   let currentParamRows = [];
+  const expandedRows = new Map();
+  const DRILL_CHILD = {
+    campaign: { child: 'stream',  filter: 'campaign', prop: 'byStream' },
+    stream:   { child: 'offer',   filter: 'stream',   prop: 'byOffer' },
+    offer:    { child: 'country', filter: 'offer',    prop: 'byCountry' },
+  };
   const LIST_FIELDS = new Set(['source', 'creative_id', ...Array.from({ length: 30 }, (_, i) => `sub_id_${i + 1}`)]);
   const PARAM_FIELDS = ['keyword', 'source', 'external_id', 'creative_id', 'ad_campaign_id', ...Array.from({ length: 30 }, (_, i) => `sub_id_${i + 1}`)];
   const paramSel = h('select', { class: 'select', 'aria-label': 'Параметр', onchange: (e) => { f.field = e.target.value; drawPresets(); load(); } },
@@ -1363,11 +1369,41 @@ async function pageReports(params) {
         note.textContent = 'Рефереры и пути считаются за всё время, применяется только фильтр кампании; конверсии здесь не считаются.';
       }
       const nameOf = (r) => (key === 'campaign' ? state.campaigns[r.id]?.name || r.id : key === 'landing' ? (r.id === 'none' ? '(без лендинга)' : state.landings[r.id]?.name || r.id) : r.id);
+      for (const tr of expandedRows.values()) tr.remove();
+      expandedRows.clear();
+      const drillInfo = DRILL_CHILD[key];
+      const expandCols = drillInfo ? [{
+        key: '_expand', label: '', title: 'Раскрыть', sortable: false, fixed: true, value: () => '',
+        render: (r) => {
+          const btn = h('button', { class: 'btn square', title: 'Развернуть', 'aria-label': 'Развернуть', style: 'padding:2px 6px;font-size:11px',
+            onclick: async (e) => {
+              if (expandedRows.has(r.id)) {
+                expandedRows.get(r.id).remove(); expandedRows.delete(r.id);
+                btn.textContent = '▸'; btn.setAttribute('title', 'Развернуть'); btn.setAttribute('aria-label', 'Развернуть');
+              } else {
+                if (expandedRows.size >= 3) { toast('Можно раскрыть не более 3 строк', true); return; }
+                try {
+                  const sub = await api('/stats' + qs({ from, to, [drillInfo.filter]: r.id }));
+                  const subRows = groupRows(sub[drillInfo.prop] || {});
+                  const childLabel = GROUPS.find(([k]) => k === drillInfo.child)?.[1] || drillInfo.child;
+                  const subTbl = dataTable({ id: 'exp-' + String(r.id).replace(/\W/g, '_'), pageSize: 20,
+                    rows: subRows, columns: [{ key: 'id', label: childLabel, fixed: true, cls: 'name' }, ...metricCols({ rpm: true })] });
+                  const expandTr = h('tr', { class: 'expand-row' }, h('td', { colspan: '99', style: 'padding:4px 0 4px 2rem;background:var(--bg-1)' }, subTbl));
+                  e.target.closest('tr').after(expandTr);
+                  expandedRows.set(r.id, expandTr);
+                  btn.textContent = '▾'; btn.setAttribute('title', 'Свернуть'); btn.setAttribute('aria-label', 'Свернуть');
+                } catch { toast('Ошибка загрузки детализации', true); }
+              }
+            },
+          }, '▸');
+          return btn;
+        },
+      }] : [];
       table?.detach();
       table = dataTable({
         id: 'report-' + key, pageSize: 100,
         rows,
-        columns: [{ key: 'id', label: f.field ? 'Значение' : label, fixed: true, cls: 'name', value: nameOf, render: (r) => (drill ? h('a', { href: '#/reports' + qs({ ...f, ...drill(r) }), title: 'Детализировать' }, nameOf(r)) : nameOf(r)) },
+        columns: [...expandCols, { key: 'id', label: f.field ? 'Значение' : label, fixed: true, cls: 'name', value: nameOf, render: (r) => (drill ? h('a', { href: '#/reports' + qs({ ...f, ...drill(r) }), title: 'Детализировать' }, nameOf(r)) : nameOf(r)) },
           ...metricCols({ rpm: true })],
       });
       put(holder, table);
