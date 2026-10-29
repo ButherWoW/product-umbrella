@@ -1,5 +1,5 @@
 // Umbrella admin UI — layout and workflows modelled on Keitaro, backed by the existing tracker API.
-const state = { token: null, offers: {}, campaigns: {}, landings: {}, sources: {}, users: [] };
+const state = { token: null, offers: {}, campaigns: {}, landings: {}, sources: {}, networks: {}, users: [] };
 // Set by the server when the tracker runs under a path prefix (BASE_PATH, e.g. /umbrella behind nginx).
 const BASE = document.querySelector('meta[name="umbrella-base"]')?.getAttribute('content') || '';
 const view = document.getElementById('view');
@@ -82,11 +82,12 @@ const qs = (params) => {
 };
 
 async function loadRefs() {
-  const [o, c, l, s] = await Promise.all([api('/api/offers'), api('/api/campaigns'), api('/api/landings'), api('/api/sources')]);
+  const [o, c, l, s, n] = await Promise.all([api('/api/offers'), api('/api/campaigns'), api('/api/landings'), api('/api/sources'), api('/api/networks')]);
   state.offers = o.offers || {};
   state.campaigns = c.campaigns || {};
   state.landings = l.landings || {};
   state.sources = s.sources || {};
+  state.networks = n.networks || {};
   state.domains = (await api('/api/domains').catch(() => ({ domains: [] }))).domains || [];
   // Owners see the team list (for assigning campaigns and per-buyer earnings); buyers get 403 and an empty list.
   state.users = isOwnerView() ? ((await api('/api/users').catch(() => ({ users: [] }))).users || []) : [];
@@ -1173,7 +1174,7 @@ async function pageNetworks() {
         h('input', { class: 'input', readonly: true, value: `${location.origin}${BASE}/postback?click_id={click_id}&secret=POSTBACK_SECRET&revenue={${n.payoutParam || 'payout'}}&currency=EUR` }),
         h('button', { class: 'btn', type: 'button', onclick: async (e) => { try { await navigator.clipboard.writeText(e.currentTarget.parentElement.querySelector('input').value); toast('URL скопирован'); } catch { toast('Не удалось скопировать URL', true); } } }, 'Копировать')), 'Скопируйте URL в настройках партнёрской сети и замените POSTBACK_SECRET на секрет сети.'),
       field('Заметки', h('textarea', { class: 'input', rows: 4, oninput: (e) => { n.notes = e.target.value; } }, n.notes)), err),
-      footer: [h('button', { class: 'btn', onclick: close }, 'Отмена'), h('button', { class: 'btn primary', onclick: async () => { try { await api(current ? '/api/networks/' + encodeURIComponent(n.id) : '/api/networks', { method: current ? 'PATCH' : 'POST', body: n }); toast('Сеть сохранена'); close(); onSaved(); } catch (e) { err.textContent = e.message; } } }, 'Сохранить')],
+      footer: [h('button', { class: 'btn', onclick: () => close() }, 'Отмена'), h('button', { class: 'btn primary', onclick: async () => { try { await api(current ? '/api/networks/' + encodeURIComponent(n.id) : '/api/networks', { method: current ? 'PATCH' : 'POST', body: n }); toast('Сеть сохранена'); close(); onSaved(); } catch (e) { err.textContent = e.message; } } }, 'Сохранить')],
     });
   }
   function load() { api('/api/networks').then((r) => table.setRows(Object.entries(r.networks || {}).map(([id, v]) => ({ id, ...v })))).catch((e) => toast('Ошибка сетей: ' + e.message, true)); }

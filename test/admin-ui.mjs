@@ -78,6 +78,8 @@ try {
   const createNetwork = page.getByRole('button', { name: 'Создать сеть' });
   await createNetwork.waitFor();
   await createNetwork.click();
+  await page.waitForTimeout(250);
+  assert.deepEqual(errors, [], 'network modal click must not raise page errors');
   const networkDialog = page.getByRole('dialog', { name: 'Новая сеть' });
   await networkDialog.waitFor();
   await networkDialog.locator('input').nth(0).fill('net-ui');
@@ -87,7 +89,9 @@ try {
   await page.locator('table.grid tbody tr', { hasText: 'Network UI' }).waitFor();
   await page.locator('table.grid tbody tr', { hasText: 'Network UI' }).getByRole('button', { name: 'Изменить' }).click();
   const savedNetworkDialog = page.getByRole('dialog', { name: 'Редактирование сети' });
-  await savedNetworkDialog.getByDisplayValue(/click_id=\{click_id\}/).waitFor();
+  const postbackInput = savedNetworkDialog.locator('input[readonly]').nth(1);
+  await postbackInput.waitFor();
+  assert.match(await postbackInput.inputValue(), /click_id=\{click_id\}/);
   assert.match(await savedNetworkDialog.innerText(), /POSTBACK_SECRET/);
   await savedNetworkDialog.getByRole('button', { name: 'Копировать' }).click();
   await savedNetworkDialog.getByRole('button', { name: 'Отмена' }).click();
