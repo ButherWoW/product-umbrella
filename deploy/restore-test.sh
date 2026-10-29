@@ -11,7 +11,7 @@ if [ -z "$DUMP" ]; then
   # shellcheck disable=SC2012
   DUMP=$(ls -1t "$DIR"/umbrella-*.dump 2>/dev/null | head -n 1 || true)
 fi
-[ -n "$DUMP" ] && [ -s "$DUMP" ] || { echo "no dump found in $DIR" >&2; exit 1; }
+if [ -z "$DUMP" ] || [ ! -s "$DUMP" ]; then echo "no dump found in $DIR" >&2; exit 1; fi
 if ! id postgres >/dev/null 2>&1; then echo "no local PostgreSQL — nothing to test" >&2; exit 1; fi
 
 as_pg() { sudo -u postgres "$@"; }
