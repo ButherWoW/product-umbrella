@@ -507,7 +507,7 @@ function shareModal(current, onSaved) {
 
 async function pageCampaigns() {
   const stateFilter = h('select', { class: 'select', 'aria-label': 'Состояние', onchange: () => load() },
-    [['', 'Все состояния'], ['active', 'Активные'], ['inactive', 'Неактивные'], ['clicks', 'С кликами']].map(([v, l]) => h('option', { value: v }, l)));
+    [['', 'Все состояния'], ['active', 'Активные'], ['inactive', 'Неактивные'], ['archived', 'Архив'], ['clicks', 'С кликами']].map(([v, l]) => h('option', { value: v }, l)));
   const bulk = h('span', { class: 'toolbar', style: 'margin:0' });
   const table = dataTable({
     id: 'campaigns', selectable: true, pageSize: 250,
@@ -518,6 +518,8 @@ async function pageCampaigns() {
       { key: 'name', label: 'Название', fixed: true, cls: 'name', render: (r) => h('a', { href: '#/campaigns/' + encodeURIComponent(r.id), title: r.name }, r.name) },
       { key: 'menu', label: '', title: 'Меню', sortable: false, value: () => '', render: (r) => h('span', { class: 'row-actions' },
         h('button', { title: 'Копировать ссылку', 'aria-label': 'Копировать ссылку', onclick: () => copyText(trackingUrl(r.id)) }, '🔗'),
+        h('button', { title: 'Копировать кампанию', 'aria-label': 'Копировать кампанию', onclick: async () => { try { await api('/api/campaigns/' + encodeURIComponent(r.id) + '/clone', { method: 'POST' }); toast('Кампания скопирована'); load(); } catch (e) { toast('Ошибка копирования: ' + e.message, true); } } }, '⧉'),
+        h('button', { title: r.archived ? 'Восстановить' : 'В архив', 'aria-label': r.archived ? 'Восстановить' : 'В архив', onclick: async () => { try { await api('/api/campaigns/' + encodeURIComponent(r.id), { method: 'PATCH', body: { archived: !r.archived } }); toast(r.archived ? 'Кампания восстановлена' : 'Кампания архивирована'); load(); } catch (e) { toast('Ошибка архива: ' + e.message, true); } } }, r.archived ? '↩' : '⌫'),
         h('a', { href: '#/reports' + qs({ group: 'stream', campaign: r.id }), title: 'Отчёт', 'aria-label': 'Отчёт' }, '▥'),
         h('a', { href: '#/clicks' + qs({ campaign: r.id }), title: 'Лог кликов', 'aria-label': 'Лог кликов' }, '☰'),
         h('button', { title: r.active ? 'Выключить' : 'Включить', 'aria-label': r.active ? 'Выключить' : 'Включить', onclick: () => setActive([r.id], !r.active) }, r.active ? '⏸' : '▶')) },
@@ -528,6 +530,7 @@ async function pageCampaigns() {
       { key: 'totalCap', label: 'Общий кап', num: true, hidden: true, render: (r) => r.totalCap ?? '—' },
       { key: 'revenueCap', label: 'Кап дохода', num: true, hidden: true, render: (r) => (r.revenueCap == null ? '—' : money(r.revenueCap)) },
       { key: 'botFilter', label: 'Бот-фильтр', hidden: true, value: (r) => (r.botFilter ? 'да' : 'нет') },
+      { key: 'archived', label: 'Архив', hidden: true, value: (r) => (r.archived ? 'да' : 'нет') },
       { key: 'geos', label: 'Гео', hidden: true, value: (r) => (r.allowGeos || []).join(', ') || 'все' },
       { key: 'devices', label: 'Устройства', hidden: true, value: (r) => (r.allowDevices || []).join(', ') || 'все' },
     ],
@@ -561,6 +564,8 @@ async function pageCampaigns() {
       const f = stateFilter.value;
       if (f === 'active') rows = rows.filter((r) => r.active);
       if (f === 'inactive') rows = rows.filter((r) => !r.active);
+      if (f === 'archived') rows = rows.filter((r) => r.archived);
+      if (!f) rows = rows.filter((r) => !r.archived);
       if (f === 'clicks') rows = rows.filter((r) => r.clicks > 0);
       table.setRows(rows);
     } catch (e) { toast('Ошибка загрузки кампаний: ' + e.message, true); }
@@ -1019,11 +1024,14 @@ async function pageOffers() {
       { key: 'id', label: 'ID', fixed: true, render: (r) => h('a', { href: '#/offers', onclick: (e) => { e.preventDefault(); offerModal(r.id, load); } }, r.id) },
       { key: 'menu', label: '', title: 'Меню', sortable: false, value: () => '', render: (r) => h('span', { class: 'row-actions' },
         h('button', { title: 'Изменить', 'aria-label': 'Изменить', onclick: () => offerModal(r.id, load) }, '✎'),
+        h('button', { title: 'Копировать', 'aria-label': 'Копировать', onclick: async () => { try { await api('/api/offers/' + encodeURIComponent(r.id) + '/clone', { method: 'POST' }); toast('Оффер скопирован'); load(); } catch (e) { toast('Ошибка копирования: ' + e.message, true); } } }, '⧉'),
+        h('button', { title: r.archived ? 'Восстановить' : 'В архив', 'aria-label': r.archived ? 'Восстановить' : 'В архив', onclick: async () => { try { await api('/api/offers/' + encodeURIComponent(r.id), { method: 'PATCH', body: { archived: !r.archived } }); toast(r.archived ? 'Оффер восстановлен' : 'Оффер архивирован'); load(); } catch (e) { toast('Ошибка архива: ' + e.message, true); } } }, r.archived ? '↩' : '⌫'),
         h('a', { href: '#/reports' + qs({ group: 'country', offer: r.id }), title: 'Отчёт', 'aria-label': 'Отчёт' }, '▥'),
         h('a', { href: '#/clicks' + qs({ offer: r.id }), title: 'Лог кликов', 'aria-label': 'Лог кликов' }, '☰')) },
       { key: 'name', label: 'Название', cls: 'name', value: (r) => r.name || '', render: (r) => h('span', { title: r.name || '' }, r.name || '—') },
       { key: 'url', label: 'URL', cls: 'name', hidden: true, render: (r) => h('span', { title: r.url }, r.url) },
       { key: 's2s', label: 'S2S', value: (r) => (r.postbackUrl ? 'да' : 'нет') },
+      { key: 'archived', label: 'Архив', hidden: true, value: (r) => (r.archived ? 'да' : 'нет') },
       { key: 'dailyCap', label: 'Дневной кап', num: true, render: (r) => r.dailyCap ?? '—' },
       ...metricCols(),
     ],
