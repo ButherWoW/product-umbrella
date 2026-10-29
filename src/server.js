@@ -720,7 +720,7 @@ async function paramReport({ field, campaign, allowed = null, from, to, currency
       if (to) { values.push(`${to}T23:59:59Z`); conditions.push(`c.created_at <= $${values.length}`); }
       const fx = sqlFx(values, currency);
       const { rows } = await db.query(`
-        SELECT ${isColumn ? `COALESCE(c.${field}, '')` : "COALESCE(c.params->>$1, '')"} AS value, COUNT(c.click_id)::int AS clicks, ${SQL_CONVERSIONS}::int AS conversions,
+        SELECT ${isColumn ? `COALESCE(c.${field}, '')` : "COALESCE(c.params->>$1, '')"} AS value, COUNT(c.click_id)::int AS clicks, COUNT(c.click_id) FILTER (WHERE c.is_unique_campaign IS DISTINCT FROM false)::int AS unique_clicks, ${SQL_CONVERSIONS}::int AS conversions,
           ${fx.revenue}::float AS revenue, ${fx.cost}::float AS cost
         FROM clicks c LEFT JOIN conversions cv USING (click_id)
         ${conditions.length ? 'WHERE ' + conditions.join(' AND ') : ''}
@@ -740,9 +740,9 @@ async function paramReport({ field, campaign, allowed = null, from, to, currency
     const t = Date.parse(click.at);
     if ((fromMs !== null && t < fromMs) || (toMs !== null && t > toMs)) continue;
     const key = (isColumn ? click[field] : click.params?.[field]) ?? '';
-    const g = groups.get(key) || { value: key, clicks: 0, conversions: 0, revenue: 0, cost: 0 };
+    const g = groups.get(key) || { value: key, clicks: 0, uniqueClicks: 0, conversions: 0, revenue: 0, cost: 0 };
     const cv = conv.get(click.clickId);
-    g.clicks += 1; g.cost += (Number(click.cost) || 0) * rates.factor(rates.defaultCurrency, currency);
+    g.clicks += 1; if (click.uniqueCampaign !== false) g.uniqueClicks += 1; g.cost += (Number(click.cost) || 0) * rates.factor(rates.defaultCurrency, currency);
     if (cv && conversionCounts(cv)) { g.conversions += 1; g.revenue += saleRevenue(cv) * rates.factor(cv.currency, currency); }
     groups.set(key, g);
   }
