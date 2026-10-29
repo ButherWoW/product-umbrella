@@ -1,0 +1,8 @@
+[Unit]
+Description=Record a failed Umbrella maintenance job (%i)
+# Started by OnFailure= of umbrella-backup.service and umbrella-restore-test.service:
+# writes /opt/umbrella/backups/LAST_FAILED and an error line to the journal. No external service.
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/umbrella/app/deploy/notify-failure.sh %i
