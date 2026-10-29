@@ -111,6 +111,43 @@ try {
   }
   await page.screenshot({ path: join(tmpdir(), 'umbrella-admin-mobile.png'), fullPage: true });
 
+  // Saved reports: save two reports with different groups, reload, verify both persist and load with correct filters.
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto(server.url + '/admin#/reports');
+  await page.getByRole('heading', { name: 'Отчёт' }).waitFor();
+  // Save first report with group = Страна
+  await page.getByRole('button', { name: 'Страна' }).click();
+  await page.locator('.chip-btn.on', { hasText: 'Страна' }).waitFor();
+  await page.getByRole('button', { name: '💾 Сохранить' }).click();
+  const repSaveDialog = page.getByRole('dialog', { name: 'Сохранить отчёт' });
+  await repSaveDialog.waitFor();
+  await repSaveDialog.getByLabel('Название отчёта').fill('Rep-1');
+  await repSaveDialog.getByRole('button', { name: 'Сохранить' }).click();
+  await repSaveDialog.waitFor({ state: 'detached' });
+  // Save second report with group = Оффер
+  await page.getByRole('button', { name: 'Оффер' }).click();
+  await page.locator('.chip-btn.on', { hasText: 'Оффер' }).waitFor();
+  await page.getByRole('button', { name: '💾 Сохранить' }).click();
+  await repSaveDialog.waitFor();
+  await repSaveDialog.getByLabel('Название отчёта').fill('Rep-2');
+  await repSaveDialog.getByRole('button', { name: 'Сохранить' }).click();
+  await repSaveDialog.waitFor({ state: 'detached' });
+  // Both chips visible immediately after saving
+  await page.getByRole('button', { name: 'Открыть Rep-1' }).waitFor();
+  await page.getByRole('button', { name: 'Открыть Rep-2' }).waitFor();
+  // Reload and navigate back — chips must survive (localStorage persists)
+  await page.reload();
+  await page.goto(server.url + '/admin#/reports');
+  await page.getByRole('heading', { name: 'Отчёт' }).waitFor();
+  await page.getByRole('button', { name: 'Открыть Rep-1' }).waitFor();
+  await page.getByRole('button', { name: 'Открыть Rep-2' }).waitFor();
+  // Click Rep-1 → filters restore to Страна group
+  await page.getByRole('button', { name: 'Открыть Rep-1' }).click();
+  await page.locator('.chip-btn.on', { hasText: 'Страна' }).waitFor();
+  // Click Rep-2 → filters restore to Оффер group
+  await page.getByRole('button', { name: 'Открыть Rep-2' }).click();
+  await page.locator('.chip-btn.on', { hasText: 'Оффер' }).waitFor();
+
   assert.deepEqual(errors, []);
 
   // Accounts: a REQUIRE_LOGIN install starts with the setup screen; owner creates a buyer; logout returns to login.

@@ -1119,16 +1119,50 @@ async function pageReports(params) {
     h('option', { value: '' }, 'Параметр'), PARAM_FIELDS.map((n) => h('option', { value: n, selected: f.field === n }, n)));
   const drawPresets = () => put(presets, GROUPS.map(([k, l]) => h('button', { class: 'chip-btn' + (f.group === k && !f.field ? ' on' : ''), onclick: () => { f.group = k; f.field = ''; paramSel.value = ''; drawPresets(); load(); } }, l)));
   drawPresets();
+
+  // Saved reports
+  const savedBar = h('div', { class: 'toolbar', style: 'flex-wrap:wrap;gap:4px;margin-bottom:4px', 'aria-label': 'Сохранённые отчёты' });
+  const drawSaved = () => {
+    const saved = store.get('reports:saved', []);
+    if (!saved.length) { savedBar.hidden = true; return; }
+    savedBar.hidden = false;
+    put(savedBar, saved.map((s, i) => h('span', { class: 'chip-btn', style: 'display:inline-flex;align-items:center;gap:4px' },
+      h('button', { style: 'background:none;border:none;padding:0;cursor:pointer;color:inherit', 'aria-label': 'Открыть ' + s.name, onclick: () => {
+        Object.assign(f, { group: s.group, campaign: s.campaign || '', offer: s.offer || '', country: s.country || '', stream: s.stream || '', subid: s.subid || '' });
+        if (s.period) { period.key = s.period.key; period.from = s.period.from; period.to = s.period.to; store.set('period', period); }
+        if (s.currency) { currency.code = s.currency; store.set('currency', currency.code); }
+        drawPresets(); load();
+      } }, s.name),
+      h('button', { style: 'background:none;border:none;padding:0 2px;cursor:pointer;color:var(--fg-3)', 'aria-label': 'Удалить ' + s.name, onclick: () => { const upd = store.get('reports:saved', []).filter((_, j) => j !== i); store.set('reports:saved', upd); drawSaved(); } }, '✕'))));
+  };
+  drawSaved();
+
+  const saveReport = () => {
+    const nameInput = h('input', { class: 'input', placeholder: 'Название', 'aria-label': 'Название отчёта', style: 'width:100%' });
+    const close = openModal({ title: 'Сохранить отчёт', body: h('div', { class: 'field' }, nameInput),
+      footer: [h('button', { class: 'btn', onclick: () => close() }, 'Отменить'),
+        h('button', { class: 'btn primary', onclick: () => {
+          const name = nameInput.value.trim(); if (!name) return;
+          const saved = store.get('reports:saved', []);
+          const entry = { name, ...f, period: { ...periodRange(), key: period.key }, currency: currency.code };
+          store.set('reports:saved', [...saved, entry].slice(-20));
+          drawSaved(); close();
+        } }, 'Сохранить')],
+    });
+    nameInput.focus();
+  };
+
   const sel = (key, label, options) => h('select', { class: 'select', 'aria-label': label, onchange: (e) => { f[key] = e.target.value; load(); } },
     h('option', { value: '' }, label), options.map(([v, l]) => h('option', { value: v, selected: f[key] === v }, l)));
   const txt = (key, label) => h('input', { class: 'input', value: f[key], placeholder: label, 'aria-label': label, style: 'width:130px', onchange: (e) => { f[key] = e.target.value.trim(); load(); } });
-  put(view, h('h1', {}, 'Отчёт'), presets,
+  put(view, h('h1', {}, 'Отчёт'), savedBar, presets,
     h('div', { class: 'toolbar' },
       paramSel,
       sel('campaign', 'Все кампании', Object.entries(state.campaigns).map(([id, c]) => [id, c.name || id])),
       sel('offer', 'Все офферы', Object.keys(state.offers).map((id) => [id, id])),
       txt('country', 'Страна'), txt('stream', 'Поток'), txt('subid', 'Sub ID'),
       periodControl(() => load()), currencyControl(() => load()),
+      h('button', { class: 'btn', onclick: saveReport }, '💾 Сохранить'),
       h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'),
       h('button', { class: 'btn square', title: 'Колонки', 'aria-label': 'Колонки', onclick: () => table?.chooser() }, '⚙')),
     note, holder);
