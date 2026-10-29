@@ -177,9 +177,11 @@ test("offersAccess 'own' limits the offer catalog to offers used in the user's c
   for (const id of ['offer-mine', 'offer-team', 'offer-free']) await addOffer(id);
   await addCampaign('mine', buyer.id, 'offer-mine');
   await addCampaign('team', null, 'offer-team');
-  const total = Object.keys((await call('/api/offers', { cookie: owner })).json.offers).length;
-  assert.ok(total >= 3);
-  assert.equal(Object.keys((await call('/api/offers', { cookie: buyer.cookie })).json.offers).length, total, "default 'all'");
+  // The demo offer-1 every fresh install has, plus the three added here.
+  const catalog = ['offer-1', 'offer-free', 'offer-mine', 'offer-team'];
+  const offerIds = async (cookie) => Object.keys((await call('/api/offers', { cookie })).json.offers).sort();
+  assert.deepEqual(await offerIds(owner), catalog);
+  assert.deepEqual(await offerIds(buyer.cookie), catalog, "default 'all'");
 
   const patched = await call(`/api/users/${buyer.id}`, { method: 'PATCH', cookie: owner, body: { offersAccess: 'own' } });
   assert.equal(patched.json.user.offersAccess, 'own');
@@ -192,7 +194,7 @@ test("offersAccess 'own' limits the offer catalog to offers used in the user's c
   assert.equal((await call('/api/offers', { method: 'POST', cookie: buyer.cookie, body: { id: 'offer-own', url: 'https://own.example.com/' } })).status, 201);
   assert.deepEqual(Object.keys((await call('/api/offers', { cookie: buyer.cookie })).json.offers).sort(), ['offer-mine', 'offer-own'], 'own offers listed');
   assert.equal((await call('/api/offers/offer-own', { method: 'PATCH', cookie: buyer.cookie, body: { name: 'Mine' } })).status, 200, 'own offer editable');
-  assert.equal(Object.keys((await call('/api/offers', { cookie: owner })).json.offers).length, total + 1, 'owner sees everything');
+  assert.deepEqual(await offerIds(owner), [...catalog, 'offer-own'].sort(), 'owner sees everything');
   assert.equal((await call('/api/users', { cookie: owner })).json.users.find((u) => u.id === buyer.id).offersAccess, 'own', 'stored with the user');
 });
 

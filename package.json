@@ -5,7 +5,8 @@
   "scripts": {
     "start": "node src/server.js",
     "migrate": "node src/migrate.js",
-    "test": "node --test test/*.test.mjs && node test/smoke.mjs"
+    "test": "node --test test/*.test.mjs && node test/smoke.mjs",
+    "test:ui": "node --test $(ls test/ui/*.mjs test/*-ui.mjs 2>/dev/null | grep -v '/setup.mjs$')"
   },
   "dependencies": {
     "@maxmind/geoip2-node": "7.1.0",
