@@ -1267,7 +1267,8 @@ async function pageReports(params) {
         const gRev = Array.from({ length: 7 }, () => new Array(24).fill(0));
         const WD_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
         for (const p of ts.series || []) {
-          const d = new Date(p.bucket ?? p.date);
+          // Hourly buckets come as 'YYYY-MM-DDTHH' (UTC), which Date cannot parse on its own.
+          const raw = String(p.bucket ?? p.date); const d = new Date(raw.length === 13 ? `${raw}:00:00Z` : raw);
           const parts = new Intl.DateTimeFormat('en', { timeZone: tz, hour12: false, weekday: 'short', hour: '2-digit' }).formatToParts(d);
           const wdRaw = WD_SHORT.indexOf(parts.find((x) => x.type === 'weekday')?.value ?? 'Sun');
           const wd = wdRaw < 0 ? 0 : (wdRaw + 6) % 7; // 0=Mon … 6=Sun
