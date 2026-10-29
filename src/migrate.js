@@ -175,5 +175,33 @@ await db.query(`CREATE TABLE IF NOT EXISTS cost_imports (import_key TEXT PRIMARY
 // Offer conversion cap counts today's conversions.
 await db.query(`CREATE INDEX IF NOT EXISTS conversions_created_idx ON conversions(created_at)`);
 
+// Event ids (journal record id) for idempotent replay by the reconciliation job (src/reconcile.js).
+// Unique indexes treat NULLs as distinct, so rows written before these columns existed stay valid.
+await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS event_id UUID`);
+await db.query(`ALTER TABLE bots ADD COLUMN IF NOT EXISTS event_id UUID`);
+await db.query(`ALTER TABLE postbacks ADD COLUMN IF NOT EXISTS event_id UUID`);
+await db.query(`CREATE UNIQUE INDEX IF NOT EXISTS bots_event_id_idx ON bots(event_id)`);
+await db.query(`CREATE UNIQUE INDEX IF NOT EXISTS postbacks_event_id_idx ON postbacks(event_id)`);
+await db.query(`CREATE INDEX IF NOT EXISTS bots_created_idx ON bots(created_at)`);
+await db.query(`CREATE INDEX IF NOT EXISTS postbacks_created_idx ON postbacks(created_at)`);
+
+// CHECK constraints that schema.sql has (databases created by this script did not). Added NOT VALID first so the
+// migration never fails on old rows, then validated; rows that do not pass keep the constraint NOT VALID
+// (new rows are still checked) and are reported.
+const checks = [
+  ['conversions', 'conversions_status_check', "CHECK (status IN ('lead', 'sale', 'rejected', 'trash'))"],
+  ['offers', 'offers_url_check', "CHECK (url ~* '^https://')"],
+  ['landings', 'landings_url_check', "CHECK (url ~* '^https://')"],
+];
+for (const [table, name, check] of checks) {
+  await db.query(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '${name}' AND conrelid = '${table}'::regclass) THEN
+      ALTER TABLE ${table} ADD CONSTRAINT ${name} ${check} NOT VALID;
+    END IF;
+  END $$`);
+  try { await db.query(`ALTER TABLE ${table} VALIDATE CONSTRAINT ${name}`); }
+  catch (error) { console.warn(`[migrate] ${table}.${name} stays NOT VALID (existing rows do not pass): ${error.message}`); }
+}
+
 console.log('[migrate] All tables ready');
 await db.end();

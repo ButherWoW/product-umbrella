@@ -20,22 +20,6 @@ export async function scanJournalLines(eventsFile, onLine) {
   for await (const line of createInterface({ input, crlfDelay: Infinity })) if (line) onLine(line);
 }
 
-// Parsed journal records (unreadable lines skipped). `types` keeps only those event types, which keeps big
-// reports from holding bots, postbacks and audit events they do not use.
-export async function readJournalRecords(eventsFile, types = null) {
-  const wanted = types ? new Set(types) : null;
-  // Cheap pre-filter before JSON.parse: the quoted type value must appear somewhere in the line.
-  const needles = types ? types.map((type) => `"${type}"`) : null;
-  const out = [];
-  await scanJournalLines(eventsFile, (line) => {
-    if (needles && !needles.some((needle) => line.includes(needle))) return;
-    let item;
-    try { item = JSON.parse(line); } catch { return; }
-    if (item && typeof item === 'object' && (!wanted || wanted.has(item.type))) out.push(item);
-  });
-  return out;
-}
-
 // Runs report scans one at a time (FIFO), so parallel reports neither multiply memory nor starve /r.
 export function createScanQueue() {
   let tail = Promise.resolve();
@@ -110,12 +94,15 @@ export function createJournalIndex({ clickLimit = 200000, visitorLimit = 200000 
   }
 
   // Rebuilds everything from the journal (startup, and after clearing statistics or retention rewrote it).
+  // Returns { bad }: unreadable lines skipped.
   async function build(eventsFile) {
     reset();
-    let missingOffer = 0;
+    let missingOffer = 0, bad = 0;
     await scanJournalLines(eventsFile, (line) => {
+      if (!line.trim()) return;
       let item;
-      try { item = JSON.parse(line); } catch { return; }
+      try { item = JSON.parse(line); } catch { bad += 1; return; }
+      if (!item || typeof item !== 'object' || Array.isArray(item)) { bad += 1; return; }
       observe(item);
       if (item?.type === 'conversion' && !clicks.has(item.clickId)) missingOffer += 1;
     });
@@ -141,6 +128,7 @@ export function createJournalIndex({ clickLimit = 200000, visitorLimit = 200000 
         });
       }
     }
+    return { bad };
   }
 
   return {

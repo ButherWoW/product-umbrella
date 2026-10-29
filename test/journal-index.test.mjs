@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createJournalIndex, createClickCounters, createScanQueue, createOldClickLookup, readJournalRecords } from '../src/journal-index.js';
+import { createJournalIndex, createClickCounters, createScanQueue, createOldClickLookup } from '../src/journal-index.js';
+import { readJournal } from '../src/journal.js';
 
 const today = new Date().toISOString().slice(0, 10);
 const click = (n, extra = {}) => ({ type: 'click', at: `${today}T10:00:${String(n % 60).padStart(2, '0')}Z`, clickId: `c${n}`, campaign: 'camp', offerId: n % 2 ? 'odd' : 'even', ip: `10.0.0.${n}`, ...extra });
@@ -39,9 +40,10 @@ test('journal index: counts, last click per IP, conversions and source postbacks
   index.observe(click(4));
   assert.equal(index.count('t|camp'), 4);
   assert.equal(index.click('c4').offerId, 'even');
-  // readJournalRecords keeps only the asked types and skips unreadable lines.
-  assert.deepEqual((await readJournalRecords(file, ['source_postback'])).map((r) => r.clickId), ['c1']);
-  assert.deepEqual(await readJournalRecords(join(dir, 'missing.jsonl')), []);
+  // The streamed reader keeps only the asked types and skips unreadable lines.
+  assert.deepEqual((await readJournal(file, ['source_postback'])).map((r) => r.clickId), ['c1']);
+  assert.equal((await readJournal(file)).length, lines.length - 1);
+  assert.deepEqual(await readJournal(join(dir, 'missing.jsonl')), []);
 });
 
 test('click counters: seeded once, reservations are synchronous, a refresh keeps unsettled clicks', async () => {
