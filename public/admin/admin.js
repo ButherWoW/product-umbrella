@@ -1610,7 +1610,7 @@ async function pageReports(params) {
   const PARAM_FIELDS = ['keyword', 'source', 'external_id', 'creative_id', 'ad_campaign_id', ...Array.from({ length: 30 }, (_, i) => `sub_id_${i + 1}`)];
   const paramSel = h('select', { class: 'select', 'aria-label': 'Параметр', onchange: (e) => { f.field = e.target.value; drawPresets(); load(); } },
     h('option', { value: '' }, 'Параметр'), PARAM_FIELDS.map((n) => h('option', { value: n, selected: f.field === n }, n)));
-  const drawPresets = () => put(presets, [...GROUPS.map(([k, l]) => h('button', { class: 'chip-btn' + (f.group === k && !f.field ? ' on' : ''), onclick: () => { f.group = k; f.field = ''; paramSel.value = ''; drawPresets(); load(); } }, l)), h('button', { class: 'chip-btn' + (f.group === 'heatmap' ? ' on' : ''), onclick: () => { f.group = 'heatmap'; f.field = ''; paramSel.value = ''; drawPresets(); load(); } }, 'Карта по часам')]);
+  const drawPresets = () => put(presets, [...GROUPS.map(([k, l]) => h('button', { class: 'chip-btn' + (f.group === k && !f.field ? ' on' : ''), onclick: () => { f.group = k; f.field = ''; paramSel.value = ''; drawPresets(); load(); } }, l)), h('button', { class: 'chip-btn' + (f.group === 'heatmap' ? ' on' : ''), onclick: () => { f.group = 'heatmap'; f.field = ''; paramSel.value = ''; drawPresets(); load(); } }, 'Карта по часам'), h('button', { class: 'chip-btn' + (f.group === 'conversions' ? ' on' : ''), onclick: () => { f.group = 'conversions'; f.field = ''; paramSel.value = ''; drawPresets(); load(); } }, 'Конверсии')]);
   drawPresets();
 
   // Period comparison: a second request for the equally long period right before the current one.
@@ -1775,6 +1775,47 @@ async function pageReports(params) {
                 }))))));
         put(holder, h('div', { class: 'toolbar', style: 'margin-bottom:8px' }, tzSel, metricSel), heatTable);
       } catch (e) { put(holder, h('p', { class: 'err' }, 'Ошибка тепловой карты: ' + e.message)); }
+      return;
+    }
+    if (f.group === 'conversions') {
+      // Conversions by day (D14): grouped by the conversion's own time, not the click's. A click's lead that later became
+      // a sale counts once, as a sale — only the latest status of each click counts, as in /stats.
+      table?.detach(); table = null;
+      try {
+        const base = { campaign: f.campaign, offer: f.offer, stream: f.stream, from, to, limit: 100 };
+        const MAX_PAGES = 100;
+        const events = []; let offset = 0; let page = 0; let more = true;
+        while (more && page < MAX_PAGES) {
+          const r = await api('/api/conversions' + qs({ ...base, offset }));
+          events.push(...(r.conversions || []));
+          more = Boolean(r.hasMore); offset = r.nextOffset ?? offset + 100; page++;
+        }
+        if (more) note.textContent = `Показаны последние ${num(events.length)} конверсий — сузьте период или выберите кампанию.`;
+        const ts = await api('/stats/timeseries' + qs({ campaign: f.campaign, offer: f.offer, from, to })).catch(() => ({ series: [] }));
+        // The log is newest first; events with the same timestamp keep the journal order (oldest first),
+        // so a click's current status is the last of its events with the newest time.
+        const latest = new Map();
+        for (const c of events) { const cur = latest.get(c.clickId); if (!cur || (c.at || '') >= (cur.at || '')) latest.set(c.clickId, c); }
+        const info = currency.info || { defaultCurrency: currency.code, rates: {} };
+        const fx = (amount, from) => { const a = info.rates?.[from || info.defaultCurrency]; const b = info.rates?.[currency.code]; return (Number(amount) || 0) * (a && b ? b / a : 1); };
+        const byDay = {};
+        const day = (id) => (byDay[id] ||= { id, clicks: 0, leads: 0, sales: 0, rejected: 0, revenue: 0, pendingRevenue: 0 });
+        for (const p of ts.series || []) if (p.date) day(String(p.date).slice(0, 10)).clicks += p.clicks || 0;
+        for (const c of latest.values()) {
+          const d = String(c.at || '').slice(0, 10); if (!d) continue;
+          const r = day(d);
+          if (c.status === 'lead') { r.leads++; r.pendingRevenue += fx(c.revenue, c.currency); }
+          else if (c.status === 'sale') { r.sales++; r.revenue += fx(c.revenue, c.currency); }
+          else if (c.status === 'rejected') r.rejected++;
+        }
+        const convRows = Object.values(byDay).sort((a, b) => (a.id < b.id ? 1 : -1));
+        // metricCols drops revenue columns for hideRevenue users (the server strips the amounts as well).
+        const pick = ['clicks', 'leads', 'sales', 'rejected', 'approvePct', 'revenue', 'pendingRevenue'];
+        const cols = metricCols().filter((c) => pick.includes(c.key)).sort((a, b) => pick.indexOf(a.key) - pick.indexOf(b.key)).map((c) => ({ ...c, hidden: false }));
+        table = dataTable({ id: 'report-conversions', pageSize: 100, rows: convRows,
+          columns: [{ key: 'id', label: 'Дата', fixed: true }, ...cols] });
+        put(holder, table);
+      } catch (e) { put(holder, h('p', { class: 'err' }, 'Ошибка конверсий: ' + e.message)); }
       return;
     }
     const [key, label, prop] = GROUPS.find((g) => g[0] === f.group) || GROUPS[0];
