@@ -100,6 +100,12 @@ CREATE TABLE IF NOT EXISTS postbacks (
 CREATE INDEX IF NOT EXISTS postbacks_direction_created_idx ON postbacks(direction, created_at);
 CREATE INDEX IF NOT EXISTS postbacks_campaign_created_idx ON postbacks(campaign, created_at);
 
+-- Spend imports (FB CSV): key campaigns|param|id|date → clicks of the last import, so a re-import replaces it.
+CREATE TABLE IF NOT EXISTS cost_imports (
+  import_key TEXT PRIMARY KEY, campaign TEXT NOT NULL, click_ids TEXT[] NOT NULL DEFAULT '{}',
+  cost NUMERIC(14,6) NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE INDEX IF NOT EXISTS clicks_campaign_created_idx ON clicks(campaign, created_at);
 CREATE INDEX IF NOT EXISTS clicks_created_idx ON clicks(created_at);
 CREATE INDEX IF NOT EXISTS conversions_created_idx ON conversions(created_at);

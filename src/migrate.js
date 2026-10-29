@@ -166,6 +166,9 @@ await db.query(`CREATE TABLE IF NOT EXISTS postbacks (id BIGSERIAL PRIMARY KEY, 
   status TEXT, revenue TEXT, currency TEXT, url TEXT, status_code INTEGER, error TEXT, attempt INTEGER, ip TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
 await db.query(`CREATE INDEX IF NOT EXISTS postbacks_direction_created_idx ON postbacks(direction, created_at)`);
 await db.query(`CREATE INDEX IF NOT EXISTS postbacks_campaign_created_idx ON postbacks(campaign, created_at)`);
+// Spend imports (FB CSV): the clicks of the last import per key, so a re-import replaces it instead of adding.
+await db.query(`CREATE TABLE IF NOT EXISTS cost_imports (import_key TEXT PRIMARY KEY, campaign TEXT NOT NULL, click_ids TEXT[] NOT NULL DEFAULT '{}',
+  cost NUMERIC(14,6) NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
 // Offer conversion cap counts today's conversions.
 await db.query(`CREATE INDEX IF NOT EXISTS conversions_created_idx ON conversions(created_at)`);
 

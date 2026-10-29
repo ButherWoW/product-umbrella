@@ -55,6 +55,8 @@ const required = [
   '/api/audit',
   '/api/domains',
   '/api/rates',
+  '/api/costs',
+  '/api/costs/import',
 ];
 
 const missing = required.filter(p => !paths.includes(p));
