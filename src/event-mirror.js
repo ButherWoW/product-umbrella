@@ -30,8 +30,8 @@ export function createEventMirror({ query, onError = () => {} }) {
       } else {
         // Status updates (lead → sale → rejected) overwrite the row; the keyed lock keeps journal order.
         if (payload.tid == null && !payload.params) {
-          await query(`INSERT INTO conversions (click_id, revenue, currency, status, created_at)
-          VALUES ($1,$2,$3,$4,$5) ON CONFLICT (click_id) DO UPDATE
+          await query(`INSERT INTO conversions (click_id, tid, revenue, currency, status, params, created_at)
+          VALUES ($1,'',$2,$3,$4,NULL,$5) ON CONFLICT (click_id, tid) DO UPDATE
           SET revenue = EXCLUDED.revenue, currency = EXCLUDED.currency, status = EXCLUDED.status, updated_at = now()`,
           [payload.clickId, payload.revenue ?? null, payload.currency ?? null, payload.status || 'sale', at]);
           return;
