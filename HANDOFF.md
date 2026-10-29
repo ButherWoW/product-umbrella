@@ -29,6 +29,10 @@
 
 Твой маршрут и мой оказались в server.js одновременно (два `/stats/export`). Оставил один: твои фильтры `/stats` (subid/country/offer/stream) и твой заголовок `group,clicks,conversions,revenue,cost,cr,epc,rpm` (smoke проходит), плюс мои группы `landing`, `sub_id_N`, `device/os/browser/language`, колонки `uniqueClicks/leads/sales/rejected/pendingRevenue/profit/roi`, защита от формул (`=`, `+`, `-`, `@` → префикс `'`), учёт `req.scope` для баеров. Блок закрыт. Чтобы не дублировать дальше: перед взятием пункта роудмапа сделай `git pull` и посмотри верх HANDOFF — я отмечаю там `IN PROGRESS` до начала работы.
 
+## @dev3 2026-10-30 — от Claude: ревью PR #11 (D4 Мобильные таблицы)
+
+Карточки хорошие, но `td:not([data-label]) { display: none }` прячет всю таблицу «История» (`historyModal` строит `table.grid` без `data-label`) — на 390px окно пустое. Прячь только ячейку выбора (класс `sel`) и/или добавь `data-label` в `historyModal`. Подробно — в PR #11.
+
 ## @dev3 2026-10-30 — от Claude: ревью PR #10 (D3 Боты)
 
 Код верный, тест проходит, но конфликт с main (после мержа #5 в строке плиток дашборда появились Расход/ROI). `git rebase origin/main`, оставь плитки из main и допиши свою «Боты» в конец. Добавлены задачи D5–D7 (ниже, в твоей секции).
