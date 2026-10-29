@@ -519,8 +519,8 @@ async function persistSource(id, value) {
 async function loadOffers() {
   if (db) {
     try {
-      const { rows } = await db.query('SELECT id, url, postback_url, daily_cap, name, network_id, "group" FROM offers');
-      for (const row of rows) if (/^[a-z0-9_-]{2,80}$/i.test(row.id) && /^https:\/\//i.test(row.url)) offers.set(row.id, parseOffer({ url: row.url, postbackUrl: row.postback_url, dailyCap: row.daily_cap, name: row.name, networkId: row.network_id, group: row.group }));
+      const { rows } = await db.query('SELECT id, url, postback_url, daily_cap, name, network_id, "group", archived FROM offers');
+      for (const row of rows) if (/^[a-z0-9_-]{2,80}$/i.test(row.id) && /^https:\/\//i.test(row.url)) offers.set(row.id, parseOffer({ url: row.url, postbackUrl: row.postback_url, dailyCap: row.daily_cap, name: row.name, networkId: row.network_id, group: row.group, archived: row.archived === true }));
       return;
     } catch (error) { console.warn('[db] offers load fallback:', error.message); }
   }
@@ -541,7 +541,7 @@ async function saveOffers() {
 
 async function persistOffer(id, value) {
   const offer = typeof value === 'string' ? { url: value, postbackUrl: null } : value;
-  if (db) await db.query('INSERT INTO offers (id, url, postback_url, daily_cap, name, network_id, "group") VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (id) DO UPDATE SET url = EXCLUDED.url, postback_url = EXCLUDED.postback_url, daily_cap = EXCLUDED.daily_cap, name = EXCLUDED.name, network_id = EXCLUDED.network_id, "group" = EXCLUDED."group"', [id, offer.url, offer.postbackUrl, offer.dailyCap ?? null, offer.name ?? null, offer.networkId ?? null, offer.group ?? '']);
+  if (db) await db.query('INSERT INTO offers (id, url, postback_url, daily_cap, name, network_id, "group", archived) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (id) DO UPDATE SET url = EXCLUDED.url, postback_url = EXCLUDED.postback_url, daily_cap = EXCLUDED.daily_cap, name = EXCLUDED.name, network_id = EXCLUDED.network_id, "group" = EXCLUDED."group", archived = EXCLUDED.archived', [id, offer.url, offer.postbackUrl, offer.dailyCap ?? null, offer.name ?? null, offer.networkId ?? null, offer.group ?? '', offer.archived === true]);
   else await saveOffers();
 }
 
