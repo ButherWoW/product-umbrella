@@ -193,3 +193,7 @@ body.auth-mode .view { margin-left: 0; display: grid; place-items: start center;
 }
 /* Two-column form (traffic simulation) */
 .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0 16px; }
+.ip-allowlist { margin-top: 16px; }
+.ip-allowlist h2 { margin: 0 0 8px; font-size: 16px; }
+.ip-allowlist p { margin: 6px 0; }
+.ip-allowlist code { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }

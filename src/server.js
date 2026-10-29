@@ -5,10 +5,10 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { db, query, closeDb } from './db.js';
 import { reportFromRows, reportFromEvents, metrics } from './stats-report.js';
-import { createUserStore, readCookie, SESSION_TTL_MS } from './auth.js';
+import { createUserStore, readCookie, SESSION_TTL_MS, API_KEY_PREFIX } from './auth.js';
 import { createRates, normalizeCurrency } from './currency.js';
 import { readEventLog } from './event-logs.js';
-import { createConversionRecorder, hasRecordedConversion, findRecordedConversion } from './conversion-recorder.js';
+import { createConversionRecorder, hasRecordedConversion, findRecordedConversion, conversionKey } from './conversion-recorder.js';
 import { createEventMirror } from './event-mirror.js';
 import { createConversionCapCounter, resolveOffer } from './conversion-cap.js';
 
@@ -40,11 +40,24 @@ function sqlFx(params, currency) {
     revenue: `COALESCE(SUM(${amount}) FILTER (WHERE cv.status = 'sale'), 0)`,
     pending: `COALESCE(SUM(${amount}) FILTER (WHERE cv.status = 'lead'), 0)`,
     cost: `COALESCE(SUM(c.cost), 0) * $${n}::float`,
+    // CPC offer payout booked on the click itself (stored in DEFAULT_CURRENCY, like cost).
+    clickRevenue: `COALESCE(SUM(c.revenue), 0) * $${n}::float`,
+    // Per-click reports: a click can have several conversions (upsells, one per tid), so they are summed per click
+    // first (alias cvs) and the click row is never duplicated — clicks and cost stay exact.
+    join: `LEFT JOIN LATERAL (SELECT
+        COUNT(*) FILTER (WHERE x.status IN ('lead', 'sale')) AS conversions,
+        COUNT(*) FILTER (WHERE x.status = 'lead') AS leads, COUNT(*) FILTER (WHERE x.status = 'sale') AS sales,
+        COUNT(*) FILTER (WHERE x.status = 'rejected') AS rejected, COUNT(*) FILTER (WHERE x.status = 'trash') AS trash,
+        COALESCE(SUM(${amount.replaceAll('cv.', 'x.')}) FILTER (WHERE x.status = 'sale'), 0) AS revenue,
+        COALESCE(SUM(${amount.replaceAll('cv.', 'x.')}) FILTER (WHERE x.status = 'lead'), 0) AS pending
+      FROM conversions x WHERE x.click_id = c.click_id) cvs ON true`,
+    sum: (column) => `COALESCE(SUM(cvs.${column}), 0)`,
   };
 }
 // JSONL equivalents.
 const convertConversion = (cv, currency) => (cv.revenue === null || cv.revenue === undefined ? cv : { ...cv, revenue: Number(cv.revenue) * rates.factor(cv.currency, currency) });
-const convertClickCost = (click, currency) => (click.cost ? { ...click, cost: Number(click.cost) * rates.factor(rates.defaultCurrency, currency) } : click);
+const convertClickCost = (click, currency) => (click.cost || click.revenue ? { ...click, cost: Number(click.cost || 0) * rates.factor(rates.defaultCurrency, currency),
+  revenue: Number(click.revenue || 0) * rates.factor(rates.defaultCurrency, currency) } : click);
 const SESSION_COOKIE = 'umb_session';
 const loginFailures = new Map();
 const postbackSecret = process.env.POSTBACK_SECRET || '';
@@ -53,6 +66,8 @@ const requirePostgres = /^(1|true|yes)$/i.test(process.env.REQUIRE_POSTGRES || '
 const clickRateLimit = Math.max(0, Number(process.env.CLICK_RATE_LIMIT || 120));
 const clickRateWindowMs = Math.max(1000, Number(process.env.CLICK_RATE_WINDOW_MS || 60000));
 const rateBuckets = new Map();
+const adminAllowedIps = parseAdminAllowedIps(process.env.ADMIN_ALLOWED_IPS);
+const adminIpAllowed = (req) => !adminAllowedIps.length || adminAllowedIps.some((rule) => ipMatches(normalizeIp(clientIp(req)), rule));
 // Offers store { url, postbackUrl } objects. Old saves with bare strings are migrated on load.
 const offers = new Map([
   ['offer-1', { url: process.env.OFFER_1_URL || 'https://example.com/', postbackUrl: null }],
@@ -131,7 +146,8 @@ function parseList(raw, normalize, valid) {
 
 function parseConditions(raw = {}) {
   const lower = (v) => String(v).toLowerCase().slice(0, 20);
-  return {
+  const text = (v) => String(v).trim().toLowerCase().slice(0, 200);
+  const out = {
     countries: parseList(raw.countries, (g) => String(g).toUpperCase().slice(0, 2), (g) => /^[A-Z]{2}$/.test(g)),
     devices: parseList(raw.devices, lower, (d) => ['mobile', 'tablet', 'desktop'].includes(d)),
     os: parseList(raw.os, lower, (o) => ['android', 'ios', 'windows', 'macos', 'linux', 'other'].includes(o)),
@@ -142,25 +158,44 @@ function parseConditions(raw = {}) {
     ...(raw.mode === 'or' ? { mode: 'or' } : {}),
     ...scheduleConditions(raw),
   };
+  // Newer conditions are stored only when set, so existing streams keep their exact shape.
+  for (const key of ['referrers', 'keywords', 'userAgents']) { const list = parseList(raw[key], text, (v) => v.length > 0); if (list.length) out[key] = list; }
+  if (typeof raw.emptyReferrer === 'boolean') out.emptyReferrer = raw.emptyReferrer;
+  const ips = parseIpRules(raw.ips).slice(0, 50);
+  if (ips.length) out.ips = ips;
+  if (raw.params && typeof raw.params === 'object' && !Array.isArray(raw.params)) {
+    const params = {};
+    for (const [f, values] of Object.entries(raw.params)) {
+      const list = TRACK_FIELDS.includes(f) ? parseList(values, (v) => String(v).trim().slice(0, 200), (v) => v.length > 0) : [];
+      if (list.length) params[f] = list;
+    }
+    if (Object.keys(params).length) out.params = params;
+  }
+  const not = [...new Set(parseList(raw.not, String, (k) => CONDITION_KEYS.includes(k) && conditionSet(out, k)))];
+  if (not.length) out.not = not;
+  return out;
 }
 
-// Day parting (Keitaro «Расписание»): ISO weekdays 1 (Mon) … 7 (Sun) and hours 0–23 in an IANA time zone.
+// Day parting (Keitaro «Расписание»): ISO weekdays 1 (Mon) … 7 (Sun), hours 0–23 and an inclusive date range, in an IANA time zone.
 // Only stored when set, so streams without a schedule keep their original shape.
 function validTimeZone(tz) {
   try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); return true; } catch { return false; }
 }
+const isoDate = (v) => (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) && !Number.isNaN(Date.parse(`${v}T00:00:00Z`))
+  && new Date(`${v}T00:00:00Z`).toISOString().startsWith(v) ? v : null);
 function scheduleConditions(raw) {
   const days = [...new Set(parseList(raw.days, Number, (d) => Number.isInteger(d) && d >= 1 && d <= 7))].sort((a, b) => a - b);
   const hours = [...new Set(parseList(raw.hours, Number, (h) => Number.isInteger(h) && h >= 0 && h <= 23))].sort((a, b) => a - b);
-  if (!days.length && !hours.length) return {};
+  const dateFrom = isoDate(raw.dateFrom); const dateTo = isoDate(raw.dateTo);
+  if (!days.length && !hours.length && !dateFrom && !dateTo) return {};
   const tz = typeof raw.tz === 'string' && validTimeZone(raw.tz) ? raw.tz : 'UTC';
-  return { ...(days.length ? { days } : {}), ...(hours.length ? { hours } : {}), tz };
+  return { ...(days.length ? { days } : {}), ...(hours.length ? { hours } : {}), ...(dateFrom ? { dateFrom } : {}), ...(dateTo ? { dateTo } : {}), tz };
 }
 const WEEKDAY = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 };
 function localDayHour(tz, date) {
-  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short', hour: 'numeric', hourCycle: 'h23' })
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short', hour: 'numeric', hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit' })
     .formatToParts(date).map((p) => [p.type, p.value]));
-  return { day: WEEKDAY[parts.weekday], hour: Number(parts.hour) };
+  return { day: WEEKDAY[parts.weekday], hour: Number(parts.hour), date: `${parts.year}-${parts.month}-${parts.day}` };
 }
 
 function parseOfferWeights(raw) {
@@ -214,19 +249,53 @@ function weightedPick(items) {
   return items[items.length - 1];
 }
 
+// Stream conditions: [label, (conditions, visitor, local time) → [actual, matched]]. Lists match any value; `not` inverts a condition.
+const includesAny = (hay, needles) => Boolean(hay) && needles.some((n) => String(hay).toLowerCase().includes(n));
+function referrerText(ref) {
+  if (!ref) return '';
+  try { const u = new URL(ref); return (u.host + u.pathname).toLowerCase(); } catch { return String(ref).toLowerCase().slice(0, 500); }
+}
+const CONDITIONS = {
+  // Unknown country (no GEOIP_DB) / ISP (no GEOIP_ASN_DB) never matches, so geo streams fall through to others.
+  countries: ['страна', (c, v) => [v.country, c.countries.includes(v.country)]],
+  devices: ['устройство', (c, v) => [v.device, c.devices.includes(v.device)]],
+  os: ['ОС', (c, v) => [v.os, c.os.includes(v.os)]],
+  browsers: ['браузер', (c, v) => [v.browser, c.browsers.includes(v.browser)]],
+  languages: ['язык', (c, v) => [v.language, c.languages.includes(v.language)]],
+  isps: ['провайдер', (c, v) => [v.isp, includesAny(v.isp, c.isps)]],
+  days: ['день недели', (c, v, t) => [t.day, c.days.includes(t.day)]],
+  hours: ['час', (c, v, t) => [t.hour, c.hours.includes(t.hour)]],
+  dateFrom: ['дата с', (c, v, t) => [t.date, t.date >= c.dateFrom], '≥'],
+  dateTo: ['дата по', (c, v, t) => [t.date, t.date <= c.dateTo], '≤'],
+  referrers: ['реферер', (c, v) => { const r = referrerText(v.referrer); return [r || null, includesAny(r, c.referrers)]; }],
+  emptyReferrer: ['пустой реферер', (c, v) => [v.referrer ? 'нет' : 'да', !v.referrer === c.emptyReferrer], '='],
+  keywords: ['ключевое слово', (c, v) => [v.params?.keyword, includesAny(v.params?.keyword, c.keywords)]],
+  ips: ['IP', (c, v) => [v.ip, Boolean(v.ip) && c.ips.some((r) => ipMatches(v.ip, r))]],
+  userAgents: ['User-Agent', (c, v) => [v.userAgent, includesAny(v.userAgent, c.userAgents)]],
+};
+const CONDITION_KEYS = [...Object.keys(CONDITIONS), 'params'];
+const conditionSet = (c, k) => (k === 'emptyReferrer' ? typeof c[k] === 'boolean' : k === 'params' ? Object.keys(c.params || {}).length > 0 : Boolean(c[k]?.length));
+function conditionChecks(c, visitor) {
+  const local = c.days?.length || c.hours?.length || c.dateFrom || c.dateTo ? localDayHour(c.tz || 'UTC', visitor.now || new Date()) : {};
+  const not = new Set(c.not || []);
+  const out = Object.entries(CONDITIONS).filter(([k]) => conditionSet(c, k)).map(([k, [label, test, op]]) => {
+    const [actual, ok] = test(c, visitor, local);
+    return { key: k, condition: label, expected: [].concat(c[k] === true ? 'да' : c[k] === false ? 'нет' : c[k]), actual: actual ?? null, ok: ok !== not.has(k), ...(op ? { op } : {}) };
+  });
+  // Each tracked parameter (after paramMap) is its own check: exact match against the listed values.
+  for (const [f, values] of Object.entries(c.params || {})) {
+    const actual = visitor.params?.[f] ?? null;
+    out.push({ key: 'params', condition: `параметр ${f}`, expected: values, actual, ok: values.includes(actual) !== not.has('params') });
+  }
+  return out;
+}
+
 function streamMatches(stream, visitor) {
   const c = stream.conditions;
   if (!c) return true;
-  // Unknown country (no GEOIP_DB) never matches a country condition, so geo streams fall through to others.
-  const local = c.days?.length || c.hours?.length ? localDayHour(c.tz || 'UTC', visitor.now || new Date()) : {};
-  const checks = [[c.countries, visitor.country], [c.devices, visitor.device], [c.os, visitor.os], [c.browsers, visitor.browser], [c.languages, visitor.language],
-    [c.days, local.day], [c.hours, local.hour]]
-    .filter(([values]) => values?.length)
-    .map(([values, actual]) => values.includes(actual));
-  // Unknown ISP (no GEOIP_ASN_DB) never matches, like an unknown country.
-  if (c.isps?.length) checks.push(Boolean(visitor.isp) && c.isps.some((i) => visitor.isp.toLowerCase().includes(i)));
+  const checks = conditionChecks(c, visitor);
   if (!checks.length) return true;
-  return c.mode === 'or' ? checks.some(Boolean) : checks.every(Boolean);
+  return c.mode === 'or' ? checks.some((x) => x.ok) : checks.every((x) => x.ok);
 }
 
 // Keitaro order: first matching forced stream → weighted among matching regular → first matching fallback.
@@ -249,14 +318,9 @@ function pickStream(streams, visitor = {}, excluded = new Set(), rotation = 'wei
 }
 
 // Traffic simulation (Keitaro «Симуляция трафика»): where would this visitor go and why. Records nothing.
-const CONDITION_LABELS = { countries: 'страна', devices: 'устройство', os: 'ОС', browsers: 'браузер', languages: 'язык', isps: 'провайдер', days: 'день недели', hours: 'час' };
 function explainStream(stream, visitor) {
   const c = stream.conditions || {};
-  const local = c.days?.length || c.hours?.length ? localDayHour(c.tz || 'UTC', visitor.now || new Date()) : {};
-  const actual = { countries: visitor.country, devices: visitor.device, os: visitor.os, browsers: visitor.browser, languages: visitor.language, isps: visitor.isp, days: local.day, hours: local.hour };
-  const checks = Object.keys(CONDITION_LABELS).filter((k) => c[k]?.length).map((k) => ({
-    condition: CONDITION_LABELS[k], expected: c[k], actual: actual[k] ?? null,
-    ok: k === 'isps' ? Boolean(visitor.isp) && c.isps.some((i) => visitor.isp.toLowerCase().includes(i)) : c[k].includes(actual[k]) }));
+  const checks = conditionChecks(c, visitor).map(({ key, ...check }) => ({ ...check, ...(c.not?.includes(key) ? { not: true } : {}) }));
   return { checks, matches: streamMatches(stream, visitor), mode: c.mode === 'or' ? 'or' : 'and' };
 }
 
@@ -269,7 +333,8 @@ async function simulateClick(input, canSee) {
   if (Number.isNaN(at.getTime())) return { error: 'invalid_at' };
   const visitor = { device: detectDevice(ua), os: detectOS(ua), browser: detectBrowser(ua), language: /^[a-z]{2}$/.test(lang) ? lang : null,
     country: /^[A-Za-z]{2}$/.test(input.country || '') ? input.country.toUpperCase() : (ip ? lookupCountry(ip) : null),
-    isp: input.isp ? String(input.isp).slice(0, 120) : network?.isp || null, now: at };
+    isp: input.isp ? String(input.isp).slice(0, 120) : network?.isp || null, now: at,
+    referrer: input.referrer ? String(input.referrer).trim().slice(0, 2048) : null, userAgent: ua, ip };
   const query = new URLSearchParams(String(input.query || '').replace(/^\?/, ''));
   const steps = [];
   const finish = (result) => ({ visitor: { ...visitor, now: at.toISOString(), datacenter: network?.datacenter ?? null }, steps, result });
@@ -280,6 +345,7 @@ async function simulateClick(input, canSee) {
     if (!c || !canSee(c)) return finish({ outcome: 'error', status: 404, reason: `кампания ${campaignId} не найдена` });
     const step = { campaign: campaignId, name: c.name, checks: [] };
     steps.push(step);
+    visitor.params = trackedParams(query, c.paramMap);
     if (!c.active) step.checks.push({ check: 'кампания включена', ok: false, note: 'на живом трафике будет 404' });
     if (ip && c.blockedIps?.some((r) => ipMatches(ip, r))) return finish({ outcome: 'blocked', status: 403, reason: 'IP в чёрном списке кампании' });
     if (ip && c.allowedIps?.length && !c.allowedIps.some((r) => ipMatches(ip, r))) return finish({ outcome: 'blocked', status: 403, reason: 'IP не в белом списке кампании' });
@@ -318,8 +384,7 @@ async function simulateClick(input, canSee) {
     }
     if (top.action === 'not_found') return finish({ outcome: 'not_found', status: 404, reason: `поток «${top.name}» отвечает 404` });
     const bot = (c.botFilter && isBot(ua)) || (c.datacenterAsBot && network?.datacenter);
-    const params = {};
-    for (const field of TRACK_FIELDS) { const v = query.get(c.paramMap?.[field] || field); if (v) params[field] = v.slice(0, 255); }
+    const params = visitor.params;
     const destinations = top.action === 'url' ? [{ url: top.url, share: 100 }]
       : (() => { const live = (top.offers || [{ offerId: top.offerId, weight: 1 }]).filter((o) => !capped.has(o.offerId)); const total = live.reduce((t, o) => t + (o.weight || 1), 0);
         return live.map((o) => { const used = routing.substitutes.get(o.offerId) || o.offerId;
@@ -360,17 +425,31 @@ function detectBrowser(ua) {
   return 'other';
 }
 
+// Tracked parameters come from the query via the campaign's paramMap, so /r/:campaign sets `params` per campaign hop.
 function visitorProfile(req) {
   const ua = req.headers['user-agent'] || '';
   const lang = String(req.headers['accept-language'] || '').trim().slice(0, 2).toLowerCase();
+  const ip = normalizeIp(clientIp(req));
   return { device: detectDevice(ua), os: detectOS(ua), browser: detectBrowser(ua), language: /^[a-z]{2}$/.test(lang) ? lang : null, country: lookupCountry(clientIp(req)),
-    isp: lookupAsn(normalizeIp(clientIp(req)))?.isp || null };
+    isp: lookupAsn(ip)?.isp || null, referrer: req.headers.referer || null, userAgent: ua, ip: ip || null, params: {} };
 }
 
 // Replace known macros in URL templates (offer URLs and S2S postback URLs).
 // Traffic-source parameters recorded per click (Keitaro "Параметры" tab). paramMap renames the query key per campaign.
 const TRACK_FIELDS = ['keyword', 'source', 'external_id', 'creative_id', 'ad_campaign_id', ...Array.from({ length: 30 }, (_, i) => `sub_id_${i + 1}`)];
 const MAPPABLE_FIELDS = [...TRACK_FIELDS, 'cost'];
+// sub_id_1..30 sent with a postback (G6): they overwrite the click's parameters. Empty values are ignored.
+const SUB_ID_FIELDS = TRACK_FIELDS.filter((field) => field.startsWith('sub_id_'));
+function postbackClickParams(query) {
+  const params = {};
+  for (const field of SUB_ID_FIELDS) { const v = query.get(field); if (v) params[field] = v.slice(0, 255); }
+  return params;
+}
+function trackedParams(query, paramMap) {
+  const params = {};
+  for (const field of TRACK_FIELDS) { const v = query.get(paramMap?.[field] || field); if (v) params[field] = v.slice(0, 255); }
+  return params;
+}
 function parseParamMap(raw) {
   const out = {};
   if (!raw || typeof raw !== 'object') return out;
@@ -499,6 +578,19 @@ function ipMatches(ip, rule) {
   return Math.floor(ipInt / block) === Math.floor(baseInt / block);
 }
 
+// ADMIN_ALLOWED_IPS: comma-separated IPs / IPv4 CIDRs allowed to reach the panel, /api and /stats.
+// Env only, so nobody can lock the team out from the UI. A typo must not silently open the panel,
+// so any invalid rule stops the server instead of being dropped.
+function parseAdminAllowedIps(raw) {
+  const items = String(raw || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const rules = parseIpRules(items);
+  if (rules.length !== items.length) {
+    const bad = items.filter((item) => !rules.includes(normalizeIp(item)));
+    throw new Error(`ADMIN_ALLOWED_IPS: неверные правила: ${bad.join(', ')}`);
+  }
+  return rules;
+}
+
 function parseIpRules(raw) {
   if (!Array.isArray(raw)) return [];
   return raw.map(normalizeIp).filter((r) => {
@@ -534,15 +626,27 @@ async function isDuplicateClick(campaign, ip, windowMinutes) {
 // Sum revenue from conversions today for a campaign. Non-fatal — returns 0 on error.
 // Conversions with statuses: a click's latest conversion event wins. Events written before statuses existed are sales.
 // "Conversions" = lead + sale; revenue counts only sales (lead amounts are pending revenue).
+// Keyed by click and tid: upsells (other tids) are separate conversions of the same click.
 function latestConversions(lines) {
   const latest = new Map();
-  for (const item of lines) if (item?.type === 'conversion') latest.set(item.clickId, item);
+  for (const item of lines) if (item?.type === 'conversion') latest.set(conversionKey(item), item);
   return latest;
+}
+// clickId → [conversions] (main conversion and upsells).
+function conversionsByClick(conversions) {
+  const byClick = new Map();
+  for (const cv of conversions) { const list = byClick.get(cv.clickId); if (list) list.push(cv); else byClick.set(cv.clickId, [cv]); }
+  return byClick;
+}
+// sub_id_N sent with postbacks overwrite the click's parameters (journal order; PostgreSQL does the same in the mirror).
+function withPostbackParams(lines) {
+  const updates = new Map();
+  for (const item of lines) if (item?.type === 'conversion' && item.params) updates.set(item.clickId, { ...(updates.get(item.clickId) || {}), ...item.params });
+  if (!updates.size) return lines;
+  return lines.map((item) => (item?.type === 'click' && updates.has(item.clickId) ? { ...item, params: { ...(item.params || {}), ...updates.get(item.clickId) } } : item));
 }
 const conversionCounts = (cv) => ['lead', 'sale'].includes(cv?.status || 'sale');
 const saleRevenue = (cv) => ((cv?.status || 'sale') === 'sale' ? Number(cv.revenue) || 0 : 0);
-const SQL_CONVERSIONS = "COUNT(cv.click_id) FILTER (WHERE cv.status IN ('lead', 'sale'))";
-const SQL_REVENUE = "COALESCE(SUM(cv.revenue) FILTER (WHERE cv.status = 'sale'), 0)";
 
 async function todayRevenue(campaign) {
   const today = new Date().toISOString().slice(0, 10);
@@ -579,6 +683,9 @@ function parseOffer(raw) {
   const urlStr = typeof raw === 'string' ? raw : String(raw?.url || '');
   if (!/^https:\/\//i.test(urlStr)) return null;
   const postbackUrl = raw?.postbackUrl && /^https:\/\//i.test(String(raw.postbackUrl)) ? String(raw.postbackUrl).slice(0, 2048) : null;
+  const payoutType = raw?.payoutType === 'cpc' ? 'cpc' : 'cpa';
+  const payout = raw?.payout === null || raw?.payout === undefined || raw?.payout === '' ? null : (Number.isFinite(Number(raw.payout)) && Number(raw.payout) >= 0 ? Number(raw.payout) : null);
+  const payoutCurrency = /^[A-Z]{3}$/i.test(String(raw?.payoutCurrency || '')) ? String(raw.payoutCurrency).toUpperCase() : null;
   const dailyCap = Number.isInteger(raw?.dailyCap) && raw.dailyCap > 0 ? raw.dailyCap : null;
   const name = typeof raw?.name === 'string' && raw.name.trim() ? raw.name.trim().slice(0, 200) : null;
   const networkId = OFFER_ID_RE.test(String(raw?.networkId || '')) ? String(raw.networkId) : null;
@@ -586,8 +693,16 @@ function parseOffer(raw) {
   const conversionCap = Number.isInteger(raw?.conversionCap) && raw.conversionCap > 0 ? raw.conversionCap : null;
   const capTz = typeof raw?.capTz === 'string' && validTimeZone(raw.capTz) ? raw.capTz : 'UTC';
   const altOfferId = OFFER_ID_RE.test(String(raw?.altOfferId || '')) ? String(raw.altOfferId) : null;
-  return { url: urlStr, postbackUrl, dailyCap, name, networkId, archived: raw?.archived === true, group: typeof raw?.group === 'string' ? raw.group.trim().slice(0, 60) : '',
+  return { url: urlStr, postbackUrl, payoutType, payout, payoutCurrency, dailyCap, name, networkId, archived: raw?.archived === true, group: typeof raw?.group === 'string' ? raw.group.trim().slice(0, 60) : '',
     conversionCap, capTz, altOfferId };
+}
+
+// Validation of the payout fields in POST/PATCH /api/offers (absent fields are not checked).
+function payoutError(body) {
+  if (body.payoutType !== undefined && body.payoutType !== null && !['cpa', 'cpc'].includes(body.payoutType)) return 'invalid_payout_type';
+  if (body.payout !== undefined && body.payout !== null && body.payout !== '' && !/^\d{1,8}(?:\.\d{1,4})?$/.test(String(body.payout))) return 'invalid_payout';
+  if (body.payoutCurrency !== undefined && body.payoutCurrency !== null && body.payoutCurrency !== '' && !/^[A-Z]{3}$/i.test(String(body.payoutCurrency))) return 'invalid_payout_currency';
+  return null;
 }
 
 // Validation of the conversion-cap fields in POST/PATCH /api/offers (absent fields are not checked).
@@ -604,8 +719,8 @@ function conversionCapError(id, body) {
 async function loadOffers() {
   if (db) {
     try {
-      const { rows } = await db.query('SELECT id, url, postback_url, daily_cap, name, network_id, "group", archived, conversion_cap, cap_tz, alt_offer_id FROM offers');
-      for (const row of rows) if (/^[a-z0-9_-]{2,80}$/i.test(row.id) && /^https:\/\//i.test(row.url)) offers.set(row.id, parseOffer({ url: row.url, postbackUrl: row.postback_url, dailyCap: row.daily_cap, name: row.name, networkId: row.network_id, group: row.group, archived: row.archived === true,
+      const { rows } = await db.query('SELECT id, url, postback_url, payout_type, payout, payout_currency, daily_cap, name, network_id, "group", archived, conversion_cap, cap_tz, alt_offer_id FROM offers');
+      for (const row of rows) if (/^[a-z0-9_-]{2,80}$/i.test(row.id) && /^https:\/\//i.test(row.url)) offers.set(row.id, parseOffer({ url: row.url, postbackUrl: row.postback_url, payoutType: row.payout_type, payout: row.payout, payoutCurrency: row.payout_currency, dailyCap: row.daily_cap, name: row.name, networkId: row.network_id, group: row.group, archived: row.archived === true,
         conversionCap: row.conversion_cap, capTz: row.cap_tz, altOfferId: row.alt_offer_id }));
       return;
     } catch (error) { console.warn('[db] offers load fallback:', error.message); }
@@ -627,7 +742,7 @@ async function saveOffers() {
 
 async function persistOffer(id, value) {
   const offer = typeof value === 'string' ? { url: value, postbackUrl: null } : value;
-  if (db) await db.query('INSERT INTO offers (id, url, postback_url, daily_cap, name, network_id, "group", archived, conversion_cap, cap_tz, alt_offer_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (id) DO UPDATE SET url = EXCLUDED.url, postback_url = EXCLUDED.postback_url, daily_cap = EXCLUDED.daily_cap, name = EXCLUDED.name, network_id = EXCLUDED.network_id, "group" = EXCLUDED."group", archived = EXCLUDED.archived, conversion_cap = EXCLUDED.conversion_cap, cap_tz = EXCLUDED.cap_tz, alt_offer_id = EXCLUDED.alt_offer_id', [id, offer.url, offer.postbackUrl, offer.dailyCap ?? null, offer.name ?? null, offer.networkId ?? null, offer.group ?? '', offer.archived === true, offer.conversionCap ?? null, offer.capTz || 'UTC', offer.altOfferId ?? null]);
+  if (db) await db.query('INSERT INTO offers (id, url, postback_url, daily_cap, name, network_id, "group", archived, conversion_cap, cap_tz, alt_offer_id, payout_type, payout, payout_currency) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) ON CONFLICT (id) DO UPDATE SET url = EXCLUDED.url, postback_url = EXCLUDED.postback_url, payout_type = EXCLUDED.payout_type, payout = EXCLUDED.payout, payout_currency = EXCLUDED.payout_currency, daily_cap = EXCLUDED.daily_cap, name = EXCLUDED.name, network_id = EXCLUDED.network_id, "group" = EXCLUDED."group", archived = EXCLUDED.archived, conversion_cap = EXCLUDED.conversion_cap, cap_tz = EXCLUDED.cap_tz, alt_offer_id = EXCLUDED.alt_offer_id', [id, offer.url, offer.postbackUrl, offer.dailyCap ?? null, offer.name ?? null, offer.networkId ?? null, offer.group ?? '', offer.archived === true, offer.conversionCap ?? null, offer.capTz || 'UTC', offer.altOfferId ?? null, offer.payoutType || 'cpa', offer.payout ?? null, offer.payoutCurrency ?? null]);
   else await saveOffers();
 }
 
@@ -803,16 +918,16 @@ async function stats({ campaign = null, allowed = null, from = null, to = null, 
           COUNT(c.lp_clicked_at)::int             AS lp_clicks,
           COUNT(c.click_id)::int                  AS clicks,
           COUNT(c.click_id) FILTER (WHERE c.is_unique_campaign)::int AS unique_clicks,
-          ${SQL_CONVERSIONS}::int                 AS conversions,
-          ${fx.revenue}::float                    AS revenue,
-          COUNT(cv.click_id) FILTER (WHERE cv.status = 'lead')::int     AS leads,
-          COUNT(cv.click_id) FILTER (WHERE cv.status = 'sale')::int     AS sales,
-          COUNT(cv.click_id) FILTER (WHERE cv.status = 'rejected')::int AS rejected,
-          COUNT(cv.click_id) FILTER (WHERE cv.status = 'trash')::int    AS trash,
-          ${fx.pending}::float AS pending_revenue,
+          ${fx.sum('conversions')}::int           AS conversions,
+          (${fx.sum('revenue')} + ${fx.clickRevenue})::float AS revenue,
+          ${fx.sum('leads')}::int                 AS leads,
+          ${fx.sum('sales')}::int                 AS sales,
+          ${fx.sum('rejected')}::int              AS rejected,
+          ${fx.sum('trash')}::int                 AS trash,
+          ${fx.sum('pending')}::float AS pending_revenue,
           ${fx.cost}::float                       AS cost
         FROM clicks c
-        LEFT JOIN conversions cv USING (click_id)
+        ${fx.join}
         ${where}
         GROUP BY c.campaign, c.country, c.offer_id, c.stream, c.landing_id
       `, params);
@@ -852,11 +967,11 @@ async function stats({ campaign = null, allowed = null, from = null, to = null, 
     });
     const visibleClickIds = new Set(clicks.map((c) => c.clickId));
     const conversions = [...latestConversions(lines).values()].filter((item) => visibleClickIds.has(item.clickId));
-    const conversionByClick = new Map(conversions.map((item) => [item.clickId, item]));
+    const conversionByClick = conversionsByClick(conversions);
     const lpClicked = new Set(lines.filter((item) => item.type === 'lp_click').map((item) => item.clickId));
     const report = { ...reportFromEvents(clicks.map((c) => convertClickCost(lpClicked.has(c.clickId) ? { ...c, lpClicked: true } : c, currency)), conversions.map((cv) => convertConversion(cv, currency))), currency };
     report.bySource = Object.create(null); report.byNetwork = Object.create(null);
-    for (const click of clicks) { const source = campaigns.get(click.campaign)?.sourceId || 'none'; const network = offers.get(click.offerId)?.networkId || 'none'; const cv = conversionByClick.get(click.clickId); const one = reportFromEvents([click], cv ? [cv] : []); for (const [key,id] of [['bySource',source],['byNetwork',network]]) { report[key][id] ||= { clicks:0, conversions:0, revenue:0, cost:0, uniqueClicks:0 }; for (const f of ['clicks','conversions','revenue','cost','uniqueClicks','leads','sales','rejected','trash','pendingRevenue']) report[key][id][f] = (report[key][id][f] || 0) + (one[f] || 0); } }
+    for (const click of clicks) { const source = campaigns.get(click.campaign)?.sourceId || 'none'; const network = offers.get(click.offerId)?.networkId || 'none'; const one = reportFromEvents([click], conversionByClick.get(click.clickId) || []); for (const [key,id] of [['bySource',source],['byNetwork',network]]) { report[key][id] ||= { clicks:0, conversions:0, revenue:0, cost:0, uniqueClicks:0 }; for (const f of ['clicks','conversions','revenue','cost','uniqueClicks','leads','sales','rejected','trash','pendingRevenue']) report[key][id][f] = (report[key][id][f] || 0) + (one[f] || 0); } }
     report.bySource = Object.fromEntries(Object.entries(report.bySource).map(([k,v]) => [k, metrics(v)])); report.byNetwork = Object.fromEntries(Object.entries(report.byNetwork).map(([k,v]) => [k, metrics(v)]));
     return report;
   } catch (error) {
@@ -879,9 +994,9 @@ async function paramReport({ field, campaign, allowed = null, from, to, currency
       if (to) { values.push(`${to}T23:59:59Z`); conditions.push(`c.created_at <= $${values.length}`); }
       const fx = sqlFx(values, currency);
       const { rows } = await db.query(`
-        SELECT ${isColumn ? `COALESCE(c.${field}, '')` : "COALESCE(c.params->>$1, '')"} AS value, COUNT(c.click_id)::int AS clicks, COUNT(c.click_id) FILTER (WHERE c.is_unique_campaign IS DISTINCT FROM false)::int AS unique_clicks, ${SQL_CONVERSIONS}::int AS conversions,
-          ${fx.revenue}::float AS revenue, ${fx.cost}::float AS cost
-        FROM clicks c LEFT JOIN conversions cv USING (click_id)
+        SELECT ${isColumn ? `COALESCE(c.${field}, '')` : "COALESCE(c.params->>$1, '')"} AS value, COUNT(c.click_id)::int AS clicks, COUNT(c.click_id) FILTER (WHERE c.is_unique_campaign IS DISTINCT FROM false)::int AS unique_clicks, ${fx.sum('conversions')}::int AS conversions,
+          (${fx.sum('revenue')} + ${fx.clickRevenue})::float AS revenue, ${fx.cost}::float AS cost
+        FROM clicks c ${fx.join}
         ${conditions.length ? 'WHERE ' + conditions.join(' AND ') : ''}
         GROUP BY 1 ORDER BY clicks DESC LIMIT 500`, values);
       return rows.map(metrics);
@@ -892,7 +1007,8 @@ async function paramReport({ field, campaign, allowed = null, from, to, currency
   catch (error) { if (error.code !== 'ENOENT') throw error; }
   const fromMs = from ? Date.parse(`${from}T00:00:00Z`) : null;
   const toMs = to ? Date.parse(`${to}T23:59:59Z`) : null;
-  const conv = latestConversions(lines);
+  lines = withPostbackParams(lines);
+  const conv = conversionsByClick(latestConversions(lines).values());
   const groups = new Map();
   for (const click of lines) {
     if (click.type !== 'click' || (campaign && click.campaign !== campaign) || (allowed && !allowed.includes(click.campaign))) continue;
@@ -900,9 +1016,9 @@ async function paramReport({ field, campaign, allowed = null, from, to, currency
     if ((fromMs !== null && t < fromMs) || (toMs !== null && t > toMs)) continue;
     const key = (isColumn ? click[field] : click.params?.[field]) ?? '';
     const g = groups.get(key) || { value: key, clicks: 0, uniqueClicks: 0, conversions: 0, revenue: 0, cost: 0 };
-    const cv = conv.get(click.clickId);
     g.clicks += 1; if (click.uniqueCampaign !== false) g.uniqueClicks += 1; g.cost += (Number(click.cost) || 0) * rates.factor(rates.defaultCurrency, currency);
-    if (cv && conversionCounts(cv)) { g.conversions += 1; g.revenue += saleRevenue(cv) * rates.factor(cv.currency, currency); }
+    g.revenue += (Number(click.revenue) || 0) * rates.factor(rates.defaultCurrency, currency);
+    for (const cv of conv.get(click.clickId) || []) if (conversionCounts(cv)) { g.conversions += 1; g.revenue += saleRevenue(cv) * rates.factor(cv.currency, currency); }
     groups.set(key, g);
   }
   return [...groups.values()].sort((a, b) => b.clicks - a.clicks).slice(0, 500).map(metrics);
@@ -1027,6 +1143,12 @@ const recordPostback = createConversionRecorder({
   currentConversion: (clickId, tid) => findRecordedConversion({ clickId, tid, eventsFile, db,
     onFallback: (error) => console.warn('[db] currentConversion fallback:', error.message) }),
   windowDaysForClick: (click) => campaigns.get(click.campaign)?.conversionWindowDays,
+  // A postback without revenue earns the CPA offer's payout (CPC offers are paid per click, not here).
+  defaultRevenue: (click) => {
+    const offer = offers.get(click.offerId);
+    return offer?.payoutType === 'cpa' && offer.payout !== null && offer.payout !== undefined
+      ? { revenue: String(offer.payout), currency: offer.payoutCurrency } : null;
+  },
   record: (payload) => event('conversion', payload),
   onRecorded: ({ click, clickId, revenue, currency, status, recorded }) => {
     // Recount the offer's conversion cap now and again once PostgreSQL has the conversion.
@@ -1058,6 +1180,8 @@ async function sessionUser(req) {
 // X-Requested-With: umbrella — a cross-site form cannot set it, which blocks CSRF.
 async function adminAuthorized(req) {
   if (bearerAuthorized(req)) return true;
+  // A personal API key arrives in the Authorization header, which a cross-site form cannot set.
+  if (req.apiKey) return true;
   if (req.user) return req.method === 'GET' || req.headers['x-requested-with'] === 'umbrella';
   return !adminToken && !requireLogin && (await users.count()) === 0;
 }
@@ -1227,7 +1351,7 @@ async function readAudit({ entity, id, limit }) {
 
 async function handleAuthRoute(req, res, url) {
   const path = url.pathname;
-  const csrfOk = req.headers['x-requested-with'] === 'umbrella' || bearerAuthorized(req);
+  const csrfOk = req.headers['x-requested-with'] === 'umbrella' || bearerAuthorized(req) || Boolean(req.apiKey);
   if (path === '/api/auth/me' && req.method === 'GET') {
     const count = await users.count();
     return json(res, 200, { user: req.user, setupRequired: count === 0, loginRequired: requireLogin || count > 0 });
@@ -1285,6 +1409,37 @@ async function handleAuthRoute(req, res, url) {
     await audit(req, 'delete', 'user', id, { email: target.email, role: target.role }, null);
     return json(res, 200, { ok: true });
   }
+  // Read-only: the allowlist comes from ADMIN_ALLOWED_IPS only.
+  if (path === '/api/security' && req.method === 'GET') {
+    if (!isOwner) return json(res, 403, { error: 'owner_only' });
+    return json(res, 200, { adminAllowedIps, clientIp: normalizeIp(clientIp(req)) || null, trustProxy: trustProxyHops });
+  }
+  // Personal API keys: everyone manages their own, the owner (and ADMIN_TOKEN) sees and revokes all.
+  if (path === '/api/keys' || path.startsWith('/api/keys/')) {
+    if (!req.user && !bearerAuthorized(req)) return json(res, 401, { error: 'login_required' });
+    if (path === '/api/keys' && req.method === 'GET') {
+      const all = url.searchParams.get('all') === '1';
+      if (all && !isOwner) return json(res, 403, { error: 'owner_only' });
+      return json(res, 200, { keys: await users.listApiKeys(all || !req.user ? null : req.user.id) });
+    }
+    if (path === '/api/keys' && req.method === 'POST') {
+      if (!req.user) return json(res, 400, { error: 'user_required' });
+      // A leaked key must not be able to mint more keys that outlive its revocation.
+      if (req.apiKey) return json(res, 403, { error: 'session_required' });
+      const { key, secret } = await users.createApiKey(req.user.id, body.name);
+      await audit(req, 'create', 'api_key', key.id, null, { name: key.name, userId: key.userId, last4: key.last4 });
+      return json(res, 201, { key, secret });
+    }
+    const keyDelete = path.match(/^\/api\/keys\/([0-9a-f-]{36})$/);
+    if (keyDelete && req.method === 'DELETE') {
+      const target = await users.getApiKey(keyDelete[1]);
+      // Someone else's key looks the same as a missing one.
+      if (!target || (!isOwner && target.userId !== req.user?.id)) return json(res, 404, { error: 'key_not_found' });
+      await users.deleteApiKey(target.id);
+      await audit(req, 'delete', 'api_key', target.id, { name: target.name, userId: target.userId, last4: target.last4 }, null);
+      return json(res, 200, { ok: true });
+    }
+  }
   return json(res, 404, { error: 'not_found' });
 }
 
@@ -1296,7 +1451,14 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
       return res.end('Not Found');
     }
-    req.user = await sessionUser(req);
+    if (!isTrackingPath(url.pathname) && !adminIpAllowed(req)) return json(res, 403, { error: 'admin_ip_not_allowed' });
+    const authorization = String(req.headers.authorization || '');
+    if (!isTrackingPath(url.pathname) && authorization.startsWith(`Bearer ${API_KEY_PREFIX}`)) {
+      const found = await users.userForApiKey(authorization.slice('Bearer '.length));
+      if (!found) return json(res, 401, { error: 'invalid_api_key' });
+      req.user = found.user;
+      req.apiKey = found.key;
+    } else req.user = await sessionUser(req);
     if (requireLogin && isPrivatePath(url.pathname) && !req.user && !bearerAuthorized(req)) {
       if (url.pathname === '/dashboard') { res.writeHead(302, { location: `${basePath}/admin` }); return res.end(); }
       return json(res, 401, { error: 'login_required' });
@@ -1305,7 +1467,8 @@ const server = http.createServer(async (req, res) => {
       req.scope = campaignScope(req, url.searchParams.get('campaign') || null);
       if (req.scope.forbidden) return json(res, 403, { error: 'campaign_not_yours' });
     }
-    if (url.pathname.startsWith('/api/auth/') || url.pathname === '/api/users' || url.pathname.startsWith('/api/users/')) {
+    if (url.pathname.startsWith('/api/auth/') || url.pathname === '/api/users' || url.pathname.startsWith('/api/users/')
+      || url.pathname === '/api/keys' || url.pathname.startsWith('/api/keys/') || url.pathname === '/api/security') {
       return await handleAuthRoute(req, res, url);
     }
     const logAsset = new Map([['/assets/event-logs.js', ['event-logs.js', 'text/javascript']],
@@ -1408,11 +1571,7 @@ const server = http.createServer(async (req, res) => {
       const subid = url.searchParams.get('subid') || null;
 
       // Apply URL macros then append any missing UTM params.
-      const params = {};
-      for (const field of TRACK_FIELDS) {
-        const value = url.searchParams.get(c.paramMap?.[field] || field);
-        if (value) params[field] = value.slice(0, 255);
-      }
+      const params = trackedParams(url.searchParams, c.paramMap);
       let cost = 0;
       if (c.costModel === 'cpc') {
         const rawCost = c.costFromParam ? url.searchParams.get(c.paramMap?.cost || 'cost') : null;
@@ -1430,6 +1589,10 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
+      // CPC offer: the payout is earned per click and booked on the click in DEFAULT_CURRENCY (like cost).
+      const cpcOffer = offers.get(offerId);
+      const clickRevenue = cpcOffer?.payoutType === 'cpc' && cpcOffer.payout
+        ? Math.round(cpcOffer.payout * rates.factor(cpcOffer.payoutCurrency || rates.defaultCurrency, rates.defaultCurrency) * 1e6) / 1e6 : 0;
       // Streams with countClicks=false redirect normally but stay out of logs and reports, as in Keitaro.
       if (countClick) {
         const visitor = `${ip}|${req.headers['user-agent'] || ''}`;
@@ -1440,7 +1603,7 @@ const server = http.createServer(async (req, res) => {
         const lang = String(req.headers['accept-language'] || '').trim().slice(0, 2).toLowerCase();
         await event('click', { clickId, campaign: campaignId, offerId, path: url.pathname, referrer: req.headers.referer || null, userAgent: req.headers['user-agent'] || null, subid, country, ip,
           device, os, browser, language: /^[a-z]{2}$/.test(lang) ? lang : null,
-          ...(network ? { asn: network.asn, isp: network.isp, datacenter: network.datacenter } : {}), stream: streamName, ...extra, ...(Object.keys(params).length ? { params } : {}), ...(cost ? { cost } : {}) });
+          ...(network ? { asn: network.asn, isp: network.isp, datacenter: network.datacenter } : {}), stream: streamName, ...extra, ...(Object.keys(params).length ? { params } : {}), ...(cost ? { cost } : {}), ...(clickRevenue ? { revenue: clickRevenue } : {}) });
         if (totalCount !== null && totalCount + 1 >= c.totalCap) await pauseCampaign(campaignId, 'total_cap_reached');
       }
       return sendRedirect(res, destination.toString(), c.redirectMethod);
@@ -1456,6 +1619,7 @@ const server = http.createServer(async (req, res) => {
         const c = campaigns.get(campaignId);
         if (!c || !c.active) return json(res, 404, { error: 'campaign_not_found_or_inactive' });
         if (!c.streams?.length) return json(res, 404, { error: 'no_streams_configured' });
+        visitor.params = trackedParams(url.searchParams, c.paramMap);
         const routing = await offerRouting(c.streams);
         const picked = pickStream(c.streams, visitor, routing.excluded, c.streamRotation);
         // A conversion-capped offer hands the click to its alternative; the click is recorded with the offer actually used.
@@ -1504,8 +1668,10 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/postback' && req.method === 'GET') {
       if (postbackSecret && !safeEqual(url.searchParams.get('secret'), postbackSecret)) return json(res, 401, { error: 'invalid_postback_secret' });
       try {
+        // `payout` is an alias of `revenue`; without either, a CPA offer's payout is used (see recordPostback).
         const result = await recordPostback({ clickId: url.searchParams.get('click_id'),
-          tid: url.searchParams.get('tid'), params: Object.fromEntries([...url.searchParams].filter(([k]) => /^sub_id_[1-9]$|^sub_id_[12][0-9]$|^sub_id_30$/.test(k))), revenue: url.searchParams.get('revenue'), currency: url.searchParams.get('currency'), status: url.searchParams.get('status') });
+          tid: url.searchParams.get('tid'), params: postbackClickParams(url.searchParams),
+          revenue: url.searchParams.get('revenue') || url.searchParams.get('payout'), currency: url.searchParams.get('currency'), status: url.searchParams.get('status') });
         return json(res, 200, result);
       } catch (error) {
         if (!error.statusCode) throw error;
@@ -1689,9 +1855,9 @@ const server = http.createServer(async (req, res) => {
       const body = await readJson(req);
       if (!/^[a-z0-9_-]{2,80}$/i.test(String(body.id || '')) || !/^https:\/\//i.test(String(body.url || ''))) return json(res, 400, { error: 'id_and_https_url_required' });
       if (body.networkId !== undefined && body.networkId !== null && !networks.has(String(body.networkId))) return json(res, 400, { error: 'network_not_found' });
-      const capError = conversionCapError(String(body.id), body);
+      const capError = conversionCapError(String(body.id), body) || payoutError(body);
       if (capError) return json(res, 400, { error: capError });
-      const offer = parseOffer({ url: String(body.url), postbackUrl: body.postbackUrl, dailyCap: body.dailyCap, name: body.name, networkId: body.networkId, archived: body.archived, group: body.group,
+      const offer = parseOffer({ url: String(body.url), postbackUrl: body.postbackUrl, payoutType: body.payoutType, payout: body.payout, payoutCurrency: body.payoutCurrency, dailyCap: body.dailyCap, name: body.name, networkId: body.networkId, archived: body.archived, group: body.group,
         conversionCap: body.conversionCap, capTz: body.capTz, altOfferId: body.altOfferId });
       if (!offer) return json(res, 400, { error: 'id_and_https_url_required' });
       offers.set(String(body.id), offer);
@@ -1717,9 +1883,9 @@ const server = http.createServer(async (req, res) => {
       const newPostbackUrl = body.postbackUrl !== undefined ? body.postbackUrl : cur.postbackUrl;
       const newDailyCap = body.dailyCap !== undefined ? body.dailyCap : cur.dailyCap;
       if (body.networkId !== undefined && body.networkId !== null && !networks.has(String(body.networkId))) return json(res, 400, { error: 'network_not_found' });
-      const capError = conversionCapError(id, body);
+      const capError = conversionCapError(id, body) || payoutError(body);
       if (capError) return json(res, 400, { error: capError });
-      const updated = parseOffer({ url: newUrl, postbackUrl: newPostbackUrl, dailyCap: newDailyCap, name: body.name !== undefined ? body.name : cur.name, networkId: body.networkId !== undefined ? body.networkId : cur.networkId, archived: body.archived !== undefined ? body.archived : cur.archived, group: body.group !== undefined ? body.group : cur.group,
+      const updated = parseOffer({ url: newUrl, postbackUrl: newPostbackUrl, payoutType: body.payoutType !== undefined ? body.payoutType : cur.payoutType, payout: body.payout !== undefined ? body.payout : cur.payout, payoutCurrency: body.payoutCurrency !== undefined ? body.payoutCurrency : cur.payoutCurrency, dailyCap: newDailyCap, name: body.name !== undefined ? body.name : cur.name, networkId: body.networkId !== undefined ? body.networkId : cur.networkId, archived: body.archived !== undefined ? body.archived : cur.archived, group: body.group !== undefined ? body.group : cur.group,
         conversionCap: body.conversionCap !== undefined ? body.conversionCap : cur.conversionCap, capTz: body.capTz !== undefined ? body.capTz : cur.capTz, altOfferId: body.altOfferId !== undefined ? body.altOfferId : cur.altOfferId });
       if (!updated) return json(res, 400, { error: 'invalid_url' });
       offers.set(id, updated);
@@ -1890,11 +2056,11 @@ const server = http.createServer(async (req, res) => {
               DATE_TRUNC('${trunc}', c.created_at) AS bucket,
               COUNT(c.click_id)::int                AS clicks,
               COUNT(c.click_id) FILTER (WHERE c.is_unique_campaign)::int AS unique_clicks,
-              ${SQL_CONVERSIONS}::int               AS conversions,
-              ${fx.revenue}::float                  AS revenue,
+              ${fx.sum('conversions')}::int         AS conversions,
+              (${fx.sum('revenue')} + ${fx.clickRevenue})::float AS revenue,
               ${fx.cost}::float                     AS cost
             FROM clicks c
-            LEFT JOIN conversions cv USING (click_id)
+            ${fx.join}
             ${where}
             GROUP BY bucket ORDER BY bucket
           `, params);
@@ -1926,6 +2092,7 @@ const server = http.createServer(async (req, res) => {
           buckets[b].clicks += 1;
           if (click.uniqueCampaign) buckets[b].uniqueClicks += 1;
           buckets[b].cost += Number(click.cost) * rates.factor(rates.defaultCurrency, tsCurrency) || 0;
+          buckets[b].revenue += Number(click.revenue) * rates.factor(rates.defaultCurrency, tsCurrency) || 0;
         }
         for (const conv of convs) {
           const b = clickBucket.get(conv.clickId) || '';

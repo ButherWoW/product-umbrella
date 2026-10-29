@@ -32,6 +32,9 @@ await db.query(`
 `);
 await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT true`);
 await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS postback_url TEXT`);
+await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS payout_type TEXT NOT NULL DEFAULT 'cpa'`);
+await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS payout NUMERIC(12,4)`);
+await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS payout_currency TEXT`);
 
 await db.query(`
   CREATE TABLE IF NOT EXISTS clicks (
@@ -88,6 +91,8 @@ await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS datacenter BOOLEAN`)
 for (const column of ['is_unique_campaign', 'is_unique_stream', 'is_unique_global']) await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS ${column} BOOLEAN NOT NULL DEFAULT true`);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS params JSONB`);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS cost NUMERIC(12,6) NOT NULL DEFAULT 0`);
+// CPC offer payout earned by the click (DEFAULT_CURRENCY).
+await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS revenue NUMERIC(12,6) NOT NULL DEFAULT 0`);
 
 await db.query(`
   CREATE TABLE IF NOT EXISTS conversions (
@@ -101,8 +106,10 @@ await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS status TEXT NOT
 await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ`);
 await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS tid TEXT NOT NULL DEFAULT ''`);
 await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS params JSONB`);
-await db.query(`ALTER TABLE conversions DROP CONSTRAINT IF EXISTS conversions_pkey`);
+// Upsells (G6): one row per (click_id, tid); tid '' is the main conversion. The new unique index is created
+// before the old primary key on click_id is dropped, so uniqueness never lapses.
 await db.query(`CREATE UNIQUE INDEX IF NOT EXISTS conversions_click_tid_idx ON conversions(click_id, tid)`);
+await db.query(`ALTER TABLE conversions DROP CONSTRAINT IF EXISTS conversions_pkey`);
 
 await db.query(`
   CREATE TABLE IF NOT EXISTS users (
@@ -122,6 +129,19 @@ await db.query(`
   )
 `);
 await db.query(`CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id)`);
+// Per-user API keys: only the SHA-256 of the secret and its last 4 characters are stored.
+await db.query(`
+  CREATE TABLE IF NOT EXISTS api_keys (
+    id           UUID        PRIMARY KEY,
+    user_id      UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name         TEXT        NOT NULL,
+    key_hash     TEXT        NOT NULL UNIQUE,
+    last4        TEXT        NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_used_at TIMESTAMPTZ
+  )
+`);
+await db.query(`CREATE INDEX IF NOT EXISTS api_keys_user_idx ON api_keys(user_id)`);
 
 await db.query(`CREATE INDEX IF NOT EXISTS clicks_campaign_created_idx ON clicks(campaign, created_at)`);
 await db.query(`CREATE INDEX IF NOT EXISTS clicks_created_idx ON clicks(created_at)`);

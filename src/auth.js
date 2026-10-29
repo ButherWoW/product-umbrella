@@ -28,6 +28,8 @@ export async function verifyPassword(password, stored) {
 // Real hash of a random password: unknown emails take as long to reject as wrong passwords.
 const DUMMY_HASH = await hashPassword(randomBytes(12).toString('hex'));
 const tokenHash = (token) => createHash('sha256').update(String(token)).digest('hex');
+export const API_KEY_PREFIX = 'umb_';
+const API_KEY_TOUCH_MS = 60 * 1000;
 const publicUser = (u) => (u ? { id: u.id, email: u.email, role: u.role, createdAt: new Date(u.created_at ?? u.createdAt).toISOString() } : null);
 
 export function validateCredentials({ email, password, role = 'buyer' }) {
@@ -38,9 +40,19 @@ export function validateCredentials({ email, password, role = 'buyer' }) {
   return { email: normalized, password, role };
 }
 
+// The secret itself is never stored: only its SHA-256 (lookup key) and the last 4 characters for display.
+const publicKey = (k) => (k ? { id: k.id, name: k.name, last4: k.last4, userId: k.user_id, ...(k.email ? { email: k.email } : {}),
+  createdAt: new Date(k.created_at).toISOString(), lastUsedAt: k.last_used_at ? new Date(k.last_used_at).toISOString() : null } : null);
+export function validateKeyName(name) {
+  const normalized = String(name ?? '').trim();
+  if (!normalized || normalized.length > 60) throw fail('invalid_key_name', 400);
+  return normalized;
+}
+
 export function createUserStore({ db = null, dataDir }) {
   const usersFile = join(dataDir, 'users.json');
   const sessionsFile = join(dataDir, 'sessions.json');
+  const keysFile = join(dataDir, 'api_keys.json');
   let chain = Promise.resolve();
   // Serializes read-modify-write cycles on the JSON files.
   const locked = (fn) => { const run = chain.then(fn, fn); chain = run.catch(() => {}); return run; };
@@ -86,6 +98,7 @@ export function createUserStore({ db = null, dataDir }) {
       await locked(async () => {
         await save(usersFile, (await load(usersFile)).filter((u) => u.id !== id));
         await save(sessionsFile, (await load(sessionsFile)).filter((s) => s.user_id !== id));
+        await save(keysFile, (await load(keysFile)).filter((k) => k.user_id !== id));
       });
     },
     async createSession(userId) {
@@ -110,6 +123,61 @@ export function createUserStore({ db = null, dataDir }) {
       const hash = tokenHash(token);
       if (db) { await db.query('DELETE FROM sessions WHERE token_hash = $1', [hash]); return; }
       await locked(async () => save(sessionsFile, (await load(sessionsFile)).filter((s) => s.token_hash !== hash)));
+    },
+    // Returns the secret exactly once; afterwards only its hash exists.
+    async createApiKey(userId, name) {
+      const secret = API_KEY_PREFIX + randomBytes(32).toString('base64url');
+      const row = { id: randomUUID(), user_id: userId, name: validateKeyName(name), key_hash: tokenHash(secret), last4: secret.slice(-4), created_at: new Date().toISOString(), last_used_at: null };
+      if (db) await db.query('INSERT INTO api_keys (id, user_id, name, key_hash, last4, created_at) VALUES ($1,$2,$3,$4,$5,$6)', [row.id, row.user_id, row.name, row.key_hash, row.last4, row.created_at]);
+      else await locked(async () => save(keysFile, [...(await load(keysFile)), row]));
+      return { key: publicKey(row), secret };
+    },
+    // userId: only that user's keys; null: every key, with the owner's email.
+    async listApiKeys(userId = null) {
+      if (db) {
+        const { rows } = await db.query(`SELECT k.*, u.email FROM api_keys k JOIN users u ON u.id = k.user_id ${userId ? 'WHERE k.user_id = $1' : ''} ORDER BY k.created_at`, userId ? [userId] : []);
+        return rows.map(publicKey);
+      }
+      const all = await load(usersFile);
+      return (await load(keysFile)).filter((k) => !userId || k.user_id === userId)
+        .map((k) => publicKey({ ...k, email: all.find((u) => u.id === k.user_id)?.email || null }));
+    },
+    async getApiKey(id) {
+      if (db) return publicKey((await db.query('SELECT * FROM api_keys WHERE id = $1', [id])).rows[0]);
+      return publicKey((await load(keysFile)).find((k) => k.id === id));
+    },
+    async deleteApiKey(id) {
+      if (db) { await db.query('DELETE FROM api_keys WHERE id = $1', [id]); return; }
+      await locked(async () => save(keysFile, (await load(keysFile)).filter((k) => k.id !== id)));
+    },
+    // Looks the key up by its SHA-256, so no secret is ever compared byte by byte. lastUsedAt is written
+    // at most once a minute per key to keep API traffic from turning into a write per request.
+    async userForApiKey(secret) {
+      if (!String(secret || '').startsWith(API_KEY_PREFIX)) return null;
+      const hash = tokenHash(secret);
+      const now = Date.now();
+      if (db) {
+        const { rows } = await db.query('SELECT k.id AS key_id, k.name AS key_name, k.last_used_at, u.* FROM api_keys k JOIN users u ON u.id = k.user_id WHERE k.key_hash = $1', [hash]);
+        const row = rows[0];
+        if (!row) return null;
+        if (!row.last_used_at || now - new Date(row.last_used_at).getTime() >= API_KEY_TOUCH_MS) {
+          await db.query('UPDATE api_keys SET last_used_at = now() WHERE id = $1', [row.key_id]);
+        }
+        return { user: publicUser(row), key: { id: row.key_id, name: row.key_name } };
+      }
+      const key = (await load(keysFile)).find((k) => k.key_hash === hash);
+      const user = key && (await load(usersFile)).find((u) => u.id === key.user_id);
+      if (!user) return null;
+      if (!key.last_used_at || now - Date.parse(key.last_used_at) >= API_KEY_TOUCH_MS) {
+        await locked(async () => {
+          const keys = await load(keysFile);
+          const current = keys.find((k) => k.id === key.id);
+          if (!current) return;
+          current.last_used_at = new Date(now).toISOString();
+          await save(keysFile, keys);
+        });
+      }
+      return { user: publicUser(user), key: { id: key.id, name: key.name } };
     },
   };
 }

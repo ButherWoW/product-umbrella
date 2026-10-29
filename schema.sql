@@ -13,6 +13,9 @@ CREATE TABLE IF NOT EXISTS offers (
   url text NOT NULL CHECK (url ~ '^https://'),
   active boolean NOT NULL DEFAULT true,
   postback_url text,
+  payout_type text NOT NULL DEFAULT 'cpa',
+  payout numeric(12,4),
+  payout_currency text,
   daily_cap integer,
   name text,
   created_at timestamptz NOT NULL DEFAULT now()
@@ -53,6 +56,7 @@ CREATE TABLE IF NOT EXISTS clicks (
   stream text,
   params jsonb,
   cost numeric(12,6) NOT NULL DEFAULT 0,
+  revenue numeric(12,6) NOT NULL DEFAULT 0,
   landing_id text,
   lp_clicked_at timestamptz,
   is_unique_campaign boolean NOT NULL DEFAULT true,
@@ -70,16 +74,15 @@ CREATE TABLE IF NOT EXISTS clicks (
 
 CREATE TABLE IF NOT EXISTS conversions (
   click_id uuid NOT NULL REFERENCES clicks(click_id),
-  tid text NOT NULL DEFAULT '',
+  tid text NOT NULL DEFAULT '',  -- '' = main conversion; other values = upsells (postback tid)
   revenue numeric(12,4),
   currency text,
   status text NOT NULL DEFAULT 'sale' CHECK (status IN ('lead', 'sale', 'rejected', 'trash')),
+  params jsonb,                  -- sub_id_N sent with the postback
   updated_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX IF NOT EXISTS conversions_click_tid_idx ON conversions(click_id, tid);
-ALTER TABLE conversions ADD COLUMN IF NOT EXISTS tid TEXT NOT NULL DEFAULT '';
-ALTER TABLE conversions ADD COLUMN IF NOT EXISTS params JSONB;
 CREATE TABLE IF NOT EXISTS bots (
   id BIGSERIAL PRIMARY KEY, campaign TEXT NOT NULL, offer_id TEXT, stream TEXT,
   user_agent TEXT, ip TEXT, reason TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -105,6 +108,17 @@ CREATE TABLE IF NOT EXISTS sessions (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);
+
+CREATE TABLE IF NOT EXISTS api_keys (
+  id uuid PRIMARY KEY,
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  key_hash text NOT NULL UNIQUE,
+  last4 text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  last_used_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS api_keys_user_idx ON api_keys(user_id);
 
 CREATE TABLE IF NOT EXISTS landings (
   id text PRIMARY KEY,

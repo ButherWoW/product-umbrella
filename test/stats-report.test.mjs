@@ -77,3 +77,12 @@ test('conversion statuses: latest status wins, only sales are revenue, leads are
   assert.equal(report.revenue, 25, 'sales only: b (20) + legacy d (5)');
   assert.equal(report.pendingRevenue, 20);
 });
+
+test('upsells: each tid of a click is a conversion, the click counts once', () => {
+  const report = reportFromEvents([{ clickId: 'a', campaign: 'x', cost: 1 }], [
+    { clickId: 'a', status: 'sale', revenue: 10 },
+    { clickId: 'a', tid: 'up-1', status: 'lead', revenue: 4 }, { clickId: 'a', tid: 'up-1', status: 'sale', revenue: 4 },
+    { clickId: 'a', tid: 'up-2', status: 'rejected', revenue: 3 },
+  ]);
+  assert.deepEqual([report.clicks, report.conversions, report.sales, report.rejected, report.revenue, report.cost], [1, 2, 2, 1, 14, 1]);
+});

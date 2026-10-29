@@ -27,7 +27,7 @@ test('mirror keeps click before conversion while independent clicks run concurre
   release(); await draining;
   assert.equal(calls.length, 3);
   assert.ok(calls[2].sql.includes('INTO conversions'));
-  assert.deepEqual(calls[2].values, ['first', 0, 'USD', 'sale', at], 'no status in the event = sale');
+  assert.deepEqual(calls[2].values, ['first', '', 0, 'USD', 'sale', null, at], 'no status in the event = sale, no tid = main conversion');
   assert.equal(calls[0].values.at(-1), at, 'mirror preserves source event timestamp');
 });
 
@@ -52,4 +52,16 @@ test('unmirrored journal events do not query PostgreSQL and logging errors canno
   mirror.enqueue({ type: 'click', clickId: 'first', campaign: 'camp', offerId: 'offer', at });
   await assert.doesNotReject(mirror.drain());
   assert.equal(queries, 1);
+});
+
+test('mirror writes upsells per (click, tid) and applies postback sub_id_N to the click', async () => {
+  const calls = [];
+  const mirror = createEventMirror({ query: async (sql, values) => { calls.push({ sql, values }); } });
+  mirror.enqueue({ type: 'conversion', clickId: 'first', tid: 'upsell-1', revenue: 5, currency: 'EUR', status: 'sale', params: { sub_id_3: 'net' }, at });
+  await mirror.drain();
+  assert.equal(calls.length, 2);
+  assert.ok(calls[0].sql.includes('ON CONFLICT (click_id, tid)'));
+  assert.deepEqual(calls[0].values, ['first', 'upsell-1', 5, 'EUR', 'sale', '{"sub_id_3":"net"}', at], 'created_at stays the last parameter');
+  assert.ok(calls[1].sql.startsWith('UPDATE clicks SET params'));
+  assert.deepEqual(calls[1].values, ['first', '{"sub_id_3":"net"}']);
 });
