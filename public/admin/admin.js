@@ -151,6 +151,12 @@ function currencyControl(onChange) {
   return h('select', { class: 'select', 'aria-label': 'Валюта', title: 'Валюта отчётов', onchange: (e) => { currency.code = e.target.value; store.set('currency', currency.code); onChange(); } },
     codes.map((c) => h('option', { value: c, selected: c === currency.code }, c)));
 }
+// Multiplier from the default currency into the selected one (1 when rates are unknown — amounts are not converted then either).
+function currencyRate() {
+  const info = currency.info;
+  const from = info?.rates?.[info.defaultCurrency]; const to = info?.rates?.[currency.code];
+  return from > 0 && to > 0 ? to / from : 1;
+}
 function ratesNote() {
   const info = currency.info;
   if (!info?.updatedAt) return h('p', { class: 'muted rates-note' }, 'Курсы валют ещё не загружены — суммы в других валютах не пересчитываются.');
@@ -227,7 +233,7 @@ function tokenModal(reason) {
 }
 
 // ---------- data table (column chooser, sort, totals, search, pagination, export) ----------
-function dataTable({ id, columns, rows = [], selectable = false, pageSize = 50, rowClass, totals = true, serverPaging = null, empty = 'Нет данных', compact = false }) {
+function dataTable({ id, columns, rows = [], selectable = false, pageSize = 50, rowClass, totals = true, serverPaging = null, empty = 'Нет данных', compact = false, onRowClick = null }) {
   let data = rows;
   let sort = store.get('sort:' + id, null);
   let page = 0;
@@ -267,7 +273,11 @@ function dataTable({ id, columns, rows = [], selectable = false, pageSize = 50, 
       title: c.title || null,
       onclick: c.sortable === false ? null : () => { sort = sort?.key === c.key ? { key: c.key, dir: sort.dir === 'desc' ? 'asc' : 'desc' } : { key: c.key, dir: c.num ? 'desc' : 'asc' }; store.set('sort:' + id, sort); render(); },
     }, c.label, sort?.key === c.key ? (sort.dir === 'desc' ? ' ↓' : ' ↑') : ''))));
-    const tbody = h('tbody', {}, shown.length ? shown.map((r) => h('tr', { class: rowClass ? rowClass(r) : null },
+    // onRowClick: the whole row opens details (mouse or Enter on the focused row); links and controls inside keep their own action.
+    const rowAttrs = (r) => (onRowClick ? { tabindex: '0', style: 'cursor:pointer',
+      onclick: (e) => { if (!e.target.closest('a, button, input, select, label')) onRowClick(r); },
+      onkeydown: (e) => { if (e.key === 'Enter' && e.target === e.currentTarget) { e.preventDefault(); onRowClick(r); } } } : {});
+    const tbody = h('tbody', {}, shown.length ? shown.map((r) => h('tr', { class: rowClass ? rowClass(r) : null, ...rowAttrs(r) },
       selectable ? h('td', { class: 'sel' }, h('input', { type: 'checkbox', 'aria-label': 'Выбрать', checked: selected.has(r.id),
         onchange: (e) => { e.target.checked ? selected.add(r.id) : selected.delete(r.id); root.dispatchEvent(new Event('selection')); } })) : null,
       cols.map((c) => h('td', { class: [c.num ? 'num' : '', c.cls || ''].join(' '), title: c.tip ? c.tip(r) : null, 'data-label': c.label }, c.render ? c.render(r) : (valueOf(c, r) ?? '—')))))
@@ -481,7 +491,8 @@ async function pageDashboard() {
   const campSel = h('select', { class: 'select', 'aria-label': 'Кампания', onchange: () => load() }, h('option', { value: '' }, 'Все кампании'),
     Object.entries(state.campaigns).map(([id, c]) => h('option', { value: id }, c.name || id)));
   put(view, h('div', { class: 'page-head' }, h('h1', {}, 'Дашборд'),
-    h('div', { class: 'toolbar', style: 'margin:0' }, campSel, periodControl(() => load()), currencyControl(() => load()), h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'))), body);
+    h('div', { class: 'toolbar', style: 'margin:0' }, campSel, periodControl(() => load()), currencyControl(() => load()), h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'),
+      (state.me?.user?.role === 'owner' || !state.me?.loginRequired) ? h('button', { class: 'btn', title: 'Дневной план команды', onclick: () => goalsModal(() => load()) }, 'Цели') : null)), body);
   async function load() {
     const { from, to } = periodRange();
     const campaign = campSel.value || null;
@@ -495,7 +506,18 @@ async function pageDashboard() {
       const earningsTile = h('div', { class: 'kpi' + (isOwner ? ' kpi-edit' : ''), style: 'background:var(--k6)', title: isOwner ? 'Нажмите, чтобы изменить процент' : null,
         onclick: isOwner ? () => shareModal(sharePct, () => load()) : null },
         h('div', { class: 'k' }, `Заработок баера · ${sharePct.toLocaleString('ru-RU')}%`), h('div', { class: 'v' }, money(buyerEarnings)));
-      const kpi = (label, value, color) => h('div', { class: 'kpi', style: `background:${color}` }, h('div', { class: 'k' }, label), h('div', { class: 'v' }, value));
+      const kpi = (label, value, color, extra) => h('div', { class: 'kpi', style: `background:${color}` }, h('div', { class: 'k' }, label), h('div', { class: 'v' }, value), extra || null);
+      // Daily goals are stored in the default currency; shown only for «Сегодня», converted like every other amount.
+      const goalBar = (value, goal) => {
+        if (hideRev() || period.key !== 'today' || goal == null || !(Number(goal) > 0)) return null;
+        const target = Number(goal) * currencyRate();
+        const share = Math.max(0, value) / target;
+        const done = share >= 1;
+        return h('div', { class: 'goal' + (done ? ' done' : ''), title: `План на сегодня: ${money(target)}` },
+          h('div', { class: 'goal-track', role: 'progressbar', 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': Math.min(100, Math.round(share * 100)) },
+            h('div', { class: 'goal-fill', style: `width:${Math.min(100, share * 100).toFixed(1)}%` })),
+          h('div', { class: 'goal-cap' }, done ? 'план выполнен' : `${Math.floor(share * 100 + 1e-9)}% плана`));
+      };
       const small = (title, id, rows, nameOf, link) => h('div', { class: 'card' }, h('h2', {}, title), dataTable({
         id: 'dash-' + id, pageSize: 10, compact: true, rows: rows.sort((a, b) => b.clicks - a.clicks),
         columns: [{ key: 'id', label: title, fixed: true, cls: 'name', render: (r) => (link ? h('a', { href: link(r) }, nameOf(r)) : nameOf(r)) },
@@ -504,7 +526,7 @@ async function pageDashboard() {
       const top5 = (id, title, rows, nameOf, link) => h('div', { class: 'card' }, h('h2', {}, title), dataTable({ id: 'dash-t5-' + id, pageSize: 5, compact: true, totals: false, rows: [...rows].sort((a, b) => b.revenue - a.revenue).slice(0, 5), columns: [{ key: 'id', label: 'Название', fixed: true, cls: 'name', render: (r) => h('a', { href: link(r) }, nameOf(r)) }, ...metricCols().filter((c) => ['clicks', 'conversions', 'revenue', 'roi'].includes(c.key))] }));
       put(body, 
         h('div', { class: 'kpis' }, kpi('Клики', num(s.clicks), 'var(--k1)'), kpi('Уник. клики', num(s.uniqueClicks), 'var(--k2)'), kpi('Конверсии', num(s.conversions), 'var(--k3)'), kpi('CR', pct(ratio(s.conversions, s.clicks)), 'var(--k2)'),
-          hideRev() ? null : kpi('Доход', money(s.revenue), 'var(--k5)'), kpi('Расход', money(s.cost || 0), 'var(--k4)'), ...(hideRev() ? [] : [kpi('Прибыль', h('span', { class: profit >= 0 ? '' : 'neg' }, money(profit)), 'var(--k8)'), kpi('ROI', pct(ratio(profit, s.cost || 0)), 'var(--k9)'), earningsTile,
+          hideRev() ? null : kpi('Доход', money(s.revenue), 'var(--k5)', goalBar(s.revenue || 0, team.dailyRevenueGoal)), kpi('Расход', money(s.cost || 0), 'var(--k4)'), ...(hideRev() ? [] : [kpi('Прибыль', h('span', { class: profit >= 0 ? '' : 'neg' }, money(profit)), 'var(--k8)', goalBar(profit, team.dailyProfitGoal)), kpi('ROI', pct(ratio(profit, s.cost || 0)), 'var(--k9)'), earningsTile,
           kpi('EPC', money4(ratio(s.revenue, s.clicks)), 'var(--k6)'), kpi('RPM', money(ratio(s.revenue * 1000, s.clicks)), 'var(--k7)')]),
           botsData.bots?.length > 0 ? h('a', { href: '#/botlog' + (campaign ? qs({ campaign }) : ''), style: 'text-decoration:none' },
             h('div', { class: 'kpi', style: 'background:var(--bad)' }, h('div', { class: 'k' }, 'Боты'), h('div', { class: 'v' }, botsData.bots.length >= 1000 ? '1000+' : num(botsData.bots.length)))) : null),
@@ -573,6 +595,35 @@ async function pageDashboard() {
     } catch (e) { put(body, h('p', { class: 'err' }, 'Ошибка загрузки: ' + e.message)); }
   }
   load();
+}
+
+// Owner-only team plan: two daily goals in the default currency (empty field = no goal).
+async function goalsModal(onSaved) {
+  const team = await api('/api/settings').catch(() => ({}));
+  const base = currency.info?.defaultCurrency || 'EUR';
+  const values = { dailyRevenueGoal: team.dailyRevenueGoal ?? '', dailyProfitGoal: team.dailyProfitGoal ?? '' };
+  const input = (key, label) => h('input', { class: 'input', type: 'number', min: 0, step: '0.01', value: values[key], placeholder: 'нет', 'aria-label': label, oninput: (e) => { values[key] = e.target.value; } });
+  const err = h('p', { class: 'err' });
+  const close = openModal({
+    title: 'Цели',
+    body: h('div', {},
+      field(`Дневной план по доходу, ${base}`, input('dailyRevenueGoal', 'План по доходу')),
+      field(`Дневной план по прибыли, ${base}`, input('dailyProfitGoal', 'План по прибыли'),
+        'Цель команды на день. На дашборде за «Сегодня» плитки «Доход» и «Прибыль» показывают прогресс в выбранной валюте. Пустое поле — без цели.'),
+      err),
+    footer: [h('button', { class: 'btn', onclick: () => close() }, 'Отмена'), h('button', { class: 'btn primary', onclick: async () => {
+      const body = {};
+      for (const key of Object.keys(values)) {
+        const raw = String(values[key]).trim();
+        if (raw === '') { body[key] = null; continue; }
+        const n = Number(raw);
+        if (!Number.isFinite(n) || n < 0) { err.textContent = 'План — число от 0 или пустое поле.'; return; }
+        body[key] = n;
+      }
+      try { await api('/api/settings', { method: 'PATCH', body }); toast('Цели сохранены'); close(); onSaved(); }
+      catch (e) { err.textContent = e.message === 'owner_only' ? 'Менять цели может только владелец.' : 'Не сохранено: ' + e.message; }
+    } }, 'Сохранить')],
+  });
 }
 
 function shareModal(current, onSaved) {
@@ -1088,6 +1139,37 @@ async function pageCampaignEditor(id) {
     finally { saveBtn.disabled = false; }
   }
 
+  // Keitaro «Очистка статистики»: owners (or the admin key) only; the campaign id typed by hand confirms it.
+  function dangerZone() {
+    const c = { mode: 'all', before: '', typed: '' };
+    const msg = h('p', { class: 'err', role: 'status' });
+    const dateInput = h('input', { class: 'input', type: 'date', 'aria-label': 'Удалить данные до даты', disabled: true, oninput: (e) => { c.before = e.target.value; } });
+    const btn = h('button', { class: 'btn danger', disabled: true, onclick: async () => {
+      msg.textContent = '';
+      if (c.mode === 'before' && !c.before) { msg.textContent = 'Укажите дату.'; return; }
+      btn.disabled = true;
+      try {
+        const r = await api('/api/campaigns/' + encodeURIComponent(d.id) + '/clear-stats', { method: 'POST', body: { confirm: c.typed, ...(c.mode === 'before' ? { before: c.before } : {}) } });
+        const x = r.removed || {};
+        toast(`Удалено: ${num(x.clicks)} кликов, ${num(x.conversions)} конверсий, ${num(x.bots)} ботов`);
+        confirmInput.value = ''; c.typed = '';
+        loadStreamStats();
+      } catch (e) { msg.textContent = ({ owner_only: 'Очищать статистику может только владелец.', confirm_mismatch: 'Идентификатор введён неверно.', invalid_before_date: 'Неверная дата.' })[e.message] || 'Не удалось: ' + e.message; }
+      finally { btn.disabled = c.typed !== d.id; }
+    } }, 'Очистить статистику');
+    const confirmInput = h('input', { class: 'input', 'aria-label': 'Идентификатор кампании для подтверждения', placeholder: d.id, autocomplete: 'off',
+      oninput: (e) => { c.typed = e.target.value.trim(); btn.disabled = c.typed !== d.id; } });
+    return h('section', { class: 'danger-zone', 'aria-label': 'Очистить статистику' },
+      h('h3', {}, 'Очистить статистику'),
+      h('p', { class: 'muted' }, 'Удаляет клики, конверсии, клики по лендингам и ботов этой кампании из журнала и PostgreSQL. Отменить нельзя — вернуть можно только из ночного бэкапа.'),
+      field('Что удалить', h('div', { class: 'radios' },
+        h('label', {}, h('input', { type: 'radio', name: 'cclear', checked: true, onchange: () => { c.mode = 'all'; dateInput.disabled = true; } }), 'Всё'),
+        h('label', {}, h('input', { type: 'radio', name: 'cclear', onchange: () => { c.mode = 'before'; dateInput.disabled = false; } }), 'Старше даты')), null),
+      field('Клики до даты (UTC)', dateInput, 'Удаляются клики раньше этой даты вместе с их конверсиями.'),
+      field(`Введите «${d.id}» для подтверждения`, confirmInput),
+      btn, msg);
+  }
+
   put(view, 
     h('div', { class: 'editor-head' }, nameInput,
       h('div', { class: 'toolbar', style: 'margin:0' }, saveBtn,
@@ -1099,7 +1181,7 @@ async function pageCampaignEditor(id) {
         h('a', { class: 'btn', href: '#/campaigns' }, 'К списку'))),
     err,
     h('div', { class: 'editor' },
-      h('div', { class: 'left' }, left),
+      h('div', { class: 'left' }, left, !isNew && (isOwnerView() || !state.me?.user) ? dangerZone() : null),
       h('div', { class: 'right' },
         h('div', { class: 'toolbar' },
           h('button', { class: 'btn primary', onclick: () => streamModal({ name: `Flow ${d.streams.length + 1}`, type: 'regular', weight: 1, conditions: {}, offers: [] }, (s) => { d.streams.push(s); mark(); drawStreams(); }, true, d.id) }, 'Создать поток'),
@@ -1854,11 +1936,54 @@ function pageLog(kind, params) {
       const rows = (r[kind] || []).map((x) => ({ ...x, id: x.clickId }));
       last = { hasMore: Boolean(r.hasMore), rows: rows.length };
       table?.detach();
-      table = dataTable({ id: 'log-' + kind, columns, rows, serverPaging: paging, pageSize: limit, totals: !isClicks, empty: isClicks ? 'Кликов за период нет' : 'Конверсий за период нет' });
+      table = dataTable({ id: 'log-' + kind, columns, rows, serverPaging: paging, pageSize: limit, totals: !isClicks, empty: isClicks ? 'Кликов за период нет' : 'Конверсий за период нет', onRowClick: isClicks ? clickCard : null });
       put(holder, table);
     } catch (e) { put(holder, h('p', { class: 'err' }, 'Ошибка загрузки: ' + e.message)); }
   }
   return () => table?.detach();
+}
+
+const CONVERSION_STATUS = { lead: 'Лид', sale: 'Продажа', rejected: 'Отклонена', trash: 'Мусор' };
+// Click card: every field of one click. UA, referrer and params come from visitors — text nodes via h() only.
+function clickCard(r) {
+  const idEl = h('span', { class: 'mono', style: 'user-select:all' }, r.clickId);
+  const copy = () => {
+    // Called synchronously from the click handler so the clipboard permission applies.
+    const fallback = () => { window.getSelection()?.selectAllChildren(idEl); toast('Не удалось скопировать — ID выделен, нажмите Ctrl+C', true); };
+    try { navigator.clipboard.writeText(r.clickId).then(() => toast('Click ID скопирован'), fallback); } catch { fallback(); }
+  };
+  const yesNo = (v) => (v === true ? 'да' : v === false ? 'нет' : '—');
+  const params = Object.entries(r.params || {}).filter(([, v]) => v !== null && v !== undefined && v !== '');
+  const offerName = r.offerId && state.offers[r.offerId]?.name;
+  const landingName = r.landingId && state.landings[r.landingId]?.name;
+  const conversion = h('span', { class: 'muted' }, 'Загрузка…');
+  const rows = [
+    ['Дата и время', dt(r.at)],
+    ['Click ID', h('span', { style: 'display:inline-flex;flex-wrap:wrap;gap:8px;align-items:center' }, idEl, h('button', { class: 'btn', type: 'button', onclick: copy }, 'Копировать'))],
+    ['Кампания', r.campaign ? h('a', { href: '#/campaigns/' + encodeURIComponent(r.campaign) }, state.campaigns[r.campaign]?.name || r.campaign) : null],
+    ['Поток', r.stream],
+    ['Оффер', offerName ? `${offerName} (${r.offerId})` : r.offerId],
+    ['Лендинг', landingName ? `${landingName} (${r.landingId})` : r.landingId],
+    ['IP', r.ip], ['Страна', r.country],
+    ['Устройство', r.device], ['ОС', r.os], ['Браузер', r.browser], ['Язык', r.language],
+    r.isp ? ['Провайдер', r.isp] : null,
+    ['Реферер', r.referrer], ['Путь', r.path],
+    ['User Agent', r.userAgent],
+    ['Subid', r.subid],
+    ...params.map(([k, v]) => [k, String(v)]),
+    ['Расход', r.cost != null ? money(r.cost) : null],
+    ['Уникальность', `кампания: ${yesNo(r.uniqueCampaign)}, поток: ${yesNo(r.uniqueStream)}, глобально: ${yesNo(r.uniqueGlobal)}`],
+    ['Конверсия', conversion],
+  ].filter(Boolean);
+  openModal({ title: 'Клик', wide: true,
+    body: h('div', { class: 'kv' }, rows.map(([label, value]) => [h('div', { class: 'muted' }, label),
+      h('div', { class: 'kv-value' }, value === null || value === undefined || value === '' ? '—' : value)])) });
+  api('/api/conversions' + qs({ click: r.clickId, limit: 5 })).then((d) => {
+    const list = d.conversions || [];
+    put(conversion, list.length ? list.map((c) => h('div', {}, [CONVERSION_STATUS[c.status] || c.status || 'Продажа',
+      c.revenue == null ? null : amount(c.revenue) + (c.currency ? ' ' + c.currency : ''), dt(c.at)].filter(Boolean).join(' · '))) : 'нет');
+    conversion.className = '';
+  }).catch((e) => { put(conversion, 'Ошибка загрузки: ' + e.message); conversion.className = 'err'; });
 }
 
 // ---------- buyers report ----------
