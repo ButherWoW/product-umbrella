@@ -6,7 +6,8 @@ export function metrics(value) {
   const revenue = Number(value.revenue) || 0;
   const cost = Number(value.cost) || 0;
   const lpClicks = Number(value.lpClicks) || 0;
-  return { ...value, clicks, conversions, revenue, cost, lpClicks, lpCtr: clicks ? lpClicks / clicks : 0, profit: revenue - cost, cr: clicks ? conversions / clicks : 0,
+  const uniqueClicks = Number(value.uniqueClicks ?? value.unique_clicks) || 0;
+  return { ...value, clicks, uniqueClicks, conversions, revenue, cost, lpClicks, lpCtr: clicks ? lpClicks / clicks : 0, profit: revenue - cost, cr: clicks ? conversions / clicks : 0,
     epc: clicks ? revenue / clicks : 0, rpm: clicks ? revenue * 1000 / clicks : 0, roi: cost ? (revenue - cost) / cost : 0 };
 }
 

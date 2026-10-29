@@ -73,6 +73,11 @@ CREATE TABLE IF NOT EXISTS conversions (
   updated_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS bots (
+  id BIGSERIAL PRIMARY KEY, campaign TEXT NOT NULL, offer_id TEXT, stream TEXT,
+  user_agent TEXT, ip TEXT, reason TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS bots_campaign_created_idx ON bots(campaign, created_at);
 
 CREATE INDEX IF NOT EXISTS clicks_campaign_created_idx ON clicks(campaign, created_at);
 CREATE INDEX IF NOT EXISTS clicks_created_idx ON clicks(created_at);
