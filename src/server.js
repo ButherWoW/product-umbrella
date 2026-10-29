@@ -494,7 +494,7 @@ function parseSource(raw) {
   const paramMap = parseParamMap(raw?.paramMap);
   const costModel = raw?.costModel === 'cpc' ? 'cpc' : 'none';
   const cpc = Number.isFinite(Number(raw?.cpc)) && Number(raw.cpc) >= 0 ? Number(raw.cpc) : null;
-  return { name, paramMap, costModel, cpc, costFromParam: typeof raw?.costFromParam === 'string' ? raw.costFromParam.trim().slice(0, 64) || null : null };
+  return { name, paramMap, costModel, cpc, costFromParam: raw?.costFromParam === true || raw?.costFromParam === 'true' };
 }
 
 async function loadSources() {
@@ -1546,7 +1546,7 @@ const server = http.createServer(async (req, res) => {
       const ownerId = isBuyer(req) ? req.user.id : (body.ownerId ?? req.user?.id ?? null);
       const sourceDefaults = body.sourceId ? sources.get(String(body.sourceId)) : null;
       campaigns.set(String(body.id), parseCampaign(String(body.id), { ...body, ownerId,
-        ...(sourceDefaults ? { paramMap: body.paramMap ?? sourceDefaults.paramMap, costModel: body.costModel ?? sourceDefaults.costModel, cpc: body.cpc ?? sourceDefaults.cpc } : {}) }));
+        ...(sourceDefaults ? { paramMap: body.paramMap ?? sourceDefaults.paramMap, costModel: body.costModel ?? sourceDefaults.costModel, cpc: body.cpc ?? sourceDefaults.cpc, costFromParam: body.costFromParam ?? sourceDefaults.costFromParam } : {}) }));
       await persistCampaign(String(body.id), campaigns.get(String(body.id)));
       await audit(req, 'create', 'campaign', String(body.id), null, campaigns.get(String(body.id)));
       return json(res, 201, { id: body.id, ...campaigns.get(String(body.id)) });

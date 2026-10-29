@@ -62,7 +62,7 @@ await db.query(`
     param_map JSONB NOT NULL DEFAULT '{}'::jsonb,
     cost_model TEXT NOT NULL DEFAULT 'none',
     cpc NUMERIC(12,6),
-    cost_from_param TEXT,
+    cost_from_param BOOLEAN NOT NULL DEFAULT false,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
   )
 `);
