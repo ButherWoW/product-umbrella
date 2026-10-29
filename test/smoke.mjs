@@ -78,6 +78,7 @@ try {
   assert.equal(report.byCampaign['paid-test'].conversions, 1);
   assert.equal(report.byCampaign['camp-b'].clicks, 1);
   assert.equal(report.byCampaign['camp-b'].conversions, 1);
+  assert.ok(report.bySource && report.byNetwork);
   const exportResponse = await fetch('http://127.0.0.1:4199/stats/export?group=country');
   assert.equal(exportResponse.status, 200);
   assert.match(await exportResponse.text(), /group,clicks,conversions,revenue/);
