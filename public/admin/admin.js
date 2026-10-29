@@ -1330,6 +1330,18 @@ async function pageReports(params) {
       txt('country', 'Страна'), txt('stream', 'Поток'), txt('subid', 'Sub ID'),
       periodControl(() => load()), currencyControl(() => load()), compareLabel,
       listsBtn,
+      h('button', { class: 'btn', title: 'Скачать CSV', 'aria-label': 'CSV', onclick: () => {
+        const tbl = holder.querySelector('table.grid');
+        if (!tbl) { toast('Нет данных для экспорта', true); return; }
+        const esc = (v) => { const s = String(v ?? '').trim().replace(/\r/g, ''); const fc = s[0]; if (fc === '=' || fc === '+' || fc === '-' || fc === '@') return `"'${s.replace(/"/g, '""')}"`;  if (s.includes(',') || s.includes('"') || s.includes('\n')) return `"${s.replace(/"/g, '""')}"`;  return s; };
+        const hdr = [...tbl.querySelectorAll('thead tr:first-child th')].map((th) => esc(th.textContent.trim()));
+        const dataRows = [...tbl.querySelectorAll('tbody tr, tfoot tr')].filter((tr) => !tr.classList.contains('sub-row')).map((tr) => [...tr.querySelectorAll('td')].map((td) => esc(td.textContent.trim())).join(','));
+        const csv = '﻿' + [hdr.join(','), ...dataRows].join('\r\n');
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = Object.assign(document.createElement('a'), { href: url, download: 'report.csv' });
+        document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+      } }, 'CSV'),
       h('button', { class: 'btn', onclick: saveReport }, '💾 Сохранить'),
       h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'),
       h('button', { class: 'btn square', title: 'Колонки', 'aria-label': 'Колонки', onclick: () => table?.chooser() }, '⚙')),
