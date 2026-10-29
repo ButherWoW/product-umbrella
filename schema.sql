@@ -18,6 +18,15 @@ CREATE TABLE IF NOT EXISTS offers (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+ALTER TABLE offers ADD COLUMN IF NOT EXISTS network_id TEXT;
+ALTER TABLE offers ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE offers ADD COLUMN IF NOT EXISTS "group" TEXT NOT NULL DEFAULT '';
+CREATE TABLE IF NOT EXISTS networks (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, offer_params TEXT NOT NULL DEFAULT '',
+  click_id_param TEXT NOT NULL DEFAULT 'sub1', payout_param TEXT NOT NULL DEFAULT 'payout',
+  notes TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS clicks (
   click_id uuid PRIMARY KEY,
   campaign text NOT NULL,

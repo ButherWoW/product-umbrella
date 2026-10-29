@@ -29,6 +29,18 @@ try {
   const campaign = await fetch('http://127.0.0.1:4199/api/campaigns', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: 'paid-test', name: 'Paid test' }) });
   assert.equal(campaign.status, 201);
   assert.equal((await (await fetch('http://127.0.0.1:4199/api/campaigns')).json()).campaigns['paid-test'].name, 'Paid test');
+  const source = await fetch('http://127.0.0.1:4199/api/sources', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: 'meta', name: 'Meta Ads', costModel: 'cpc', cpc: 0.12, paramMap: { sub_id_1: 'ad_id' } }) });
+  assert.equal(source.status, 201);
+  const network = await fetch('http://127.0.0.1:4199/api/networks', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: 'acme', name: 'Acme Network', clickIdParam: 'sub1', payoutParam: 'payout' }) });
+  assert.equal(network.status, 201);
+  const linked = await fetch('http://127.0.0.1:4199/api/campaigns/paid-test', { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sourceId: 'meta' }) });
+  assert.equal((await linked.json()).sourceId, 'meta');
+  const networkOffer = await fetch('http://127.0.0.1:4199/api/offers/new-offer', { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ networkId: 'acme' }) });
+  assert.equal((await networkOffer.json()).networkId, 'acme');
+  const clonedCampaign = await fetch('http://127.0.0.1:4199/api/campaigns/paid-test/clone', { method: 'POST' });
+  assert.equal(clonedCampaign.status, 201); assert.equal((await clonedCampaign.json()).active, false);
+  const clonedOffer = await fetch('http://127.0.0.1:4199/api/offers/new-offer/clone', { method: 'POST' });
+  assert.equal(clonedOffer.status, 201); assert.equal((await clonedOffer.json()).archived, false);
   const paused = await fetch('http://127.0.0.1:4199/api/campaigns/paid-test', { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ active: false }) });
   assert.equal((await paused.json()).active, false);
   const resumed = await fetch('http://127.0.0.1:4199/api/campaigns/paid-test', { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ active: true }) });
@@ -72,6 +84,8 @@ try {
   const compareDate = new Date().toISOString().slice(0, 10);
   const compare = await (await fetch(`http://127.0.0.1:4199/stats/compare?from=${compareDate}&to=${compareDate}`)).json();
   assert.ok(compare.current && compare.previous && compare.deltaPct);
+  const bots = await (await fetch(`http://127.0.0.1:4199/stats/bots?from=${compareDate}&to=${compareDate}`)).json();
+  assert.deepEqual(bots, { total: 0, byCampaign: {} });
   const clickLog = await (await fetch('http://127.0.0.1:4199/api/clicks?campaign=paid-test&limit=10')).json();
   assert.ok(Array.isArray(clickLog.clicks));
   assert.ok(clickLog.clicks.length >= 1);
