@@ -344,6 +344,9 @@ const metricCols = (opts = {}) => [
   { key: 'conversions', label: 'Конв.', title: 'Конверсии', num: true, render: (r) => num(r.conversions), total: (rs) => num(sum(rs, 'conversions')) },
   { key: 'cr', label: 'CR', title: 'CR — коэффициент конверсии', num: true, value: (r) => ratio(r.conversions, r.clicks), render: (r) => pct(ratio(r.conversions, r.clicks)), total: (rs) => pct(ratio(sum(rs, 'conversions'), sum(rs, 'clicks'))) },
   { key: 'revenue', label: 'Доход', num: true, render: (r) => money(r.revenue), total: (rs) => money(sum(rs, 'revenue')) },
+  { key: 'cost', label: 'Расход', num: true, render: (r) => money(r.cost), total: (rs) => money(sum(rs, 'cost')) },
+  { key: 'profit', label: 'Прибыль', num: true, value: (r) => (r.revenue || 0) - (r.cost || 0), render: (r) => { const p = (r.revenue || 0) - (r.cost || 0); return h('span', { class: p >= 0 ? 'pos' : 'neg' }, money(p)); }, total: (rs) => { const p = sum(rs, 'revenue') - sum(rs, 'cost'); return h('span', { class: p >= 0 ? 'pos' : 'neg' }, money(p)); } },
+  { key: 'roi', label: 'ROI', num: true, value: (r) => ratio((r.revenue || 0) - (r.cost || 0), r.cost), render: (r) => pct(ratio((r.revenue || 0) - (r.cost || 0), r.cost)), total: (rs) => pct(ratio(sum(rs, 'revenue') - sum(rs, 'cost'), sum(rs, 'cost'))) },
   { key: 'epc', label: 'EPC', title: 'EPC — доход с клика', num: true, value: (r) => ratio(r.revenue, r.clicks), render: (r) => money4(ratio(r.revenue, r.clicks)), total: (rs) => money4(ratio(sum(rs, 'revenue'), sum(rs, 'clicks'))) },
   { key: 'rpm', label: 'RPM', title: 'RPM — доход на 1000 кликов', num: true, hidden: !opts.rpm, value: (r) => ratio(r.revenue * 1000, r.clicks), render: (r) => money(ratio(r.revenue * 1000, r.clicks)), total: (rs) => money(ratio(sum(rs, 'revenue') * 1000, sum(rs, 'clicks'))) },
   { key: 'leads', label: 'Лиды', title: 'Лиды — конверсии в ожидании', num: true, hidden: true, render: (r) => num(r.leads), total: (rs) => num(sum(rs, 'leads')) },
@@ -439,7 +442,7 @@ async function pageDashboard() {
       }));
       put(body, 
         h('div', { class: 'kpis' }, kpi('Клики', num(s.clicks), 'var(--k1)'), kpi('Уник. клики', num(s.uniqueClicks), 'var(--k2)'), kpi('Конверсии', num(s.conversions), 'var(--k3)'), kpi('CR', pct(ratio(s.conversions, s.clicks)), 'var(--k2)'),
-          kpi('Доход', money(s.revenue), 'var(--k5)'), kpi('Прибыль', h('span', { class: profit >= 0 ? '' : 'neg' }, money(profit)), 'var(--k4)'), earningsTile,
+          kpi('Доход', money(s.revenue), 'var(--k5)'), kpi('Расход', money(s.cost || 0), 'var(--k4)'), kpi('Прибыль', h('span', { class: profit >= 0 ? '' : 'neg' }, money(profit)), 'var(--k8)'), kpi('ROI', pct(ratio(profit, s.cost || 0)), 'var(--k9)'), earningsTile,
           kpi('EPC', money4(ratio(s.revenue, s.clicks)), 'var(--k6)'), kpi('RPM', money(ratio(s.revenue * 1000, s.clicks)), 'var(--k7)')),
         ratesNote(),
         h('div', { class: 'card', style: 'margin-bottom:14px' }, lineChart([
@@ -614,7 +617,6 @@ function summarizeConditions(c = {}) {
   if (c.os?.length) parts.push('ОС: ' + c.os.join(', '));
   if (c.browsers?.length) parts.push('Браузеры: ' + c.browsers.join(', '));
   if (c.languages?.length) parts.push('Языки: ' + c.languages.join(', '));
-  if (c.isps?.length) parts.push('Провайдеры: ' + c.isps.join(', '));
   if (c.days?.length) parts.push('Дни: ' + c.days.map((d) => DAY_NAMES[d]).join(', '));
   if (c.hours?.length) parts.push(`Часы: ${compactHours(c.hours)} (${c.tz || 'UTC'})`);
   return parts.length ? parts.join(c.mode === 'or' ? ' ИЛИ ' : ' · ') : 'Без фильтров';
@@ -622,7 +624,7 @@ function summarizeConditions(c = {}) {
 
 function streamModal(stream, onApply, isNew = false, currentCampaignId = null) {
   const s = structuredClone(stream);
-  s.conditions = { countries: [], devices: [], os: [], browsers: [], languages: [], isps: [], days: [], hours: [], ...(s.conditions || {}) };
+  s.conditions = { countries: [], devices: [], os: [], browsers: [], languages: [], days: [], hours: [], ...(s.conditions || {}) };
   s.action = s.action || 'offers';
   s.offers = s.offers || [];
   const err = h('p', { class: 'err' });
@@ -686,7 +688,6 @@ function streamModal(stream, onApply, isNew = false, currentCampaignId = null) {
       field('Операционные системы', checkGroup(COND.os, s.conditions.os, (v) => { s.conditions.os = v; })),
       field('Браузеры', checkGroup(COND.browsers, s.conditions.browsers, (v) => { s.conditions.browsers = v; })),
       field('Языки', h('input', { class: 'input', value: s.conditions.languages.join(', '), placeholder: 'fr, de', oninput: (e) => { s.conditions.languages = splitList(e.target.value).map((x) => x.toLowerCase()); } }), 'Два первых символа Accept-Language.'),
-      field('Провайдеры', h('input', { class: 'input', value: s.conditions.isps.join(', '), placeholder: 'orange, free mobile', oninput: (e) => { s.conditions.isps = splitList(e.target.value).map((x) => x.toLowerCase()); } }), 'Часть названия провайдера, как в отчёте «Провайдер». Без базы провайдеров условие не срабатывает.'),
       field('Дни недели', checkGroup([[1, 'Пн'], [2, 'Вт'], [3, 'Ср'], [4, 'Чт'], [5, 'Пт'], [6, 'Сб'], [7, 'Вс']], s.conditions.days, (v) => { s.conditions.days = v.map(Number); }), 'Пусто — любой день.'),
       field('Часы', h('input', { class: 'input', value: compactHours(s.conditions.hours), placeholder: '9-21', oninput: (e) => { s.conditions.hours = parseHours(e.target.value); } }), 'Например «9-21» или «0-6, 22-23». Пусто — круглосуточно.'),
       field('Часовой пояс расписания', h('select', { class: 'select', onchange: (e) => { s.conditions.tz = e.target.value; } },
