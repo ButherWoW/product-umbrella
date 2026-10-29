@@ -209,3 +209,6 @@ body.auth-mode .view { margin-left: 0; display: grid; place-items: start center;
 .check-line { display: flex; align-items: center; gap: 6px; margin: 4px 0; font-size: 13px; }
 .check-line[hidden] { display: none; }
 body.read-only:not(.auth-mode) .btn.primary, body.read-only:not(.auth-mode) .row-actions { display: none !important; }
+/* Key-value card (click details) */
+.kv { display: grid; grid-template-columns: minmax(100px, max-content) minmax(0, 1fr); gap: 6px 16px; align-items: baseline; }
+.kv-value { overflow-wrap: anywhere; }

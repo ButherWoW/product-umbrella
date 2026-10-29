@@ -233,7 +233,7 @@ function tokenModal(reason) {
 }
 
 // ---------- data table (column chooser, sort, totals, search, pagination, export) ----------
-function dataTable({ id, columns, rows = [], selectable = false, pageSize = 50, rowClass, totals = true, serverPaging = null, empty = 'Нет данных', compact = false }) {
+function dataTable({ id, columns, rows = [], selectable = false, pageSize = 50, rowClass, totals = true, serverPaging = null, empty = 'Нет данных', compact = false, onRowClick = null }) {
   let data = rows;
   let sort = store.get('sort:' + id, null);
   let page = 0;
@@ -273,7 +273,11 @@ function dataTable({ id, columns, rows = [], selectable = false, pageSize = 50, 
       title: c.title || null,
       onclick: c.sortable === false ? null : () => { sort = sort?.key === c.key ? { key: c.key, dir: sort.dir === 'desc' ? 'asc' : 'desc' } : { key: c.key, dir: c.num ? 'desc' : 'asc' }; store.set('sort:' + id, sort); render(); },
     }, c.label, sort?.key === c.key ? (sort.dir === 'desc' ? ' ↓' : ' ↑') : ''))));
-    const tbody = h('tbody', {}, shown.length ? shown.map((r) => h('tr', { class: rowClass ? rowClass(r) : null },
+    // onRowClick: the whole row opens details (mouse or Enter on the focused row); links and controls inside keep their own action.
+    const rowAttrs = (r) => (onRowClick ? { tabindex: '0', style: 'cursor:pointer',
+      onclick: (e) => { if (!e.target.closest('a, button, input, select, label')) onRowClick(r); },
+      onkeydown: (e) => { if (e.key === 'Enter' && e.target === e.currentTarget) { e.preventDefault(); onRowClick(r); } } } : {});
+    const tbody = h('tbody', {}, shown.length ? shown.map((r) => h('tr', { class: rowClass ? rowClass(r) : null, ...rowAttrs(r) },
       selectable ? h('td', { class: 'sel' }, h('input', { type: 'checkbox', 'aria-label': 'Выбрать', checked: selected.has(r.id),
         onchange: (e) => { e.target.checked ? selected.add(r.id) : selected.delete(r.id); root.dispatchEvent(new Event('selection')); } })) : null,
       cols.map((c) => h('td', { class: [c.num ? 'num' : '', c.cls || ''].join(' '), title: c.tip ? c.tip(r) : null, 'data-label': c.label }, c.render ? c.render(r) : (valueOf(c, r) ?? '—')))))
@@ -1894,11 +1898,54 @@ function pageLog(kind, params) {
       const rows = (r[kind] || []).map((x) => ({ ...x, id: x.clickId }));
       last = { hasMore: Boolean(r.hasMore), rows: rows.length };
       table?.detach();
-      table = dataTable({ id: 'log-' + kind, columns, rows, serverPaging: paging, pageSize: limit, totals: !isClicks, empty: isClicks ? 'Кликов за период нет' : 'Конверсий за период нет' });
+      table = dataTable({ id: 'log-' + kind, columns, rows, serverPaging: paging, pageSize: limit, totals: !isClicks, empty: isClicks ? 'Кликов за период нет' : 'Конверсий за период нет', onRowClick: isClicks ? clickCard : null });
       put(holder, table);
     } catch (e) { put(holder, h('p', { class: 'err' }, 'Ошибка загрузки: ' + e.message)); }
   }
   return () => table?.detach();
+}
+
+const CONVERSION_STATUS = { lead: 'Лид', sale: 'Продажа', rejected: 'Отклонена', trash: 'Мусор' };
+// Click card: every field of one click. UA, referrer and params come from visitors — text nodes via h() only.
+function clickCard(r) {
+  const idEl = h('span', { class: 'mono', style: 'user-select:all' }, r.clickId);
+  const copy = () => {
+    // Called synchronously from the click handler so the clipboard permission applies.
+    const fallback = () => { window.getSelection()?.selectAllChildren(idEl); toast('Не удалось скопировать — ID выделен, нажмите Ctrl+C', true); };
+    try { navigator.clipboard.writeText(r.clickId).then(() => toast('Click ID скопирован'), fallback); } catch { fallback(); }
+  };
+  const yesNo = (v) => (v === true ? 'да' : v === false ? 'нет' : '—');
+  const params = Object.entries(r.params || {}).filter(([, v]) => v !== null && v !== undefined && v !== '');
+  const offerName = r.offerId && state.offers[r.offerId]?.name;
+  const landingName = r.landingId && state.landings[r.landingId]?.name;
+  const conversion = h('span', { class: 'muted' }, 'Загрузка…');
+  const rows = [
+    ['Дата и время', dt(r.at)],
+    ['Click ID', h('span', { style: 'display:inline-flex;flex-wrap:wrap;gap:8px;align-items:center' }, idEl, h('button', { class: 'btn', type: 'button', onclick: copy }, 'Копировать'))],
+    ['Кампания', r.campaign ? h('a', { href: '#/campaigns/' + encodeURIComponent(r.campaign) }, state.campaigns[r.campaign]?.name || r.campaign) : null],
+    ['Поток', r.stream],
+    ['Оффер', offerName ? `${offerName} (${r.offerId})` : r.offerId],
+    ['Лендинг', landingName ? `${landingName} (${r.landingId})` : r.landingId],
+    ['IP', r.ip], ['Страна', r.country],
+    ['Устройство', r.device], ['ОС', r.os], ['Браузер', r.browser], ['Язык', r.language],
+    r.isp ? ['Провайдер', r.isp] : null,
+    ['Реферер', r.referrer], ['Путь', r.path],
+    ['User Agent', r.userAgent],
+    ['Subid', r.subid],
+    ...params.map(([k, v]) => [k, String(v)]),
+    ['Расход', r.cost != null ? money(r.cost) : null],
+    ['Уникальность', `кампания: ${yesNo(r.uniqueCampaign)}, поток: ${yesNo(r.uniqueStream)}, глобально: ${yesNo(r.uniqueGlobal)}`],
+    ['Конверсия', conversion],
+  ].filter(Boolean);
+  openModal({ title: 'Клик', wide: true,
+    body: h('div', { class: 'kv' }, rows.map(([label, value]) => [h('div', { class: 'muted' }, label),
+      h('div', { class: 'kv-value' }, value === null || value === undefined || value === '' ? '—' : value)])) });
+  api('/api/conversions' + qs({ click: r.clickId, limit: 5 })).then((d) => {
+    const list = d.conversions || [];
+    put(conversion, list.length ? list.map((c) => h('div', {}, [CONVERSION_STATUS[c.status] || c.status || 'Продажа',
+      c.revenue == null ? null : amount(c.revenue) + (c.currency ? ' ' + c.currency : ''), dt(c.at)].filter(Boolean).join(' · '))) : 'нет');
+    conversion.className = '';
+  }).catch((e) => { put(conversion, 'Ошибка загрузки: ' + e.message); conversion.className = 'err'; });
 }
 
 // ---------- buyers report ----------
