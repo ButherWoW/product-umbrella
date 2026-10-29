@@ -16,6 +16,8 @@ ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/opt/umbrella/data
 PrivateTmp=true
+# New data files (journal, JSON stores, logs) are owner-only; nginx serves no files from /opt/umbrella/data.
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

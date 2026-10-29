@@ -135,7 +135,7 @@ export async function checkCosts({ server, call, buyer, run }) {
 test('postback journals with S2S retries and manual cost updates (JSONL)', { skip: !hasOpenssl() && 'openssl not available', timeout: 30000 }, async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'umbrella-pbcost-'));
   const mock = await startNetworkMock(dir);
-  const server = await startTestServer(dir, { ADMIN_TOKEN: TOKEN, S2S_RETRY_MS: '20', NODE_EXTRA_CA_CERTS: mock.cert });
+  const server = await startTestServer(dir, { ADMIN_TOKEN: TOKEN, S2S_RETRY_MS: '20', S2S_ALLOW_PRIVATE: '1', NODE_EXTRA_CA_CERTS: mock.cert });
   t.after(async () => { await server.stop(); await mock.stop(); await rm(dir, { recursive: true, force: true }); });
   const call = (path, body) => fetch(server.url + path, { method: body ? 'POST' : 'GET',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}` }, body: body ? JSON.stringify(body) : undefined });
