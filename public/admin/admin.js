@@ -151,6 +151,12 @@ function currencyControl(onChange) {
   return h('select', { class: 'select', 'aria-label': 'Валюта', title: 'Валюта отчётов', onchange: (e) => { currency.code = e.target.value; store.set('currency', currency.code); onChange(); } },
     codes.map((c) => h('option', { value: c, selected: c === currency.code }, c)));
 }
+// Multiplier from the default currency into the selected one (1 when rates are unknown — amounts are not converted then either).
+function currencyRate() {
+  const info = currency.info;
+  const from = info?.rates?.[info.defaultCurrency]; const to = info?.rates?.[currency.code];
+  return from > 0 && to > 0 ? to / from : 1;
+}
 function ratesNote() {
   const info = currency.info;
   if (!info?.updatedAt) return h('p', { class: 'muted rates-note' }, 'Курсы валют ещё не загружены — суммы в других валютах не пересчитываются.');
@@ -481,7 +487,8 @@ async function pageDashboard() {
   const campSel = h('select', { class: 'select', 'aria-label': 'Кампания', onchange: () => load() }, h('option', { value: '' }, 'Все кампании'),
     Object.entries(state.campaigns).map(([id, c]) => h('option', { value: id }, c.name || id)));
   put(view, h('div', { class: 'page-head' }, h('h1', {}, 'Дашборд'),
-    h('div', { class: 'toolbar', style: 'margin:0' }, campSel, periodControl(() => load()), currencyControl(() => load()), h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'))), body);
+    h('div', { class: 'toolbar', style: 'margin:0' }, campSel, periodControl(() => load()), currencyControl(() => load()), h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'),
+      (state.me?.user?.role === 'owner' || !state.me?.loginRequired) ? h('button', { class: 'btn', title: 'Дневной план команды', onclick: () => goalsModal(() => load()) }, 'Цели') : null)), body);
   async function load() {
     const { from, to } = periodRange();
     const campaign = campSel.value || null;
@@ -495,7 +502,18 @@ async function pageDashboard() {
       const earningsTile = h('div', { class: 'kpi' + (isOwner ? ' kpi-edit' : ''), style: 'background:var(--k6)', title: isOwner ? 'Нажмите, чтобы изменить процент' : null,
         onclick: isOwner ? () => shareModal(sharePct, () => load()) : null },
         h('div', { class: 'k' }, `Заработок баера · ${sharePct.toLocaleString('ru-RU')}%`), h('div', { class: 'v' }, money(buyerEarnings)));
-      const kpi = (label, value, color) => h('div', { class: 'kpi', style: `background:${color}` }, h('div', { class: 'k' }, label), h('div', { class: 'v' }, value));
+      const kpi = (label, value, color, extra) => h('div', { class: 'kpi', style: `background:${color}` }, h('div', { class: 'k' }, label), h('div', { class: 'v' }, value), extra || null);
+      // Daily goals are stored in the default currency; shown only for «Сегодня», converted like every other amount.
+      const goalBar = (value, goal) => {
+        if (hideRev() || period.key !== 'today' || goal == null || !(Number(goal) > 0)) return null;
+        const target = Number(goal) * currencyRate();
+        const share = Math.max(0, value) / target;
+        const done = share >= 1;
+        return h('div', { class: 'goal' + (done ? ' done' : ''), title: `План на сегодня: ${money(target)}` },
+          h('div', { class: 'goal-track', role: 'progressbar', 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': Math.min(100, Math.round(share * 100)) },
+            h('div', { class: 'goal-fill', style: `width:${Math.min(100, share * 100).toFixed(1)}%` })),
+          h('div', { class: 'goal-cap' }, done ? 'план выполнен' : `${Math.floor(share * 100 + 1e-9)}% плана`));
+      };
       const small = (title, id, rows, nameOf, link) => h('div', { class: 'card' }, h('h2', {}, title), dataTable({
         id: 'dash-' + id, pageSize: 10, compact: true, rows: rows.sort((a, b) => b.clicks - a.clicks),
         columns: [{ key: 'id', label: title, fixed: true, cls: 'name', render: (r) => (link ? h('a', { href: link(r) }, nameOf(r)) : nameOf(r)) },
@@ -504,7 +522,7 @@ async function pageDashboard() {
       const top5 = (id, title, rows, nameOf, link) => h('div', { class: 'card' }, h('h2', {}, title), dataTable({ id: 'dash-t5-' + id, pageSize: 5, compact: true, totals: false, rows: [...rows].sort((a, b) => b.revenue - a.revenue).slice(0, 5), columns: [{ key: 'id', label: 'Название', fixed: true, cls: 'name', render: (r) => h('a', { href: link(r) }, nameOf(r)) }, ...metricCols().filter((c) => ['clicks', 'conversions', 'revenue', 'roi'].includes(c.key))] }));
       put(body, 
         h('div', { class: 'kpis' }, kpi('Клики', num(s.clicks), 'var(--k1)'), kpi('Уник. клики', num(s.uniqueClicks), 'var(--k2)'), kpi('Конверсии', num(s.conversions), 'var(--k3)'), kpi('CR', pct(ratio(s.conversions, s.clicks)), 'var(--k2)'),
-          hideRev() ? null : kpi('Доход', money(s.revenue), 'var(--k5)'), kpi('Расход', money(s.cost || 0), 'var(--k4)'), ...(hideRev() ? [] : [kpi('Прибыль', h('span', { class: profit >= 0 ? '' : 'neg' }, money(profit)), 'var(--k8)'), kpi('ROI', pct(ratio(profit, s.cost || 0)), 'var(--k9)'), earningsTile,
+          hideRev() ? null : kpi('Доход', money(s.revenue), 'var(--k5)', goalBar(s.revenue || 0, team.dailyRevenueGoal)), kpi('Расход', money(s.cost || 0), 'var(--k4)'), ...(hideRev() ? [] : [kpi('Прибыль', h('span', { class: profit >= 0 ? '' : 'neg' }, money(profit)), 'var(--k8)', goalBar(profit, team.dailyProfitGoal)), kpi('ROI', pct(ratio(profit, s.cost || 0)), 'var(--k9)'), earningsTile,
           kpi('EPC', money4(ratio(s.revenue, s.clicks)), 'var(--k6)'), kpi('RPM', money(ratio(s.revenue * 1000, s.clicks)), 'var(--k7)')]),
           botsData.bots?.length > 0 ? h('a', { href: '#/botlog' + (campaign ? qs({ campaign }) : ''), style: 'text-decoration:none' },
             h('div', { class: 'kpi', style: 'background:var(--bad)' }, h('div', { class: 'k' }, 'Боты'), h('div', { class: 'v' }, botsData.bots.length >= 1000 ? '1000+' : num(botsData.bots.length)))) : null),
@@ -573,6 +591,35 @@ async function pageDashboard() {
     } catch (e) { put(body, h('p', { class: 'err' }, 'Ошибка загрузки: ' + e.message)); }
   }
   load();
+}
+
+// Owner-only team plan: two daily goals in the default currency (empty field = no goal).
+async function goalsModal(onSaved) {
+  const team = await api('/api/settings').catch(() => ({}));
+  const base = currency.info?.defaultCurrency || 'EUR';
+  const values = { dailyRevenueGoal: team.dailyRevenueGoal ?? '', dailyProfitGoal: team.dailyProfitGoal ?? '' };
+  const input = (key, label) => h('input', { class: 'input', type: 'number', min: 0, step: '0.01', value: values[key], placeholder: 'нет', 'aria-label': label, oninput: (e) => { values[key] = e.target.value; } });
+  const err = h('p', { class: 'err' });
+  const close = openModal({
+    title: 'Цели',
+    body: h('div', {},
+      field(`Дневной план по доходу, ${base}`, input('dailyRevenueGoal', 'План по доходу')),
+      field(`Дневной план по прибыли, ${base}`, input('dailyProfitGoal', 'План по прибыли'),
+        'Цель команды на день. На дашборде за «Сегодня» плитки «Доход» и «Прибыль» показывают прогресс в выбранной валюте. Пустое поле — без цели.'),
+      err),
+    footer: [h('button', { class: 'btn', onclick: () => close() }, 'Отмена'), h('button', { class: 'btn primary', onclick: async () => {
+      const body = {};
+      for (const key of Object.keys(values)) {
+        const raw = String(values[key]).trim();
+        if (raw === '') { body[key] = null; continue; }
+        const n = Number(raw);
+        if (!Number.isFinite(n) || n < 0) { err.textContent = 'План — число от 0 или пустое поле.'; return; }
+        body[key] = n;
+      }
+      try { await api('/api/settings', { method: 'PATCH', body }); toast('Цели сохранены'); close(); onSaved(); }
+      catch (e) { err.textContent = e.message === 'owner_only' ? 'Менять цели может только владелец.' : 'Не сохранено: ' + e.message; }
+    } }, 'Сохранить')],
+  });
 }
 
 function shareModal(current, onSaved) {
