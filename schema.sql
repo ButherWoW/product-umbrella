@@ -1,4 +1,4 @@
--- Product Umbrella production schema. Kept aligned with src/migrate.js and src/db.js.
+﻿-- Product Umbrella production schema. Kept aligned with src/migrate.js and src/db.js.
 CREATE TABLE IF NOT EXISTS campaigns (
   id text PRIMARY KEY,
   name text NOT NULL,
@@ -66,5 +66,15 @@ CREATE TABLE IF NOT EXISTS landings (
   id text PRIMARY KEY,
   url text NOT NULL CHECK (url ~ '^https://'),
   name text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS sources (
+  id text PRIMARY KEY,
+  name text,
+  param_map jsonb NOT NULL DEFAULT '{}'::jsonb,
+  cost_model text NOT NULL DEFAULT 'none',
+  cpc numeric(12,6) NOT NULL DEFAULT 0,
+  cost_from_param boolean NOT NULL DEFAULT false,
   created_at timestamptz NOT NULL DEFAULT now()
 );
