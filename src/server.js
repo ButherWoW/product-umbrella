@@ -18,6 +18,7 @@ const offersFile = join(dataDir, 'offers.json');
 const landingsFile = join(dataDir, 'landings.json');
 const settingsFile = join(dataDir, 'settings.json');
 const campaignsFile = join(dataDir, 'campaigns.json');
+const sourcesFile = join(dataDir, 'sources.json');
 const port = Number(process.env.PORT || 4100);
 // Public path prefix when served behind a proxy under a subpath (nginx strips it before proxying).
 const basePath = /^\/[A-Za-z0-9_-]{1,40}$/.test(process.env.BASE_PATH || '') ? process.env.BASE_PATH : '';
@@ -499,6 +500,51 @@ async function persistOffer(id, value) {
   else await saveOffers();
 }
 
+const sources = new Map();
+
+function parseSource(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  return {
+    name: typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim().slice(0, 200) : null,
+    paramMap: parseParamMap(raw.paramMap),
+    costModel: raw.costModel === 'cpc' ? 'cpc' : 'none',
+    cpc: Number.isFinite(Number(raw.cpc)) && Number(raw.cpc) >= 0 && Number(raw.cpc) < 1000 ? Number(raw.cpc) : 0,
+    costFromParam: raw.costFromParam === true,
+  };
+}
+
+async function loadSources() {
+  if (db) {
+    try {
+      const { rows } = await db.query('SELECT id, name, param_map, cost_model, cpc, cost_from_param FROM sources');
+      for (const row of rows) if (OFFER_ID_RE.test(row.id)) {
+        const s = parseSource({ name: row.name, paramMap: row.param_map, costModel: row.cost_model, cpc: row.cpc, costFromParam: row.cost_from_param });
+        if (s) sources.set(row.id, s);
+      }
+      return;
+    } catch (error) { console.warn('[db] sources load fallback:', error.message); }
+  }
+  try {
+    const saved = JSON.parse(await readFile(sourcesFile, 'utf8'));
+    for (const [id, raw] of Object.entries(saved)) {
+      if (!OFFER_ID_RE.test(id)) continue;
+      const s = parseSource(raw);
+      if (s) sources.set(id, s);
+    }
+  } catch (error) { if (error.code !== 'ENOENT') console.warn('[sources] invalid config ignored'); }
+}
+
+async function saveSources() {
+  await mkdir(dataDir, { recursive: true });
+  await writeFile(sourcesFile, JSON.stringify(Object.fromEntries(sources), null, 2) + '\n');
+}
+
+async function persistSource(id, value) {
+  if (db) await db.query('INSERT INTO sources (id, name, param_map, cost_model, cpc, cost_from_param) VALUES ($1, $2, $3::jsonb, $4, $5, $6) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, param_map = EXCLUDED.param_map, cost_model = EXCLUDED.cost_model, cpc = EXCLUDED.cpc, cost_from_param = EXCLUDED.cost_from_param',
+    [id, value.name ?? null, JSON.stringify(value.paramMap || {}), value.costModel, value.cpc, value.costFromParam]);
+  else await saveSources();
+}
+
 function parseCampaign(id, value) {
   return {
     name: String(value.name || id).slice(0, 120),
@@ -534,6 +580,7 @@ function parseCampaign(id, value) {
     cpc: Number.isFinite(Number(value.cpc)) && Number(value.cpc) >= 0 && Number(value.cpc) < 1000 ? Number(value.cpc) : 0,
     costFromParam: value.costFromParam === true,
     conversionWindowDays: Number.isInteger(value.conversionWindowDays) && value.conversionWindowDays > 0 && value.conversionWindowDays <= 365 ? value.conversionWindowDays : null,
+    sourceId: OFFER_ID_RE.test(String(value.sourceId || '')) ? String(value.sourceId) : null,
   };
 }
 
@@ -1428,6 +1475,35 @@ const server = http.createServer(async (req, res) => {
       await audit(req, 'update', 'offer', id, cur, updated);
       return json(res, 200, { id, ...updated });
     }
+    if (url.pathname === '/api/sources' && req.method === 'GET') return json(res, 200, { sources: Object.fromEntries(sources) });
+    if (url.pathname === '/api/sources' && req.method === 'POST') {
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      const body = await readJson(req);
+      if (!OFFER_ID_RE.test(String(body.id || ''))) return json(res, 400, { error: 'valid_id_required' });
+      const source = parseSource(body);
+      if (!source) return json(res, 400, { error: 'invalid_source' });
+      sources.set(String(body.id), source);
+      await persistSource(String(body.id), source);
+      return json(res, 201, { id: body.id, ...source });
+    }
+    const sourceUpdate = url.pathname.match(/^\/api\/sources\/([A-Za-z0-9_-]{2,80})$/);
+    if (sourceUpdate && req.method === 'PATCH') {
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      const id = sourceUpdate[1];
+      if (!sources.has(id)) return json(res, 404, { error: 'source_not_found' });
+      const body = await readJson(req);
+      const cur = sources.get(id);
+      const updated = parseSource({
+        name: body.name !== undefined ? body.name : cur.name,
+        paramMap: body.paramMap !== undefined ? body.paramMap : cur.paramMap,
+        costModel: body.costModel !== undefined ? body.costModel : cur.costModel,
+        cpc: body.cpc !== undefined ? body.cpc : cur.cpc,
+        costFromParam: body.costFromParam !== undefined ? body.costFromParam : cur.costFromParam,
+      });
+      sources.set(id, updated);
+      await persistSource(id, updated);
+      return json(res, 200, { id, ...updated });
+    }
     if (url.pathname === '/api/campaigns' && req.method === 'GET') {
       const allowed = scopeCampaigns(req);
       return json(res, 200, { campaigns: Object.fromEntries([...campaigns].filter(([id]) => !allowed || allowed.includes(id))) });
@@ -1480,6 +1556,7 @@ const server = http.createServer(async (req, res) => {
         costModel: body.costModel === undefined ? cur.costModel : body.costModel,
         cpc: body.cpc === undefined ? cur.cpc : body.cpc,
         costFromParam: body.costFromParam === undefined ? cur.costFromParam : body.costFromParam,
+        sourceId: body.sourceId === undefined ? cur.sourceId : (OFFER_ID_RE.test(String(body.sourceId || '')) ? String(body.sourceId) : null),
       }));
       await persistCampaign(id, campaigns.get(id));
       await audit(req, 'update', 'campaign', id, cur, campaigns.get(id));
@@ -1650,6 +1727,7 @@ const server = http.createServer(async (req, res) => {
 
 await rates.start();
 await loadSettings();
+await loadSources();
 await loadOffers();
 await loadLandings();
 await loadCampaigns();
