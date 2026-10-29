@@ -978,14 +978,20 @@ try {
   const connDlg = page.getByRole('dialog', { name: 'Редактирование потока' });
   await connDlg.getByRole('tab', { name: 'Фильтры' }).click();
   await connDlg.getByLabel('Мобильный', { exact: true }).check();
-  await connDlg.getByLabel('Дата-центр', { exact: true }).check();
+  // No cloaking: data centers are not offered, and a bot User-Agent is refused in Russian before anything is saved.
+  assert.equal(await connDlg.getByLabel('Дата-центр', { exact: true }).count(), 0, 'no data-center option');
   await connDlg.getByLabel('Тип соединения: НЕ').check();
+  await connDlg.getByLabel('User-Agent', { exact: true }).fill('facebookexternalhit');
   await connDlg.getByRole('button', { name: 'Применить' }).click();
-  await page.locator('.stream', { hasText: 'Соединение НЕ: Мобильный, Дата-центр' }).waitFor();
+  await connDlg.locator('.err', { hasText: 'клоакинг не допускается' }).waitFor();
+  await connDlg.getByRole('tab', { name: 'Фильтры' }).click();
+  await connDlg.getByLabel('User-Agent', { exact: true }).fill('');
+  await connDlg.getByRole('button', { name: 'Применить' }).click();
+  await page.locator('.stream', { hasText: 'Соединение НЕ: Мобильный' }).waitFor();
   await page.locator('.editor-head .btn.primary').click();
   await page.locator('#toast', { hasText: 'Сохранено' }).waitFor();
   const connSaved = (await (await fetch(server.url + '/api/campaigns')).json()).campaigns['conn-ui'].streams[0].conditions;
-  assert.deepEqual([connSaved.connections, connSaved.not], [['mobile', 'datacenter'], ['connections']], 'connection filter saved');
+  assert.deepEqual([connSaved.connections, connSaved.not], [['mobile'], ['connections']], 'connection filter saved');
   await page.goto(server.url + '/admin#/reports?group=connection&campaign=conn-ui');
   await page.locator('.chip-btn.on', { hasText: 'Тип соединения' }).waitFor();
   await page.locator('table.grid tbody tr', { hasText: '(неизвестно)' }).waitFor();

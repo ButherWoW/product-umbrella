@@ -3,7 +3,6 @@ import { spawn } from 'node:child_process';
 import { mkdtemp, appendFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Script } from 'node:vm';
 
 const dataDir = await mkdtemp(join(tmpdir(), 'product-umbrella-'));
 const child = spawn(process.execPath, ['src/server.js'], { env: { ...process.env, PORT: '4199', DATA_DIR: dataDir, POSTBACK_SECRET: 'test-secret', TRUST_PROXY: '1', FX_REFRESH: '0', MONITOR: '0', DATABASE_URL: '', ADMIN_TOKEN: '', GEOIP_DB: '', CLICK_RATE_LIMIT: '0' }, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -18,11 +17,11 @@ try {
   const healthBody = await health.json();
   assert.equal(healthBody.ok, true);
   assert.equal(healthBody.storage, 'jsonl');
-  const dashboardHtml = await (await fetch('http://127.0.0.1:4199/dashboard')).text();
-  for (const match of dashboardHtml.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Script(match[1]);
-  const editorAsset = await fetch('http://127.0.0.1:4199/assets/stream-editor.js');
-  assert.equal(editorAsset.status, 200);
-  new Script(await editorAsset.text());
+  // The legacy inline /dashboard page was removed; old links land in the admin panel.
+  const legacyDashboard = await fetch('http://127.0.0.1:4199/dashboard', { redirect: 'manual' });
+  assert.equal(legacyDashboard.status, 302);
+  assert.equal(legacyDashboard.headers.get('location'), '/admin');
+  assert.equal((await fetch('http://127.0.0.1:4199/assets/stream-editor.js')).status, 404, 'legacy dashboard assets are gone');
   const created = await fetch('http://127.0.0.1:4199/api/offers', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: 'new-offer', url: 'https://example.org/product' }) });
   assert.equal(created.status, 201);
   assert.equal((await (await fetch('http://127.0.0.1:4199/api/offers')).json()).offers['new-offer'].url, 'https://example.org/product');
