@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS campaigns (
 
 CREATE TABLE IF NOT EXISTS offers (
   id text PRIMARY KEY,
-  url text NOT NULL CHECK (url ~ '^https://'),
+  url text NOT NULL CONSTRAINT offers_url_check CHECK (url ~* '^https://'),
   active boolean NOT NULL DEFAULT true,
   postback_url text,
   payout_type text NOT NULL DEFAULT 'cpa',
@@ -80,23 +80,30 @@ CREATE TABLE IF NOT EXISTS conversions (
   tid text NOT NULL DEFAULT '',  -- '' = main conversion; other values = upsells (postback tid)
   revenue numeric(12,4),
   currency text,
-  status text NOT NULL DEFAULT 'sale' CHECK (status IN ('lead', 'sale', 'rejected', 'trash')),
+  status text NOT NULL DEFAULT 'sale' CONSTRAINT conversions_status_check CHECK (status IN ('lead', 'sale', 'rejected', 'trash')),
   params jsonb,                  -- sub_id_N sent with the postback
-  updated_at timestamptz,
+  updated_at timestamptz,        -- time of the latest event (status update); NULL while there is only one
+  event_id uuid,                 -- journal id of the latest event (reconciliation)
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX IF NOT EXISTS conversions_click_tid_idx ON conversions(click_id, tid);
 CREATE TABLE IF NOT EXISTS bots (
   id BIGSERIAL PRIMARY KEY, campaign TEXT NOT NULL, offer_id TEXT, stream TEXT,
-  user_agent TEXT, ip TEXT, reason TEXT, isp TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  user_agent TEXT, ip TEXT, reason TEXT, isp TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  event_id UUID                  -- journal id (reconciliation); NULL for rows written before it existed
 );
+CREATE UNIQUE INDEX IF NOT EXISTS bots_event_id_idx ON bots(event_id);
+CREATE INDEX IF NOT EXISTS bots_created_idx ON bots(created_at);
 CREATE INDEX IF NOT EXISTS bots_campaign_created_idx ON bots(campaign, created_at);
 -- Postback journals (G7): direction 'in' (incoming /postback) or 'out' (S2S attempt). URLs without credentials.
 CREATE TABLE IF NOT EXISTS postbacks (
   id BIGSERIAL PRIMARY KEY, direction TEXT NOT NULL, click_id TEXT, campaign TEXT, offer_id TEXT, tid TEXT,
   status TEXT, revenue TEXT, currency TEXT, url TEXT, status_code INTEGER, error TEXT, attempt INTEGER, ip TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  event_id UUID                  -- journal id (reconciliation)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS postbacks_event_id_idx ON postbacks(event_id);
+CREATE INDEX IF NOT EXISTS postbacks_created_idx ON postbacks(created_at);
 CREATE INDEX IF NOT EXISTS postbacks_direction_created_idx ON postbacks(direction, created_at);
 CREATE INDEX IF NOT EXISTS postbacks_campaign_created_idx ON postbacks(campaign, created_at);
 
@@ -142,7 +149,7 @@ CREATE INDEX IF NOT EXISTS api_keys_user_idx ON api_keys(user_id);
 
 CREATE TABLE IF NOT EXISTS landings (
   id text PRIMARY KEY,
-  url text NOT NULL CHECK (url ~ '^https://'),
+  url text NOT NULL CONSTRAINT landings_url_check CHECK (url ~* '^https://'),
   name text,
   created_at timestamptz NOT NULL DEFAULT now()
 );
