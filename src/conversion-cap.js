@@ -5,11 +5,19 @@ import { readFile } from 'node:fs/promises';
 // for clicks recorded with this offer, since local midnight in the offer's time zone.
 
 // UTC offset (ms) of a time zone at a given instant: wall clock read as UTC minus the instant.
-function zoneOffset(tz, ms) {
+export function zoneOffset(tz, ms) {
   const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: tz, hourCycle: 'h23',
     year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' })
     .formatToParts(new Date(ms)).map((p) => [p.type, p.value]));
   return Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(parts.hour), Number(parts.minute), Number(parts.second)) - Math.floor(ms / 1000) * 1000;
+}
+
+// Instant (ms) of 00:00 local time on `date` (YYYY-MM-DD) in `tz`; a midnight skipped by DST → the first instant of that day.
+export function zonedDayStart(date, tz) {
+  const day = Date.parse(`${date}T00:00:00Z`);
+  let guess = day - zoneOffset(tz, day);
+  guess = day - zoneOffset(tz, guess);
+  return guess;
 }
 
 // Instant of the last local midnight in `tz` at `now` (DST-safe: the offset is taken at midnight itself).

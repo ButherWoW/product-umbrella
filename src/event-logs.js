@@ -84,12 +84,19 @@ async function fromJsonl(kind, query, eventsFile) {
   const clicks = new Map();
   const events = [];
   const postbackParams = new Map(); // sub_id_N from postbacks overwrite click parameters, as in PostgreSQL
+  const costUpdates = new Map(); // manual cost updates replace click costs, as in PostgreSQL
   try {
     for await (const line of lines) {
       if (!line.trim()) continue;
       let item;
       try { item = JSON.parse(line); } catch { continue; }
-      if (!item || typeof item !== 'object' || typeof item.clickId !== 'string') continue;
+      if (!item || typeof item !== 'object') continue;
+      if (item.type === 'cost_update' && kind === 'clicks' && Array.isArray(item.clickIds)) {
+        for (const id of item.clickIds) costUpdates.set(id, item.cost);
+        if (item.lastClickId) costUpdates.set(item.lastClickId, item.lastCost);
+        continue;
+      }
+      if (typeof item.clickId !== 'string') continue;
       if (item.type === 'click') {
         if (kind === 'clicks') events.push(item);
         else clicks.set(item.clickId, item);
@@ -105,7 +112,9 @@ async function fromJsonl(kind, query, eventsFile) {
     input.destroy();
   }
   const rows = (kind === 'clicks'
-    ? events.map((item) => normalizeClick(postbackParams.has(item.clickId) ? { ...item, params: { ...(item.params || {}), ...postbackParams.get(item.clickId) } } : item))
+    ? events.map((item) => normalizeClick({ ...item,
+      ...(postbackParams.has(item.clickId) ? { params: { ...(item.params || {}), ...postbackParams.get(item.clickId) } } : {}),
+      ...(costUpdates.has(item.clickId) ? { cost: costUpdates.get(item.clickId) } : {}) }))
     : events.map((item) => normalizeConversion(item, clicks.get(item.clickId) || {})))
     .filter((item) => matches(item, query))
     .sort((a, b) => (b.at || '').localeCompare(a.at || '') || String(b.clickId).localeCompare(String(a.clickId)));

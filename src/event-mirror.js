@@ -7,7 +7,21 @@ export function createEventMirror({ query, onError = () => {} }) {
   const pending = new Set();
 
   function enqueue({ type, at, ...payload }) {
-    if (!['click', 'conversion', 'lp_click', 'bot'].includes(type)) return null;
+    if (!['click', 'conversion', 'lp_click', 'bot', 'postback_in', 'postback_out', 'cost_update'].includes(type)) return null;
+    if (type === 'postback_in' || type === 'postback_out') {
+      const task = query(`INSERT INTO postbacks (direction, click_id, campaign, offer_id, tid, status, revenue, currency, url, status_code, error, attempt, ip, created_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, [type === 'postback_in' ? 'in' : 'out', payload.clickId ?? null, payload.campaign ?? null,
+        payload.offerId ?? null, payload.tid ?? null, payload.status ?? null, payload.revenue === null || payload.revenue === undefined ? null : String(payload.revenue),
+        payload.currency ?? null, payload.url ?? null, payload.statusCode ?? null, payload.error ?? null, payload.attempt ?? null, payload.ip ?? null, at])
+        .catch((error) => onError(type, error));
+      pending.add(task); task.then(() => pending.delete(task)); return task;
+    }
+    if (type === 'cost_update') {
+      // Manual cost update (G8): one cost for every listed click, the rounding remainder on the last one.
+      const task = query(`UPDATE clicks SET cost = CASE WHEN click_id::text = $3 THEN $4::numeric ELSE $2::numeric END WHERE click_id = ANY($1::uuid[])`,
+        [payload.clickIds || [], payload.cost ?? 0, payload.lastClickId ?? '', payload.lastCost ?? payload.cost ?? 0]).catch((error) => onError(type, error));
+      pending.add(task); task.then(() => pending.delete(task)); return task;
+    }
     if (type === 'bot') {
       const task = query('INSERT INTO bots (campaign, offer_id, stream, user_agent, ip, reason, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)', [payload.campaign, payload.offerId ?? null, payload.stream ?? null, payload.userAgent ?? null, payload.ip ?? null, payload.reason ?? null, at]).catch((error) => onError(type, error));
       pending.add(task); task.then(() => pending.delete(task)); return task;
@@ -51,5 +65,9 @@ export function createEventMirror({ query, onError = () => {} }) {
   async function drain() {
     while (pending.size) await Promise.all([...pending]);
   }
-  return { enqueue, drain };
+  // Waits only for the tasks queued so far (drain() could wait forever under steady traffic).
+  async function flush() {
+    await Promise.all([...pending]);
+  }
+  return { enqueue, drain, flush };
 }

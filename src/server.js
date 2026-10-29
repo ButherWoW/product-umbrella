@@ -10,7 +10,7 @@ import { createRates, normalizeCurrency } from './currency.js';
 import { readEventLog } from './event-logs.js';
 import { createConversionRecorder, hasRecordedConversion, findRecordedConversion, conversionKey } from './conversion-recorder.js';
 import { createEventMirror } from './event-mirror.js';
-import { createConversionCapCounter, resolveOffer } from './conversion-cap.js';
+import { createConversionCapCounter, resolveOffer, zonedDayStart } from './conversion-cap.js';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const dataDir = process.env.DATA_DIR || join(root, 'data');
@@ -638,12 +638,25 @@ function conversionsByClick(conversions) {
   for (const cv of conversions) { const list = byClick.get(cv.clickId); if (list) list.push(cv); else byClick.set(cv.clickId, [cv]); }
   return byClick;
 }
-// sub_id_N sent with postbacks overwrite the click's parameters (journal order; PostgreSQL does the same in the mirror).
-function withPostbackParams(lines) {
-  const updates = new Map();
-  for (const item of lines) if (item?.type === 'conversion' && item.params) updates.set(item.clickId, { ...(updates.get(item.clickId) || {}), ...item.params });
-  if (!updates.size) return lines;
-  return lines.map((item) => (item?.type === 'click' && updates.has(item.clickId) ? { ...item, params: { ...(item.params || {}), ...updates.get(item.clickId) } } : item));
+// Later journal events that change a click, applied in journal order (PostgreSQL does the same in the mirror):
+// sub_id_N sent with postbacks overwrite its parameters (G6), a manual cost update replaces its cost (G8).
+function applyClickUpdates(lines) {
+  const params = new Map(), costs = new Map();
+  for (const item of lines) {
+    if (item?.type === 'conversion' && item.params) params.set(item.clickId, { ...(params.get(item.clickId) || {}), ...item.params });
+    else if (item?.type === 'cost_update' && Array.isArray(item.clickIds)) {
+      for (const id of item.clickIds) costs.set(id, item.cost);
+      if (item.lastClickId) costs.set(item.lastClickId, item.lastCost);
+    }
+  }
+  if (!params.size && !costs.size) return lines;
+  return lines.map((item) => {
+    if (item?.type !== 'click' || (!params.has(item.clickId) && !costs.has(item.clickId))) return item;
+    const updated = { ...item };
+    if (params.has(item.clickId)) updated.params = { ...(item.params || {}), ...params.get(item.clickId) };
+    if (costs.has(item.clickId)) updated.cost = costs.get(item.clickId);
+    return updated;
+  });
 }
 const conversionCounts = (cv) => ['lead', 'sale'].includes(cv?.status || 'sale');
 const saleRevenue = (cv) => ((cv?.status || 'sale') === 'sale' ? Number(cv.revenue) || 0 : 0);
@@ -949,7 +962,7 @@ async function stats({ campaign = null, allowed = null, from = null, to = null, 
   }
   // JSONL fallback
   try {
-    const lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map(JSON.parse);
+    const lines = applyClickUpdates((await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map(JSON.parse));
     const fromMs = from ? Date.parse(`${from}T00:00:00Z`) : null;
     const toMs = to ? Date.parse(`${to}T23:59:59Z`) : null;
     const allClicks = lines.filter((item) => item.type === 'click');
@@ -1007,7 +1020,7 @@ async function paramReport({ field, campaign, allowed = null, from, to, currency
   catch (error) { if (error.code !== 'ENOENT') throw error; }
   const fromMs = from ? Date.parse(`${from}T00:00:00Z`) : null;
   const toMs = to ? Date.parse(`${to}T23:59:59Z`) : null;
-  lines = withPostbackParams(lines);
+  lines = applyClickUpdates(lines);
   const conv = conversionsByClick(latestConversions(lines).values());
   const groups = new Map();
   for (const click of lines) {
@@ -1136,6 +1149,151 @@ function json(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
+// Postback journals (G7). Stored URLs never keep credentials: user:password@ is dropped and the values of
+// secret/token/password/key/signature-like parameters are replaced, so the log can be shown to buyers.
+const CREDENTIAL_PARAM = /secret|token|passw|^pass$|^pwd$|auth|signature|^sig$|^sign$|api_?key|^key$|_key$|hash|credential/i;
+function redactUrl(raw) {
+  try {
+    const u = new URL(raw, 'http://localhost');
+    u.username = ''; u.password = '';
+    for (const name of new Set(u.searchParams.keys())) if (CREDENTIAL_PARAM.test(name)) u.searchParams.set(name, '***');
+    return (/^https?:\/\//i.test(raw) ? u.toString() : u.pathname + u.search).slice(0, 2048);
+  } catch { return null; }
+}
+async function logPostback(type, payload) {
+  try { await event(type, payload); } catch (error) { console.warn('[postbacks] journal not written:', error.message); }
+}
+// Outgoing S2S postback: up to 3 attempts (network error, 5xx or 429), pause S2S_RETRY_MS × attempt; every attempt is logged.
+const S2S_ATTEMPTS = 3;
+const s2sRetryMs = Number.isFinite(Number(process.env.S2S_RETRY_MS)) && process.env.S2S_RETRY_MS !== '' ? Number(process.env.S2S_RETRY_MS) : 2000;
+async function deliverS2s(s2sUrl, meta) {
+  for (let attempt = 1; attempt <= S2S_ATTEMPTS; attempt += 1) {
+    let statusCode = null, error = null;
+    try {
+      const response = await fetch(s2sUrl, { signal: AbortSignal.timeout(10000) });
+      await response.body?.cancel();
+      statusCode = response.status;
+      if (!response.ok) error = `HTTP ${response.status}`;
+    } catch (failure) { error = String(failure.message || failure).slice(0, 300); }
+    await logPostback('postback_out', { ...meta, url: redactUrl(s2sUrl), statusCode, error, attempt });
+    if (!error) return;
+    const retryable = statusCode === null || statusCode >= 500 || statusCode === 429;
+    if (!retryable || attempt === S2S_ATTEMPTS) { console.warn('[s2s] postback failed:', error, `(attempt ${attempt})`); return; }
+    await new Promise((resolve) => setTimeout(resolve, s2sRetryMs * attempt));
+  }
+}
+// GET /api/postbacks: PostgreSQL first, the JSONL journal as fallback. Newest first.
+async function readPostbacks({ direction, campaign, allowed, from, to, limit }) {
+  const fromMs = from ? Date.parse(`${from}T00:00:00Z`) : null;
+  const toMs = to ? Date.parse(`${to}T23:59:59.999Z`) : null;
+  if (db) {
+    try {
+      const conditions = ['direction = $1'], values = [direction];
+      const add = (sql, value) => { values.push(value); conditions.push(sql.replace('?', `$${values.length}`)); };
+      if (campaign) add('campaign = ?', campaign);
+      if (allowed) add('campaign = ANY(?::text[])', allowed);
+      if (fromMs !== null) add('created_at >= ?', new Date(fromMs).toISOString());
+      if (toMs !== null) add('created_at <= ?', new Date(toMs).toISOString());
+      values.push(limit);
+      const { rows } = await db.query(`SELECT click_id, campaign, offer_id, tid, status, revenue, currency, url, status_code, error, attempt, ip, created_at
+        FROM postbacks WHERE ${conditions.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT $${values.length}`, values);
+      return { storage: 'postgres', postbacks: rows.map((r) => ({ at: new Date(r.created_at).toISOString(), direction, clickId: r.click_id, campaign: r.campaign, offerId: r.offer_id,
+        tid: r.tid, status: r.status, revenue: r.revenue, currency: r.currency, url: r.url, statusCode: r.status_code, error: r.error, attempt: r.attempt, ip: r.ip })) };
+    } catch (error) { console.warn('[db] postbacks fallback:', error.message); }
+  }
+  let lines = [];
+  try { lines = (await readFile(eventsFile, 'utf8')).split('\n'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  const type = `"postback_${direction}"`;
+  const out = [];
+  for (let i = lines.length - 1; i >= 0 && out.length < limit; i -= 1) {
+    if (!lines[i].includes(type)) continue;
+    let item; try { item = JSON.parse(lines[i]); } catch { continue; }
+    if (item.type !== `postback_${direction}`) continue;
+    if (campaign && item.campaign !== campaign) continue;
+    if (allowed && !allowed.includes(item.campaign)) continue;
+    const t = Date.parse(item.at);
+    if ((fromMs !== null && !(t >= fromMs)) || (toMs !== null && !(t <= toMs))) continue;
+    out.push({ at: item.at, direction, clickId: item.clickId ?? null, campaign: item.campaign ?? null, offerId: item.offerId ?? null, tid: item.tid ?? null,
+      status: item.status ?? null, revenue: item.revenue ?? null, currency: item.currency ?? null, url: item.url ?? null, statusCode: item.statusCode ?? null,
+      error: item.error ?? null, attempt: item.attempt ?? null, ip: item.ip ?? null });
+  }
+  return { storage: 'jsonl', postbacks: out };
+}
+
+// Manual cost update (G8). Matching clicks: campaign, local dates from..to in tz, optional offer/stream/source/sub_id_N
+// filters, optionally unique clicks only. Bots are never clicks, so they get no cost. The amount (in `currency`) is
+// converted to DEFAULT_CURRENCY and split equally; the last click takes the rounding remainder, so the sum is exact.
+const COST_FILTERS = ['offer', 'stream', 'source', ...SUB_ID_FIELDS];
+async function updateCosts(body, req) {
+  const campaignId = String(body?.campaign || '');
+  const campaign = campaigns.get(campaignId);
+  if (!campaign) return { status: 404, error: 'campaign_not_found' };
+  if (!canEditCampaign(req, campaign)) return { status: 403, error: 'campaign_not_yours' };
+  const from = isoDate(body.from), to = isoDate(body.to);
+  if (!from || !to) return { status: 400, error: 'from_and_to_dates_required' };
+  if (to < from) return { status: 400, error: 'invalid_date_range' };
+  const tz = body.tz === undefined || body.tz === null || body.tz === '' ? 'UTC' : body.tz;
+  if (typeof tz !== 'string' || !validTimeZone(tz)) return { status: 400, error: 'invalid_tz' };
+  const amount = typeof body.amount === 'string' && body.amount.trim() !== '' ? Number(body.amount) : body.amount;
+  if (typeof amount !== 'number' || !Number.isFinite(amount) || amount < 0 || amount >= 1e8) return { status: 400, error: 'invalid_amount' };
+  const currency = body.currency === undefined || body.currency === null || body.currency === '' ? rates.defaultCurrency : String(body.currency).toUpperCase();
+  if (!/^[A-Z]{3}$/.test(currency)) return { status: 400, error: 'invalid_currency' };
+  const rawFilters = body.filters ?? {};
+  if (typeof rawFilters !== 'object' || Array.isArray(rawFilters)) return { status: 400, error: 'invalid_filters' };
+  const filters = {};
+  for (const [key, value] of Object.entries(rawFilters)) {
+    if (!COST_FILTERS.includes(key)) return { status: 400, error: 'invalid_filter', filter: key };
+    if (value === null || value === undefined || value === '') continue;
+    if (typeof value !== 'string' || value.length > 255) return { status: 400, error: 'invalid_filter', filter: key };
+    filters[key] = value;
+  }
+  const uniqueOnly = body.uniqueOnly === true;
+  const start = zonedDayStart(from, tz);
+  const end = zonedDayStart(new Date(Date.parse(`${to}T00:00:00Z`) + 86400000).toISOString().slice(0, 10), tz);
+  const paramFilters = Object.entries(filters).filter(([key]) => key !== 'offer' && key !== 'stream');
+
+  let clickIds = null;
+  if (db) {
+    try {
+      await eventMirror?.flush(); // clicks still queued for PostgreSQL must be matched too
+      const values = [campaignId, new Date(start).toISOString(), new Date(end).toISOString()];
+      const conditions = ['campaign = $1', 'created_at >= $2', 'created_at < $3'];
+      if (filters.offer) { values.push(filters.offer); conditions.push(`offer_id = $${values.length}`); }
+      if (filters.stream) { values.push(filters.stream); conditions.push(`COALESCE(NULLIF(stream, ''), 'default') = $${values.length}`); }
+      for (const [key, value] of paramFilters) { values.push(key, value); conditions.push(`params->>$${values.length - 1} = $${values.length}`); }
+      if (uniqueOnly) conditions.push('is_unique_campaign');
+      const { rows } = await db.query(`SELECT click_id FROM clicks WHERE ${conditions.join(' AND ')} ORDER BY created_at, click_id`, values);
+      clickIds = rows.map((r) => r.click_id);
+    } catch (error) { console.warn('[db] cost update fallback:', error.message); }
+  }
+  if (!clickIds) {
+    let lines = [];
+    try { lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    clickIds = applyClickUpdates(lines).filter((item) => {
+      if (item.type !== 'click' || item.campaign !== campaignId) return false;
+      const t = Date.parse(item.at);
+      if (!(t >= start && t < end)) return false;
+      if (filters.offer && item.offerId !== filters.offer) return false;
+      if (filters.stream && (item.stream || 'default') !== filters.stream) return false;
+      if (paramFilters.some(([key, value]) => item.params?.[key] !== value)) return false;
+      return !uniqueOnly || item.uniqueCampaign !== false;
+    }).map((item) => item.clickId);
+  }
+  const total = Math.round(amount * rates.factor(currency, rates.defaultCurrency) * 1e6) / 1e6;
+  const result = { ok: true, campaign: campaignId, from, to, tz, amount, currency, cost: total, costCurrency: rates.defaultCurrency, updated: clickIds.length };
+  if (!clickIds.length) return { ...result, perClick: 0 };
+  const perClick = Math.floor(total * 1e6 / clickIds.length) / 1e6;
+  const lastCost = Math.round((total - perClick * (clickIds.length - 1)) * 1e6) / 1e6;
+  const { mirrored } = await event('cost_update', { campaign: campaignId, clickIds, cost: perClick,
+    ...(lastCost !== perClick ? { lastClickId: clickIds.at(-1), lastCost } : {}) });
+  // Answer once PostgreSQL has the new costs too, so a report right after the update shows them.
+  await mirrored;
+  await audit(req, 'update', 'costs', campaignId, null, { amount, currency, from, to, tz, clicks: clickIds.length, perClick,
+    filters: Object.keys(filters).length ? JSON.stringify(filters) : null, uniqueOnly });
+  return { ...result, perClick };
+}
+
 const recordPostback = createConversionRecorder({
   findClick: getClickData,
   hasConversion: (clickId, tid) => hasRecordedConversion({ clickId, tid, eventsFile, db,
@@ -1150,17 +1308,14 @@ const recordPostback = createConversionRecorder({
       ? { revenue: String(offer.payout), currency: offer.payoutCurrency } : null;
   },
   record: (payload) => event('conversion', payload),
-  onRecorded: ({ click, clickId, revenue, currency, status, recorded }) => {
+  onRecorded: ({ click, clickId, tid, revenue, currency, status, recorded }) => {
     // Recount the offer's conversion cap now and again once PostgreSQL has the conversion.
     if (click.offerId) conversionCaps.invalidate(click.offerId, recorded?.mirrored);
     const offer = offers.get(click.offerId);
     if (!offer?.postbackUrl) return;
-    const s2sUrl = applyMacros(offer.postbackUrl, { click_id: clickId, revenue: revenue ?? '', currency: currency ?? '', status: status || 'sale' });
-    fetch(s2sUrl, { signal: AbortSignal.timeout(10000) })
-      .then(async (response) => {
-        await response.body?.cancel();
-        if (!response.ok) console.warn('[s2s] postback HTTP:', response.status);
-      }).catch((error) => console.warn('[s2s] postback failed:', error.message));
+    const s2sUrl = applyMacros(offer.postbackUrl, { click_id: clickId, tid: tid ?? '', revenue: revenue ?? '', currency: currency ?? '', status: status || 'sale' });
+    deliverS2s(s2sUrl, { clickId, campaign: click.campaign ?? null, offerId: click.offerId ?? null, tid: tid || null, status: status || 'sale' })
+      .catch((error) => console.warn('[s2s] postback failed:', error.message));
   },
   onDeliveryError: (error) => console.warn('[s2s] postback scheduling failed:', error.message),
 });
@@ -1463,7 +1618,8 @@ const server = http.createServer(async (req, res) => {
       if (url.pathname === '/dashboard') { res.writeHead(302, { location: `${basePath}/admin` }); return res.end(); }
       return json(res, 401, { error: 'login_required' });
     }
-    if (url.pathname === '/stats' || url.pathname.startsWith('/stats/') || url.pathname === '/api/clicks' || url.pathname === '/api/conversions' || url.pathname === '/api/bots') {
+    if (url.pathname === '/stats' || url.pathname.startsWith('/stats/') || url.pathname === '/api/clicks' || url.pathname === '/api/conversions' || url.pathname === '/api/bots'
+      || url.pathname === '/api/postbacks') {
       req.scope = campaignScope(req, url.searchParams.get('campaign') || null);
       if (req.scope.forbidden) return json(res, 403, { error: 'campaign_not_yours' });
     }
@@ -1666,14 +1822,25 @@ const server = http.createServer(async (req, res) => {
       return await handleClick(campaignId, offerId, offer.url);
     }
     if (url.pathname === '/postback' && req.method === 'GET') {
-      if (postbackSecret && !safeEqual(url.searchParams.get('secret'), postbackSecret)) return json(res, 401, { error: 'invalid_postback_secret' });
+      // Every incoming postback is journaled with its response code (G7), including rejected ones.
+      const q = (key) => (url.searchParams.get(key) || '').slice(0, 200) || null;
+      const context = {};
+      const logIncoming = (statusCode, error = null) => logPostback('postback_in', { clickId: q('click_id'), campaign: context.click?.campaign ?? null,
+        offerId: context.click?.offerId ?? null, tid: q('tid'), status: q('status'), revenue: q('revenue') || q('payout'), currency: q('currency'),
+        url: redactUrl(req.url), statusCode, error, ip: clientIp(req) || null });
+      if (postbackSecret && !safeEqual(url.searchParams.get('secret'), postbackSecret)) {
+        await logIncoming(401, 'invalid_postback_secret');
+        return json(res, 401, { error: 'invalid_postback_secret' });
+      }
       try {
         // `payout` is an alias of `revenue`; without either, a CPA offer's payout is used (see recordPostback).
-        const result = await recordPostback({ clickId: url.searchParams.get('click_id'),
+        const result = await recordPostback({ clickId: url.searchParams.get('click_id'), context,
           tid: url.searchParams.get('tid'), params: postbackClickParams(url.searchParams),
           revenue: url.searchParams.get('revenue') || url.searchParams.get('payout'), currency: url.searchParams.get('currency'), status: url.searchParams.get('status') });
+        await logIncoming(200);
         return json(res, 200, result);
       } catch (error) {
+        await logIncoming(error.statusCode || 500, String(error.message || error).slice(0, 300));
         if (!error.statusCode) throw error;
         return json(res, error.statusCode, { error: error.message,
           ...(error.conversionWindowDays ? { conversionWindowDays: error.conversionWindowDays } : {}) });
@@ -1818,6 +1985,26 @@ const server = http.createServer(async (req, res) => {
       const mine = scopeCampaigns(req);
       const entries = await readAudit({ entity, id: entityId, limit: mine ? 2000 : limit });
       return json(res, 200, { entries: mine ? entries.filter((e) => e.actor === req.user.email || (e.entity === 'campaign' && mine.includes(e.entityId))).slice(0, limit) : entries });
+    }
+    // Postback journals (G7): GET /api/postbacks?direction=in|out&campaign&from&to&limit. Buyers see their campaigns only.
+    if (url.pathname === '/api/postbacks' && req.method === 'GET') {
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      const direction = url.searchParams.get('direction') || 'in';
+      if (!['in', 'out'].includes(direction)) return json(res, 400, { error: 'invalid_direction' });
+      const from = url.searchParams.get('from') || null, to = url.searchParams.get('to') || null;
+      if ((from && !isoDate(from)) || (to && !isoDate(to))) return json(res, 400, { error: 'invalid_date' });
+      const rawLimit = Number(url.searchParams.get('limit') || 100);
+      const limit = Number.isInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 500) : 100;
+      const result = await readPostbacks({ direction, campaign: req.scope?.campaign || null, allowed: req.scope?.allowed || null, from, to, limit });
+      return json(res, 200, { direction, ...result });
+    }
+    // Manual cost update (G8, Keitaro «Обновить расходы»): the amount is split equally over the matching clicks.
+    if (url.pathname === '/api/costs' && req.method === 'POST') {
+      const body = await readJson(req);
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      const result = await updateCosts(body, req);
+      if (result.error) return json(res, result.status, { error: result.error });
+      return json(res, 200, result);
     }
     if (url.pathname === '/api/domains' && req.method === 'GET') return json(res, 200, { primary: primaryHost || null, domains: await trackingDomains() });
     if (url.pathname === '/api/rates' && req.method === 'GET') return json(res, 200, { defaultCurrency: rates.defaultCurrency, ...rates.info() });
@@ -2069,7 +2256,7 @@ const server = http.createServer(async (req, res) => {
       }
       // JSONL fallback
       try {
-        const lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map(JSON.parse);
+        const lines = applyClickUpdates((await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map(JSON.parse));
         const fromMs = tsFrom ? Date.parse(`${tsFrom}T00:00:00Z`) : null;
         const toMs = tsTo ? Date.parse(`${tsTo}T23:59:59Z`) : null;
         const allClicks = lines.filter((item) => item.type === 'click');

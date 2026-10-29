@@ -147,6 +147,11 @@ await db.query(`CREATE INDEX IF NOT EXISTS clicks_campaign_created_idx ON clicks
 await db.query(`CREATE INDEX IF NOT EXISTS clicks_created_idx ON clicks(created_at)`);
 await db.query(`CREATE TABLE IF NOT EXISTS bots (id BIGSERIAL PRIMARY KEY, campaign TEXT NOT NULL, offer_id TEXT, stream TEXT, user_agent TEXT, ip TEXT, reason TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
 await db.query(`CREATE INDEX IF NOT EXISTS bots_campaign_created_idx ON bots(campaign, created_at)`);
+// Postback journals (G7): incoming postbacks and outgoing S2S attempts. URLs are stored without credentials.
+await db.query(`CREATE TABLE IF NOT EXISTS postbacks (id BIGSERIAL PRIMARY KEY, direction TEXT NOT NULL, click_id TEXT, campaign TEXT, offer_id TEXT, tid TEXT,
+  status TEXT, revenue TEXT, currency TEXT, url TEXT, status_code INTEGER, error TEXT, attempt INTEGER, ip TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
+await db.query(`CREATE INDEX IF NOT EXISTS postbacks_direction_created_idx ON postbacks(direction, created_at)`);
+await db.query(`CREATE INDEX IF NOT EXISTS postbacks_campaign_created_idx ON postbacks(campaign, created_at)`);
 // Offer conversion cap counts today's conversions.
 await db.query(`CREATE INDEX IF NOT EXISTS conversions_created_idx ON conversions(created_at)`);
 

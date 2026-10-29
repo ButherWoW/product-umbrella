@@ -1649,7 +1649,7 @@
             "name": "entity",
             "in": "query",
             "description": "Filter by entity type.",
-            "schema": { "type": "string", "enum": ["campaign", "offer", "landing", "user", "settings"] }
+            "schema": { "type": "string", "enum": ["campaign", "offer", "landing", "user", "settings", "costs"] }
           },
           { "name": "id", "in": "query", "description": "Filter by entity ID.", "schema": { "type": "string" } },
           { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 100 } }
@@ -1669,6 +1669,47 @@
             }
           },
           "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/postbacks": {
+      "get": {
+        "summary": "Postback journals",
+        "description": "Incoming postbacks (direction=in, with the response code; an unknown click_id is logged with 404) or outgoing S2S attempts (direction=out; up to 3 attempts on network errors, 5xx and 429). Stored URLs have credentials (secret, token, key, password, signature…) replaced by ***. Buyers see only their campaigns.",
+        "operationId": "getPostbacks",
+        "tags": ["conversions"],
+        "security": [{ "bearerAuth": [] }, { "cookieAuth": [] }],
+        "parameters": [
+          { "name": "direction", "in": "query", "schema": { "type": "string", "enum": ["in", "out"], "default": "in" } },
+          { "name": "campaign", "in": "query", "schema": { "type": "string" } },
+          { "name": "from", "in": "query", "schema": { "type": "string", "format": "date" } },
+          { "name": "to", "in": "query", "schema": { "type": "string", "format": "date" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 100 } }
+        ],
+        "responses": {
+          "200": { "description": "Newest first: { direction, storage, postbacks: [{ at, clickId, campaign, offerId, tid, status, revenue, currency, url, statusCode, error, attempt, ip }] }" },
+          "400": { "description": "invalid_direction or invalid_date" },
+          "403": { "description": "campaign_not_yours" }
+        }
+      }
+    },
+    "/api/costs": {
+      "post": {
+        "summary": "Manual cost update",
+        "description": "Splits `amount` equally over the campaign's clicks in the local dates from..to (tz), optionally filtered; bots are not clicks. The new cost replaces the previous one. Recorded in the audit log.",
+        "operationId": "updateCosts",
+        "tags": ["campaigns"],
+        "security": [{ "bearerAuth": [] }, { "cookieAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["campaign", "from", "to", "amount"], "properties": {
+          "campaign": { "type": "string" }, "from": { "type": "string", "format": "date" }, "to": { "type": "string", "format": "date" },
+          "tz": { "type": "string", "default": "UTC" }, "amount": { "type": "number", "minimum": 0 }, "currency": { "type": "string", "description": "Default: DEFAULT_CURRENCY" },
+          "filters": { "type": "object", "description": "offer, stream, source, sub_id_1..sub_id_30 (exact values)", "additionalProperties": { "type": "string" } },
+          "uniqueOnly": { "type": "boolean", "default": false } } } } } },
+        "responses": {
+          "200": { "description": "{ ok, updated, perClick, cost, costCurrency, amount, currency, … }" },
+          "400": { "description": "Invalid dates, tz, amount, currency or filter" },
+          "403": { "description": "campaign_not_yours (buyer)" },
+          "404": { "description": "campaign_not_found" }
         }
       }
     },
