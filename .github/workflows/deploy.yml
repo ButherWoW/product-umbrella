@@ -112,6 +112,16 @@ jobs:
             done
             journalctl -u umbrella -n 40 --no-pager; exit 1'
 
+      - name: Verify storage
+        run: |
+          ssh root@$HOST 'storage=$(curl -s http://127.0.0.1:4110/health | sed -n "s/.*\"storage\":\"\([a-z]*\)\".*/\1/p")
+            echo "storage: $storage"
+            if grep -q "^DATABASE_URL=" /opt/umbrella/.env && [ "$storage" != postgres ]; then
+              echo "DATABASE_URL is set but the service is not using PostgreSQL:"
+              journalctl -u umbrella -n 30 --no-pager | grep -E "\[db\]|Error|error" | sed -E "s#postgresql://[^@ ]*@#postgresql://***@#g"
+              exit 1
+            fi'
+
       - name: Wire nginx (backup, include once, test, rollback on failure)
         run: |
           ssh root@$HOST 'set -e
