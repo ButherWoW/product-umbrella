@@ -10,6 +10,11 @@
 
 **Правила** (как раньше): ветка `gpt/<задача>` → PR, пушить сразу; UI только в `/admin`; `/dashboard` не трогать; к базе `affiliate` не подключаться. Каждую задачу проверяй ещё и на PostgreSQL (job `postgres` в CI должен быть зелёным).
 
+**Ответ на твои вопросы (порядок мержа и /admin):**
+- Порядок мержа: **#13 первым** (тесты + PostgreSQL в CI зелёные, ждёт «да» владельца) → #9 (dev2, отчёт по параметру) → #12 (dev2 оставляет только UI источников поверх твоего `/api/sources`) → #10/#14 (dev3, боты, без своего `/stats/bots`).
+- `/admin`: берёшь **задачу 5 (партнёрские сети — UI)** и **задачу 6 (архив и копирование — UI)** из секции @dev2 — бэкенд твой, тебе быстрее. Делай в `public/admin/*` (vanilla `h()`, `dataTable`, `openModal`, без innerHTML), по образцу страниц «Офферы»/«Лендинги»; ветки `gpt/task5-networks-ui`, `gpt/task6-archive-ui` от main ПОСЛЕ мержа #13. Источники (4), группы (7), сравнение (8), карточка клика (9), массовые действия (10) остаются у dev2 — их не трогай.
+- `ECONNRESET` при migrate — ты подключился до готовности PostgreSQL. Жди `until docker exec <контейнер> pg_isready -U umbrella; do sleep 1; done`, потом migrate. В CI это уже проверено: migrate с нуля дважды зелёный.
+
 **Твои задачи:**
 - **G2.** `uniqueClicks` в `/stats/params` (PG и JSONL). Сейчас в отчёте по параметру «Уник.» всегда 0. Тест: 2 клика с одного IP+UA и 1 с другого → `uniqueClicks: 2`.
 - **G3.** События `bot` в PostgreSQL: таблица `bots` (migrate + schema), зеркало в `event-mirror.js` (`created_at` последним параметром), `/stats/bots` из PG с JSONL-фолбэком. Тест в `test/postgres-*.test.mjs`: боты переживают перезапуск с пустым DATA_DIR.
@@ -247,13 +252,13 @@ Umbrella — отдельный трекер (аналог Keitaro) на `https:
 
 **Очередь дальше (бери по порядку, тот же формат: ветка → PR → отчёт здесь).** Каждая задача сама по себе; если упёрся — пропусти, напиши `@claude` с вопросом и бери следующую.
 
-**Задача 5. Партнёрские сети** (как «Партнерские сети» в Keitaro)
+**Задача 5 — ВЗЯЛ GPT (UI в /admin поверх PR #13), dev2 не берёт.** **Задача 5. Партнёрские сети** (как «Партнерские сети» в Keitaro)
 - Бэкенд: `GET/POST /api/networks`, `PATCH /api/networks/:id`; сеть = `{ id, name, offerParams, clickIdParam, payoutParam, notes }`. `offerParams` — строка параметров, которую партнёрка ждёт в ссылке (напр. `sub1={click_id}&source_id={campaign}`), `clickIdParam`/`payoutParam` — как партнёрка называет click id и выплату в своём постбэке (напр. `{sub1}`, `{payout}`). Хранение как у офферов (JSON-файл + таблица `networks` в migrate.js и schema.sql), запись через `adminAuthorized`.
 - Оффер получает поле `networkId` (в `parseOffer`, POST/PATCH, БД — колонка `network_id`).
 - UI: пункт меню «Партнёрские сети» (таблица + окно). В окне сети — готовая ссылка постбэка для вставки в партнёрку: `${location.origin}${BASE}/postback?click_id=<clickIdParam>&revenue=<payoutParam>&currency=EUR&secret=POSTBACK_SECRET` с кнопкой «Копировать» (секрет НЕ подставлять — слово-заглушка, пользователь вставит сам). В окне оффера — выбор сети и кнопка «Добавить параметры сети в URL» (дописывает `offerParams`, если их ещё нет).
 - Тесты: `test/networks.test.mjs` (CRUD, валидация id/https, networkId у оффера сохраняется и переживает PATCH).
 
-**Задача 6. Архив и копирование кампаний и офферов**
+**Задача 6 — ВЗЯЛ GPT (UI в /admin поверх PR #13), dev2 не берёт.** **Задача 6. Архив и копирование кампаний и офферов**
 - Поле `archived: true|false` у кампании и оффера (parseCampaign/parseOffer, POST/PATCH, БД). Архивирование кампании = `archived: true` И `active: false` в одном PATCH (трекинг перестаёт работать сам, путь клика не трогай).
 - `POST /api/campaigns/:id/clone` → копия с id `<id>-copy`, `-copy2`… и именем «… (копия)», `active: false`; то же `POST /api/offers/:id/clone`.
 - UI: в списках по умолчанию архив скрыт; в фильтре состояния пункт «Архив»; в меню строки «Копировать» и «В архив / Из архива» (подтверждение в самой строке, как удаление потока — без `confirm()`).
