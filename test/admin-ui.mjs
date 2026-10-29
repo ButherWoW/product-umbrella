@@ -327,6 +327,44 @@ try {
     await p2.screenshot({ path: join(tmpdir(), 'umbrella-admin-buyer.png') });
   } finally { await locked.stop(); await rm(dir2, { recursive: true, force: true }); }
 
+  // Task 8: period comparison adds Δ% columns, «—» without previous data, disabled for «За всё время».
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await api('/api/campaigns', { id: 't8-compare', name: 'T8 Compare', streams: [{ name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] }] });
+  await fetch(server.url + '/r/t8-compare', { redirect: 'manual' });
+  await page.goto(server.url + '/admin#/reports?group=campaign&campaign=t8-compare');
+  await page.getByRole('heading', { name: 'Отчёт' }).waitFor();
+  await page.getByRole('combobox', { name: 'Период' }).selectOption('today');
+  const t8Row = page.locator('table.grid tbody tr', { hasText: 'T8 Compare' });
+  await t8Row.waitFor();
+  const t8Box = page.getByRole('checkbox', { name: 'Сравнить с предыдущим периодом' });
+  assert.ok(await t8Box.isEnabled(), 'compare checkbox enabled for «Сегодня»');
+  assert.equal(await page.locator('table.grid th', { hasText: 'Δ%' }).count(), 0, 'no Δ% columns before compare');
+  await t8Box.check();
+  await page.locator('table.grid th', { hasText: 'Δ%' }).first().waitFor();
+  assert.equal(await page.locator('table.grid th', { hasText: 'Δ%' }).count(), 4, 'Δ% next to clicks, conversions, revenue, profit');
+  const t8Cells = await page.evaluate(() => {
+    const ths = [...document.querySelectorAll('table.grid thead th')];
+    const row = [...document.querySelectorAll('table.grid tbody tr')].find((r) => r.textContent.includes('T8 Compare'));
+    const tds = [...row.querySelectorAll('td')];
+    return ths.map((th, i) => [th.textContent.trim(), tds[i]?.textContent.trim()]);
+  });
+  const t8ClicksIdx = t8Cells.findIndex(([l]) => l.startsWith('Клики'));
+  assert.ok(t8Cells[t8ClicksIdx + 1][0].startsWith('Δ%'), 'Δ% column follows clicks');
+  assert.equal(t8Cells[t8ClicksIdx + 1][1], '—', 'Δ% is «—» when the previous period has no clicks');
+  assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem('umbrella:reports:compare'))), true, 'compare choice persisted');
+  await page.reload();
+  await page.locator('table.grid tbody tr', { hasText: 'T8 Compare' }).waitFor();
+  await page.locator('table.grid th', { hasText: 'Δ%' }).first().waitFor();
+  assert.ok(await page.getByRole('checkbox', { name: 'Сравнить с предыдущим периодом' }).isChecked(), 'compare checkbox restored after reload');
+  await page.getByRole('combobox', { name: 'Период' }).selectOption('all');
+  await page.locator('table.grid tbody tr', { hasText: 'T8 Compare' }).waitFor();
+  await page.waitForFunction(() => !document.querySelector('table.grid th')?.closest('table')?.textContent.includes('Δ%'));
+  assert.ok(await page.getByRole('checkbox', { name: 'Сравнить с предыдущим периодом' }).isDisabled(), 'compare disabled for «За всё время»');
+  await page.getByRole('combobox', { name: 'Период' }).selectOption('today');
+  await page.locator('.chip-btn', { hasText: 'День' }).click();
+  assert.ok(await page.getByRole('checkbox', { name: 'Сравнить с предыдущим периодом' }).isDisabled(), 'compare disabled for day grouping');
+  await page.evaluate(() => localStorage.removeItem('umbrella:reports:compare'));
+
   assert.deepEqual(errors, []);
   console.log('Admin UI browser test passed');
 } finally {

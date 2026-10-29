@@ -1228,6 +1228,27 @@ async function pageReports(params) {
   const drawPresets = () => put(presets, [...GROUPS.map(([k, l]) => h('button', { class: 'chip-btn' + (f.group === k && !f.field ? ' on' : ''), onclick: () => { f.group = k; f.field = ''; paramSel.value = ''; drawPresets(); load(); } }, l)), h('button', { class: 'chip-btn' + (f.group === 'heatmap' ? ' on' : ''), onclick: () => { f.group = 'heatmap'; f.field = ''; paramSel.value = ''; drawPresets(); load(); } }, 'Карта по часам')]);
   drawPresets();
 
+  // Period comparison: a second request for the equally long period right before the current one.
+  const COMPARE_GROUPS = new Set(['campaign', 'offer', 'stream', 'landing', 'country', 'device', 'os', 'browser', 'language', 'isp']);
+  // Named via title, not <label>: a label containing «периодом» would also match lookups of the «Период» select by label.
+  const compareBox = h('input', { type: 'checkbox', title: 'Сравнить с предыдущим периодом', checked: store.get('reports:compare', false), onchange: (e) => { store.set('reports:compare', e.target.checked); load(); } });
+  const compareLabel = h('span', { class: 'muted', style: 'display:inline-flex;align-items:center;gap:4px;cursor:pointer', onclick: (e) => { if (e.target !== compareBox) compareBox.click(); } }, compareBox, h('span', { 'aria-hidden': 'true' }, 'Сравнить с предыдущим периодом'));
+  const prevRange = (from, to) => {
+    const start = Date.parse(from + 'T00:00:00Z'); const span = Date.parse(to + 'T00:00:00Z') - start + 86400000;
+    return { from: new Date(start - span).toISOString().slice(0, 10), to: new Date(start - 86400000).toISOString().slice(0, 10) };
+  };
+  const deltaPct = (cur, prev) => (prev ? (cur - prev) / Math.abs(prev) * 100 : null);
+  const deltaCell = (d) => (d === null ? '—' : h('span', { class: d > 0 ? 'pos' : d < 0 ? 'neg' : '' }, (d > 0 ? '+' : '') + d.toLocaleString('ru-RU', { maximumFractionDigits: 1 }) + '%'));
+  const DELTA_METRICS = { clicks: ['клики', (r) => r.clicks || 0], conversions: ['конверсии', (r) => r.conversions || 0], revenue: ['доход', (r) => r.revenue || 0], profit: ['прибыль', (r) => (r.revenue || 0) - (r.cost || 0)] };
+  const withDeltas = (cols) => cols.flatMap((c) => {
+    const m = DELTA_METRICS[c.key];
+    if (!m) return [c];
+    const [name, get] = m;
+    const totalOf = (rs) => deltaPct(rs.reduce((s, r) => s + get(r), 0), rs.reduce((s, r) => s + (r.prev ? get(r.prev) : 0), 0));
+    return [c, { key: 'delta_' + c.key, label: 'Δ%', title: 'Δ% ' + name + ' к предыдущему периоду', num: true,
+      value: (r) => deltaPct(get(r), r.prev ? get(r.prev) : 0), render: (r) => deltaCell(deltaPct(get(r), r.prev ? get(r.prev) : 0)), total: (rs) => deltaCell(totalOf(rs)) }];
+  });
+
   // Saved reports
   const savedBar = h('div', { class: 'toolbar', style: 'flex-wrap:wrap;gap:4px;margin-bottom:4px', 'aria-label': 'Сохранённые отчёты' });
   const drawSaved = () => {
@@ -1293,7 +1314,7 @@ async function pageReports(params) {
       sel('campaign', 'Все кампании', Object.entries(state.campaigns).map(([id, c]) => [id, c.name || id])),
       sel('offer', 'Все офферы', Object.keys(state.offers).map((id) => [id, id])),
       txt('country', 'Страна'), txt('stream', 'Поток'), txt('subid', 'Sub ID'),
-      periodControl(() => load()), currencyControl(() => load()),
+      periodControl(() => load()), currencyControl(() => load()), compareLabel,
       listsBtn,
       h('button', { class: 'btn', onclick: saveReport }, '💾 Сохранить'),
       h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'),
@@ -1305,6 +1326,10 @@ async function pageReports(params) {
     const { from, to } = periodRange();
     note.textContent = '';
     listsBtn.hidden = !f.field || !LIST_FIELDS.has(f.field);
+    compareBox.disabled = !from || !(f.field || COMPARE_GROUPS.has(f.group));
+    compareBox.title = compareBox.disabled ? 'Сравнить с предыдущим периодом — недоступно для «За всё время», времени, карты по часам, рефереров и путей' : 'Сравнить с предыдущим периодом';
+    const compare = compareBox.checked && !compareBox.disabled;
+    const prev = compare ? prevRange(from, to) : null;
     if (f.group === 'heatmap') {
       table?.detach(); table = null;
       const tz = store.get('heatmap:tz', 'UTC');
@@ -1361,17 +1386,32 @@ async function pageReports(params) {
       if (f.field) {
         const s = await api('/stats/params' + qs({ field: f.field, campaign: f.campaign, from, to }));
         rows = (s.rows || []).map((x) => ({ id: x.value || '(не передан)', clicks: x.clicks || 0, conversions: x.conversions || 0, revenue: x.revenue || 0, cost: x.cost || 0, profit: x.profit || 0, roi: x.roi || 0 }));
+        if (prev) {
+          const p = await api('/stats/params' + qs({ field: f.field, campaign: f.campaign, ...prev }));
+          const byId = new Map((p.rows || []).map((x) => [x.value || '(не передан)', x]));
+          rows.forEach((r) => { r.prev = byId.get(r.id) || null; });
+        }
         currentParamRows = rows;
         note.textContent = 'Для отчёта по параметру применяются только кампания и период.';
       } else if (prop) {
         const s = await api('/stats' + qs({ from, to, campaign: f.campaign, offer: f.offer, country: f.country, stream: f.stream, subid: f.subid }));
         rows = groupRows(s[prop]);
+        if (prev) {
+          const p = await api('/stats' + qs({ ...prev, campaign: f.campaign, offer: f.offer, country: f.country, stream: f.stream, subid: f.subid }));
+          const byId = new Map(groupRows(p[prop]).map((x) => [x.id, x]));
+          rows.forEach((r) => { r.prev = byId.get(r.id) || null; });
+        }
         if (key === 'campaign') drill = (r) => ({ group: 'stream', campaign: r.id });
         if (key === 'offer') drill = (r) => ({ group: 'country', offer: r.id });
         if (key === 'stream') drill = (r) => ({ group: 'offer', stream: r.id });
       } else if (['device', 'os', 'browser', 'language', 'isp'].includes(key)) {
         const r = await api('/stats/params' + qs({ field: key, campaign: f.campaign, from, to }));
         rows = (r.rows || []).map((x) => ({ id: x.value || '(неизвестно)', clicks: x.clicks || 0, conversions: x.conversions || 0, revenue: x.revenue || 0, cost: x.cost || 0 }));
+        if (prev) {
+          const p = await api('/stats/params' + qs({ field: key, campaign: f.campaign, ...prev }));
+          const byId = new Map((p.rows || []).map((x) => [x.value || '(неизвестно)', x]));
+          rows.forEach((r) => { r.prev = byId.get(r.id) || null; });
+        }
         if (f.offer || f.country || f.stream || f.subid) note.textContent = 'Для этой группировки применяются только кампания и период.';
       } else if (key === 'day' || key === 'hour') {
         const ts = await api('/stats/timeseries' + qs({ campaign: f.campaign, from, to, granularity: key }));
@@ -1382,6 +1422,7 @@ async function pageReports(params) {
         rows = (r.referrers || r.paths || []).map((x) => ({ id: x.referrer ?? x.path ?? '—', clicks: x.clicks || 0, conversions: 0, revenue: 0 }));
         note.textContent = 'Рефереры и пути считаются за всё время, применяется только фильтр кампании; конверсии здесь не считаются.';
       }
+      if (prev) note.textContent = [note.textContent, `Δ% — по сравнению с ${prev.from} — ${prev.to}.`].filter(Boolean).join(' ');
       const nameOf = (r) => (key === 'campaign' ? state.campaigns[r.id]?.name || r.id : key === 'landing' ? (r.id === 'none' ? '(без лендинга)' : state.landings[r.id]?.name || r.id) : r.id);
       const expandedRows = new Map();
       const expandRow = async (r, btn) => {
@@ -1435,7 +1476,7 @@ async function pageReports(params) {
                 h('button', { style: 'all:unset;cursor:pointer;font-size:10px;color:var(--fg-2,#999);user-select:none', 'aria-label': 'Развернуть', onclick: (e) => { e.stopPropagation(); expandRow(r, e.currentTarget); } }, '▸'),
                 nameOf(r))
             : nameOf(r) },
-          ...metricCols({ rpm: true })],
+          ...(prev ? withDeltas(metricCols({ rpm: true })) : metricCols({ rpm: true }))],
       });
       put(holder, table);
     } catch (e) { put(holder, h('p', { class: 'err' }, 'Ошибка отчёта: ' + e.message)); }
