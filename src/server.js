@@ -1694,6 +1694,24 @@ const server = http.createServer(async (req, res) => {
       const limit = Number.isInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 1000) : 100;
       if (botFrom && !/^\d{4}-\d{2}-\d{2}$/.test(botFrom)) return json(res, 400, { error: 'invalid_from_date' });
       if (botTo && !/^\d{4}-\d{2}-\d{2}$/.test(botTo)) return json(res, 400, { error: 'invalid_to_date' });
+      const botRow = (b) => ({ at: b.at ?? null, campaign: b.campaign ?? null, offerId: b.offerId ?? null, stream: b.stream ?? null, reason: b.reason ?? 'user_agent',
+        isp: b.isp ?? null, userAgent: b.userAgent ? String(b.userAgent).slice(0, 200) : null, ip: b.ip ?? null });
+      // PostgreSQL first (the bots table, with isp), the JSONL journal as fallback.
+      if (db) {
+        try {
+          const where = [], values = [];
+          const add = (sql, value) => { values.push(value); where.push(sql.replace('?', `$${values.length}`)); };
+          if (botCampaign) add('campaign = ?', botCampaign);
+          if (req.scope?.allowed) add('campaign = ANY(?::text[])', req.scope.allowed);
+          if (botFrom) add('created_at >= ?', `${botFrom}T00:00:00Z`);
+          if (botTo) add('created_at <= ?', `${botTo}T23:59:59Z`);
+          values.push(limit);
+          const { rows } = await db.query(`SELECT created_at, campaign, offer_id, stream, reason, isp, user_agent, ip FROM bots ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+            ORDER BY created_at DESC, id DESC LIMIT $${values.length}`, values);
+          return json(res, 200, { bots: rows.map((r) => botRow({ at: new Date(r.created_at).toISOString(), campaign: r.campaign, offerId: r.offer_id, stream: r.stream,
+            reason: r.reason, isp: r.isp, userAgent: r.user_agent, ip: r.ip })) });
+        } catch (e) { console.warn('[db] bot log fallback:', e.message); }
+      }
       try {
         const lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
         const fromMs = botFrom ? Date.parse(`${botFrom}T00:00:00Z`) : null;
@@ -1706,16 +1724,7 @@ const server = http.createServer(async (req, res) => {
           if (fromMs !== null && (t === null || t < fromMs)) return false;
           if (toMs !== null && (t === null || t > toMs)) return false;
           return true;
-        }).reverse().slice(0, limit).map((b) => ({
-          at: b.at ?? null,
-          campaign: b.campaign ?? null,
-          offerId: b.offerId ?? null,
-          stream: b.stream ?? null,
-          reason: b.reason ?? 'user_agent',
-          isp: b.isp ?? null,
-          userAgent: b.userAgent ? String(b.userAgent).slice(0, 200) : null,
-          ip: b.ip ?? null,
-        }));
+        }).reverse().slice(0, limit).map(botRow);
         return json(res, 200, { bots });
       } catch (e) {
         if (e.code === 'ENOENT') return json(res, 200, { bots: [] });
@@ -2159,9 +2168,9 @@ if (db) {
         .map((line) => { try { return JSON.parse(line); } catch { return null; } }).filter((e) => e?.type === 'bot' && e.campaign);
       for (let i = 0; i < old.length; i += 500) {
         const chunk = old.slice(i, i + 500); const values = [];
-        const tuples = chunk.map((e, j) => { values.push(e.campaign, e.offerId ?? null, e.stream ?? null, e.userAgent ?? null, e.ip ?? null, e.reason ?? null, e.at || new Date().toISOString());
-          const b = j * 7; return `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7})`; });
-        await db.query(`INSERT INTO bots (campaign, offer_id, stream, user_agent, ip, reason, created_at) VALUES ${tuples.join(',')}`, values);
+        const tuples = chunk.map((e, j) => { values.push(e.campaign, e.offerId ?? null, e.stream ?? null, e.userAgent ?? null, e.ip ?? null, e.reason ?? null, e.isp ?? null, e.at || new Date().toISOString());
+          const b = j * 8; return `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7},$${b + 8})`; });
+        await db.query(`INSERT INTO bots (campaign, offer_id, stream, user_agent, ip, reason, isp, created_at) VALUES ${tuples.join(',')}`, values);
       }
       if (old.length) console.log(`[db] copied ${old.length} bot events from the journal`);
     }

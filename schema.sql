@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS conversions (
 );
 CREATE TABLE IF NOT EXISTS bots (
   id BIGSERIAL PRIMARY KEY, campaign TEXT NOT NULL, offer_id TEXT, stream TEXT,
-  user_agent TEXT, ip TEXT, reason TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  user_agent TEXT, ip TEXT, reason TEXT, isp TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS bots_campaign_created_idx ON bots(campaign, created_at);
 
