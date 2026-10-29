@@ -303,6 +303,42 @@ try {
     await dlg.locator('input[type=password]').fill('buyer-password-1');
     await dlg.getByRole('button', { name: 'Создать' }).click();
     await p2.locator('table.grid tbody tr', { hasText: 'buyer@example.com' }).waitFor();
+    await p2.locator('.ip-allowlist', { hasText: 'Ограничения нет' }).waitFor();
+
+    // API keys: the secret is shown once with a copy button, the list shows only the last 4 characters,
+    // deletion needs a second click on the same row button (no confirm()).
+    await p2.locator('[data-nav=keys]').click();
+    await p2.getByRole('heading', { name: 'API-ключи' }).waitFor();
+    await p2.getByRole('button', { name: 'Создать', exact: true }).click();
+    const keyDlg = p2.getByRole('dialog', { name: 'Новый API-ключ' });
+    await keyDlg.getByLabel('Название').fill('UI script');
+    await keyDlg.getByRole('button', { name: 'Создать' }).click();
+    const secretDlg = p2.getByRole('dialog', { name: 'Ключ создан' });
+    const secret = await secretDlg.getByRole('textbox', { name: 'API-ключ' }).inputValue();
+    assert.match(secret, /^umb_[A-Za-z0-9_-]{43}$/);
+    assert.ok(await secretDlg.getByRole('button', { name: 'Копировать' }).isVisible());
+    assert.equal((await fetch(locked.url + '/api/auth/me', { headers: { authorization: 'Bearer ' + secret } }).then((r) => r.json())).user.email, 'owner@example.com', 'the shown key works');
+    await secretDlg.getByRole('button', { name: 'Готово' }).click();
+    const keyRow = p2.locator('table.grid tbody tr', { hasText: 'UI script' });
+    await keyRow.waitFor();
+    assert.ok((await keyRow.innerText()).includes('umb_…' + secret.slice(-4)));
+    assert.ok(!(await p2.locator('body').innerText()).includes(secret), 'the secret is gone after closing the dialog');
+    await p2.setViewportSize({ width: 390, height: 844 });
+    for (const hash of ['#/keys', '#/users']) {
+      await p2.goto(locked.url + '/admin' + hash);
+      await p2.locator('table.grid').waitFor();
+      const overflow = await p2.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+      assert.ok(overflow <= 1, `${hash} overflows by ${overflow}px at 390px`);
+    }
+    await p2.setViewportSize({ width: 1280, height: 900 });
+    await p2.goto(locked.url + '/admin#/keys');
+    const del = p2.locator('table.grid tbody tr', { hasText: 'UI script' }).getByRole('button', { name: 'Удалить ключ UI script' });
+    await del.click();
+    await p2.locator('table.grid tbody tr', { hasText: 'Удалить?' }).waitFor();
+    await del.click();
+    await p2.locator('#toast', { hasText: 'Ключ удалён' }).waitFor();
+    await p2.locator('table.grid tbody tr', { hasText: 'UI script' }).waitFor({ state: 'detached' });
+    assert.equal((await fetch(locked.url + '/api/auth/me', { headers: { authorization: 'Bearer ' + secret } })).status, 401, 'deleted key stops working');
     await p2.locator('[data-nav=dashboard]').click();
     await p2.getByRole('heading', { name: 'Баеры' }).waitFor();
 
