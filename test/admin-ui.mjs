@@ -328,6 +328,43 @@ try {
   const attentionText = await attentionCard.innerText();
   assert.ok(/D13 Bad ROI|d13-bad/.test(attentionText) && /ROI/.test(attentionText), `attention block has campaign info, got: ${attentionText.slice(0, 100)}`);
 
+  // D15: compare two campaigns
+  await api('/api/campaigns', { id: 'd15-alpha', name: 'D15 Alpha', streams: [{ name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] }] });
+  await api('/api/campaigns', { id: 'd15-beta', name: 'D15 Beta', streams: [{ name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] }] });
+  for (let i = 0; i < 3; i++) await fetch(server.url + '/r/d15-alpha', { redirect: 'manual' });
+  await fetch(server.url + '/r/d15-beta', { redirect: 'manual' });
+  await page.goto(server.url + '/admin#/campaigns');
+  await page.locator('table.grid tbody tr', { hasText: 'D15 Alpha' }).waitFor();
+  await page.locator('table.grid tbody tr', { hasText: 'D15 Alpha' }).locator('input[type=checkbox]').check();
+  await page.locator('table.grid tbody tr', { hasText: 'D15 Beta' }).locator('input[type=checkbox]').check();
+  await page.locator('button', { hasText: 'Сравнить' }).waitFor();
+  await page.locator('button', { hasText: 'Сравнить' }).click();
+  const cmpDialog = page.getByRole('dialog', { name: 'Сравнение кампаний' });
+  await cmpDialog.waitFor();
+  const cmpText = await cmpDialog.innerText();
+  assert.ok(cmpText.includes('D15 Alpha'), `compare dialog should show first campaign, got: ${cmpText.slice(0, 200)}`);
+  assert.ok(cmpText.includes('D15 Beta'), 'compare dialog should show second campaign');
+  assert.ok(cmpText.includes('Клики'), 'compare dialog should show metrics');
+  const cmpRows = await cmpDialog.locator('table.grid tbody tr').count();
+  assert.equal(cmpRows, 9, `compare table should have 9 metric rows, got ${cmpRows}`);
+  await page.keyboard.press('Escape');
+  // D16: landing LP CTR and CR columns in reports
+  await api('/api/landings', { id: 'landing-d16', name: 'D16 Landing', url: server.url + '/admin' });
+  await api('/api/campaigns', { id: 'd16-camp', name: 'D16 Camp', streams: [{ name: 'Main', landingId: 'landing-d16', offers: [{ offerId: 'offer-1', weight: 1 }] }] });
+  const d16r1 = await fetch(server.url + '/r/d16-camp', { redirect: 'manual' });
+  const d16cid = d16r1.headers.get('location') ? new URL(d16r1.headers.get('location')).searchParams.get('click_id') : null;
+  await fetch(server.url + '/r/d16-camp', { redirect: 'manual' });
+  await fetch(server.url + '/r/d16-camp', { redirect: 'manual' });
+  if (d16cid) await fetch(server.url + '/lp/click?click_id=' + d16cid, { redirect: 'manual' });
+  await page.goto(server.url + '/admin#/reports?group=landing');
+  await page.getByRole('heading', { name: 'Отчёт' }).waitFor();
+  await page.locator('button.chip-btn', { hasText: 'Лендинг' }).waitFor();
+  await page.locator('button.chip-btn', { hasText: 'Лендинг' }).click();
+  await page.locator('table.grid').waitFor({ timeout: 5000 });
+  const lpHeaders = await page.locator('table.grid thead th').allInnerTexts();
+  assert.ok(lpHeaders.some((h) => h === 'LP CTR'), `landing report should have LP CTR column, got: ${lpHeaders.join(', ')}`);
+  assert.ok(lpHeaders.some((h) => h.includes('CR (LP)')), `landing report should have CR (LP) column`);
+
   assert.deepEqual(errors, []);
 
   // Accounts: a REQUIRE_LOGIN install starts with the setup screen; owner creates a buyer; logout returns to login.
