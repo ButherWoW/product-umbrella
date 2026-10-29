@@ -169,9 +169,9 @@ async function historyModal(entity, id, title) {
     put(list, entries.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'grid' },
       h('thead', {}, h('tr', {}, h('th', {}, 'Когда'), h('th', {}, 'Кто'), h('th', {}, 'Действие'), h('th', {}, 'Что изменилось'))),
       h('tbody', {}, entries.map((e) => h('tr', {},
-        h('td', {}, dt(e.at)), h('td', {}, e.actor === 'system' ? 'система' : e.actor === 'admin-token' ? 'ключ администратора' : e.actor),
-        h('td', {}, ACTION_LABEL[e.action] || e.action),
-        h('td', { style: 'white-space:normal' }, Object.entries(e.changes || {}).map(([k, v]) => h('div', {}, h('b', {}, FIELD_LABEL[k] || k), v ? `: ${showValue(v[0])} → ${showValue(v[1])}` : ': изменено'))))))))
+        h('td', { 'data-label': 'Когда' }, dt(e.at)), h('td', { 'data-label': 'Кто' }, e.actor === 'system' ? 'система' : e.actor === 'admin-token' ? 'ключ администратора' : e.actor),
+        h('td', { 'data-label': 'Действие' }, ACTION_LABEL[e.action] || e.action),
+        h('td', { 'data-label': 'Что изменилось', style: 'white-space:normal' }, Object.entries(e.changes || {}).map(([k, v]) => h('div', {}, h('b', {}, FIELD_LABEL[k] || k), v ? `: ${showValue(v[0])} → ${showValue(v[1])}` : ': изменено'))))))))
       : h('p', { class: 'muted' }, 'Изменений пока нет.'));
   } catch (e) { put(list, h('p', { class: 'err' }, 'Не удалось загрузить историю: ' + e.message)); }
 }
@@ -263,7 +263,7 @@ function dataTable({ id, columns, rows = [], selectable = false, pageSize = 50, 
       onclick: c.sortable === false ? null : () => { sort = sort?.key === c.key ? { key: c.key, dir: sort.dir === 'desc' ? 'asc' : 'desc' } : { key: c.key, dir: c.num ? 'desc' : 'asc' }; store.set('sort:' + id, sort); render(); },
     }, c.label, sort?.key === c.key ? (sort.dir === 'desc' ? ' ↓' : ' ↑') : ''))));
     const tbody = h('tbody', {}, shown.length ? shown.map((r) => h('tr', { class: rowClass ? rowClass(r) : null },
-      selectable ? h('td', {}, h('input', { type: 'checkbox', 'aria-label': 'Выбрать', checked: selected.has(r.id),
+      selectable ? h('td', { class: 'sel' }, h('input', { type: 'checkbox', 'aria-label': 'Выбрать', checked: selected.has(r.id),
         onchange: (e) => { e.target.checked ? selected.add(r.id) : selected.delete(r.id); root.dispatchEvent(new Event('selection')); } })) : null,
       cols.map((c) => h('td', { class: [c.num ? 'num' : '', c.cls || ''].join(' '), title: c.tip ? c.tip(r) : null, 'data-label': c.label }, c.render ? c.render(r) : (valueOf(c, r) ?? '—')))))
       : h('tr', {}, h('td', { colspan: cols.length + (selectable ? 1 : 0), class: 'empty' }, empty)));

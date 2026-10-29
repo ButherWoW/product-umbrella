@@ -174,7 +174,7 @@ body.auth-mode .view { margin-left: 0; display: grid; place-items: start center;
   table.grid td { display: flex; justify-content: space-between; align-items: baseline; padding: 6px 12px; border-bottom: 1px solid var(--line); white-space: normal; text-align: right; min-height: 0; }
   table.grid tr td:last-child { border-bottom: none; }
   table.grid td[data-label]::before { content: attr(data-label); color: var(--fg-3); font-size: 12px; flex: 0 0 auto; margin-right: 12px; text-align: left; white-space: nowrap; }
-  table.grid td:not([data-label]) { display: none; }
+  table.grid td.sel { display: none; }
   table.grid td.bar-profit { display: none; }
   table.grid td.num { text-align: right; }
   table.grid td.name { max-width: none; overflow: visible; text-overflow: clip; }
