@@ -686,6 +686,78 @@ try {
   await page.locator('#toast', { hasText: 'Сохранено' }).waitFor();
   const bindSaved = (await (await api('/api/campaigns', undefined, 'GET')).json()).campaigns['bind-ui'];
   assert.deepEqual([bindSaved.bindVisitors, bindSaved.bindTtlHours], ['stream_offer', 48], 'binding settings saved');
+  // User permissions: owner sets role «Только чтение» and flags in the users page; a viewer gets no write
+  // controls, a hideRevenue buyer gets no revenue tiles or columns.
+  {
+    const dir4 = await mkdtemp(join(tmpdir(), 'umbrella-admin-perms-'));
+    const permSrv = await startTestServer(dir4, { ADMIN_TOKEN: TOKEN, REQUIRE_LOGIN: '1' });
+    try {
+      const papi = (path, body, method = 'POST') => fetch(permSrv.url + path, { method, headers: { 'content-type': 'application/json', authorization: 'Bearer ' + TOKEN }, body: JSON.stringify(body) }).then((r) => r.json());
+      await papi('/api/auth/setup', { email: 'perm-owner@example.com', password: 'owner-password-1' });
+      const login = async (email, password) => {
+        const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+        const pg = await ctx.newPage();
+        pg.on('pageerror', (error) => errors.push(error.message));
+        await pg.goto(permSrv.url + '/admin#/dashboard');
+        await pg.getByLabel('Email').fill(email);
+        await pg.getByLabel('Пароль').fill(password);
+        await pg.getByRole('button', { name: 'Войти' }).click();
+        await pg.locator('#user-box', { hasText: email }).waitFor();
+        return { ctx, pg };
+      };
+      const own = await login('perm-owner@example.com', 'owner-password-1');
+      await own.pg.setViewportSize({ width: 1280, height: 900 });
+      await own.pg.goto(permSrv.url + '/admin#/users');
+      await own.pg.getByRole('heading', { name: 'Пользователи' }).waitFor();
+      const createUser = async (email, role) => {
+        await own.pg.getByRole('button', { name: 'Создать', exact: true }).click();
+        const dlg = own.pg.getByRole('dialog', { name: 'Новый пользователь' });
+        await dlg.locator('input[type=email]').fill(email);
+        await dlg.locator('input[type=password]').fill('user-password-1');
+        if (role) await dlg.getByRole('combobox', { name: 'Роль' }).selectOption({ label: role });
+        await dlg.getByRole('button', { name: 'Создать' }).click();
+        await own.pg.locator('table.grid tbody tr', { hasText: email }).waitFor();
+      };
+      await createUser('perm-viewer@example.com', 'Только чтение');
+      await createUser('perm-buyer@example.com');
+      await own.pg.locator('table.grid tbody tr', { hasText: 'perm-viewer@example.com' }).getByText('Только чтение').waitFor();
+      await own.pg.getByRole('button', { name: 'Права пользователя perm-buyer@example.com' }).click();
+      const permDlg = own.pg.getByRole('dialog', { name: 'Права пользователя' });
+      await permDlg.getByLabel('Скрывать доход').check();
+      await permDlg.getByLabel('Только офферы своих кампаний').check();
+      assert.ok(await permDlg.getByLabel('Видит все кампании').isHidden(), 'viewAll only for viewers');
+      await permDlg.getByRole('button', { name: 'Сохранить' }).click();
+      await own.pg.locator('#toast', { hasText: 'Права сохранены' }).waitFor();
+      await own.pg.locator('table.grid tbody tr', { hasText: 'perm-buyer@example.com' }).getByText('без дохода, свои офферы').waitFor();
+      const permUsers = (await (await fetch(permSrv.url + '/api/users', { headers: { authorization: 'Bearer ' + TOKEN } })).json()).users;
+      const pb = permUsers.find((u) => u.email === 'perm-buyer@example.com');
+      assert.deepEqual([pb.role, pb.hideRevenue, pb.offersAccess], ['buyer', true, 'own'], 'flags saved from the dialog');
+      await papi('/api/campaigns', { id: 'perm-camp', name: 'Perm camp', ownerId: pb.id, streams: [{ name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] }] });
+      await own.ctx.close();
+
+      const hid = await login('perm-buyer@example.com', 'user-password-1');
+      await hid.pg.locator('.kpi', { hasText: 'Расход' }).waitFor();
+      assert.equal(await hid.pg.locator('.kpi', { hasText: 'Доход' }).count(), 0, 'no revenue tile');
+      assert.equal(await hid.pg.locator('.kpi', { hasText: 'ROI' }).count(), 0, 'no ROI tile');
+      await hid.pg.goto(permSrv.url + '/admin#/campaigns');
+      await hid.pg.locator('table.grid tbody tr', { hasText: 'Perm camp' }).waitFor();
+      const heads = await hid.pg.locator('table.grid thead').innerText();
+      assert.ok(!/Доход|Прибыль|ROI|EPC/.test(heads), `revenue columns hidden: ${heads}`);
+      await hid.ctx.close();
+
+      const ro = await login('perm-viewer@example.com', 'user-password-1');
+      assert.ok(await ro.pg.evaluate(() => document.body.classList.contains('read-only')));
+      await ro.pg.goto(permSrv.url + '/admin#/campaigns');
+      await ro.pg.locator('table.grid').waitFor();
+      assert.ok(await ro.pg.locator('a.btn.primary', { hasText: 'Создать' }).isHidden(), 'viewer has no create button');
+      await ro.pg.getByRole('button', { name: 'Выйти' }).click();
+      await ro.pg.getByRole('button', { name: 'Войти' }).waitFor({ state: 'visible' });
+      await ro.ctx.close();
+    } finally {
+      await permSrv.stop();
+      await rm(dir4, { recursive: true, force: true });
+    }
+  }
 
   assert.deepEqual(errors, []);
   console.log('Admin UI browser test passed');

@@ -94,6 +94,10 @@ async function loadRefs() {
 }
 
 const isOwnerView = () => state.me?.user?.role === 'owner';
+// Permission flags of the signed-in user. The server already strips the data; the panel only tidies the layout.
+const hideRev = () => Boolean(state.me?.user?.hideRevenue) && state.me.user.role !== 'owner';
+const REV_COLS = new Set(['revenue', 'profit', 'roi', 'epc', 'rpm', 'uepc', 'pendingRevenue', 'earn']);
+const ROLE_LABEL = { owner: 'Владелец', buyer: 'Баер', viewer: 'Только чтение' };
 const userEmail = (id) => state.users.find((u) => u.id === id)?.email || (id ? 'удалённый пользователь' : '—');
 
 // ---------- period ----------
@@ -410,7 +414,7 @@ const metricCols = (opts = {}) => [
   { key: 'approvePct', label: 'Approve %', title: 'Approve % — доля подтверждённых от всех завершённых', num: true, hidden: true, value: (r) => { const d = (r.sales || 0) + (r.rejected || 0) + (r.leads || 0); return d ? (r.sales || 0) / d : 0; }, render: (r) => { const d = (r.sales || 0) + (r.rejected || 0) + (r.leads || 0); return d ? pct((r.sales || 0) / d) : '—'; }, total: (rs) => { const d = sum(rs, 'sales') + sum(rs, 'rejected') + sum(rs, 'leads'); return d ? pct(sum(rs, 'sales') / d) : '—'; } },
   { key: 'crHold', label: 'CR (холд)', title: 'CR (холд) — доля лидов от кликов', num: true, hidden: true, value: (r) => ratio(r.leads, r.clicks), render: (r) => (r.clicks ? pct(ratio(r.leads, r.clicks)) : '—'), total: (rs) => { const c = sum(rs, 'clicks'); return c ? pct(sum(rs, 'leads') / c) : '—'; } },
   { key: 'cpa', label: 'CPA', title: 'CPA — расход на продажу', num: true, hidden: true, value: (r) => (r.sales ? (r.cost || 0) / r.sales : 0), render: (r) => (r.sales ? money4((r.cost || 0) / r.sales) : '—'), total: (rs) => { const s = sum(rs, 'sales'); return s ? money4(sum(rs, 'cost') / s) : '—'; } },
-];
+].filter((c) => !hideRev() || !REV_COLS.has(c.key));
 const sum = (rows, key) => rows.reduce((s, r) => s + (Number(r[key]) || 0), 0);
 const groupRows = (obj) => Object.entries(obj || {}).map(([id, v]) => ({ id, clicks: v.clicks || 0, uniqueClicks: v.uniqueClicks || 0, conversions: v.conversions || 0, revenue: v.revenue || 0, cost: v.cost || 0, lpClicks: v.lpClicks || 0,
   leads: v.leads || 0, sales: v.sales || 0, rejected: v.rejected || 0, pendingRevenue: v.pendingRevenue || 0 }));
@@ -500,8 +504,8 @@ async function pageDashboard() {
       const top5 = (id, title, rows, nameOf, link) => h('div', { class: 'card' }, h('h2', {}, title), dataTable({ id: 'dash-t5-' + id, pageSize: 5, compact: true, totals: false, rows: [...rows].sort((a, b) => b.revenue - a.revenue).slice(0, 5), columns: [{ key: 'id', label: 'Название', fixed: true, cls: 'name', render: (r) => h('a', { href: link(r) }, nameOf(r)) }, ...metricCols().filter((c) => ['clicks', 'conversions', 'revenue', 'roi'].includes(c.key))] }));
       put(body, 
         h('div', { class: 'kpis' }, kpi('Клики', num(s.clicks), 'var(--k1)'), kpi('Уник. клики', num(s.uniqueClicks), 'var(--k2)'), kpi('Конверсии', num(s.conversions), 'var(--k3)'), kpi('CR', pct(ratio(s.conversions, s.clicks)), 'var(--k2)'),
-          kpi('Доход', money(s.revenue), 'var(--k5)'), kpi('Расход', money(s.cost || 0), 'var(--k4)'), kpi('Прибыль', h('span', { class: profit >= 0 ? '' : 'neg' }, money(profit)), 'var(--k8)'), kpi('ROI', pct(ratio(profit, s.cost || 0)), 'var(--k9)'), earningsTile,
-          kpi('EPC', money4(ratio(s.revenue, s.clicks)), 'var(--k6)'), kpi('RPM', money(ratio(s.revenue * 1000, s.clicks)), 'var(--k7)'),
+          hideRev() ? null : kpi('Доход', money(s.revenue), 'var(--k5)'), kpi('Расход', money(s.cost || 0), 'var(--k4)'), ...(hideRev() ? [] : [kpi('Прибыль', h('span', { class: profit >= 0 ? '' : 'neg' }, money(profit)), 'var(--k8)'), kpi('ROI', pct(ratio(profit, s.cost || 0)), 'var(--k9)'), earningsTile,
+          kpi('EPC', money4(ratio(s.revenue, s.clicks)), 'var(--k6)'), kpi('RPM', money(ratio(s.revenue * 1000, s.clicks)), 'var(--k7)')]),
           botsData.bots?.length > 0 ? h('a', { href: '#/botlog' + (campaign ? qs({ campaign }) : ''), style: 'text-decoration:none' },
             h('div', { class: 'kpi', style: 'background:var(--bad)' }, h('div', { class: 'k' }, 'Боты'), h('div', { class: 'v' }, botsData.bots.length >= 1000 ? '1000+' : num(botsData.bots.length)))) : null),
         ratesNote(),
@@ -510,7 +514,7 @@ async function pageDashboard() {
           const campRows = groupRows(s.byCampaign);
           const botsByCamp = statsBotsData.byCampaign || {};
           const items = [
-            ...campRows.filter((r) => r.clicks >= MIN_CLICKS && ratio(r.revenue - r.cost, r.cost) <= ROI_ALERT)
+            ...campRows.filter((r) => !hideRev() && r.clicks >= MIN_CLICKS && ratio(r.revenue - r.cost, r.cost) <= ROI_ALERT)
               .map((r) => ({ text: `${state.campaigns[r.id]?.name || r.id}: ROI ${pct(ratio(r.revenue - r.cost, r.cost))}`, link: '#/reports' + qs({ group: 'stream', campaign: r.id }) })),
             ...groupRows(s.byOffer).filter((r) => r.clicks >= MIN_CLICKS && (r.conversions || 0) === 0)
               .map((r) => ({ text: `Оффер ${r.id}: ${num(r.clicks)} кл., 0 конв.`, link: '#/reports' + qs({ group: 'country', offer: r.id }) })),
@@ -529,7 +533,7 @@ async function pageDashboard() {
           { key: 'clicks', label: 'Клики', color: '#4d86f0', values: series.map((p) => p.clicks) },
           { key: 'conversions', label: 'Конв.', color: '#e0496a', values: series.map((p) => p.conversions) },
           { key: 'revenue', label: 'Доход', color: '#e8913f', right: true, values: series.map((p) => p.revenue) },
-        ], series)),
+        ].filter((l) => !hideRev() || l.key !== 'revenue'), series)),
         h('div', { class: 'grid-2', style: 'margin-bottom:14px' },
           top5('camp', 'Топ кампаний', groupRows(s.byCampaign), (r) => state.campaigns[r.id]?.name || r.id, (r) => '#/reports' + qs({ group: 'stream', campaign: r.id })),
           top5('offer', 'Топ офферов', groupRows(s.byOffer), (r) => r.id, (r) => '#/reports' + qs({ group: 'country', offer: r.id })),
@@ -1895,20 +1899,52 @@ function drawUserBox() {
   const me = state.me?.user;
   document.querySelectorAll('[data-owner-only]').forEach((el) => { el.hidden = me?.role !== 'owner'; });
   document.querySelectorAll('[data-user-only]').forEach((el) => { el.hidden = !me; });
-  put(box, me ? [h('span', { class: 'muted', title: me.role === 'owner' ? 'Владелец' : 'Баер' }, me.email),
+  // Viewers cannot write (the server answers 403 read_only), so creation, saving and row actions are hidden.
+  document.body.classList.toggle('read-only', me?.role === 'viewer');
+  put(box, me ? [h('span', { class: 'muted', title: ROLE_LABEL[me.role] || me.role }, me.email),
     h('button', { class: 'btn', onclick: async () => { await fetch(BASE + '/api/auth/logout', { method: 'POST', headers: { 'x-requested-with': 'umbrella' } }); state.me = { ...state.me, user: null }; drawUserBox(); state.me.loginRequired ? authScreen() : route(); } }, 'Выйти')]
     : state.me?.setupRequired ? h('button', { class: 'btn', onclick: () => authScreen() }, 'Создать владельца') : []);
 }
 
+// Role select and permission checkboxes shared by the create and edit dialogs; u is mutated in place.
+function permissionFields(u) {
+  const check = (key, label, on = true, off = false) => h('label', { class: 'check-line' },
+    h('input', { type: 'checkbox', checked: u[key] === on, onchange: (e) => { u[key] = e.target.checked ? on : off; } }), ' ' + label);
+  const viewAll = check('viewAll', 'Видит все кампании (не только свои)');
+  viewAll.hidden = u.role !== 'viewer';
+  return [
+    field('Роль', h('select', { class: 'input', 'aria-label': 'Роль', onchange: (e) => { u.role = e.target.value; viewAll.hidden = u.role !== 'viewer'; } },
+      Object.entries(ROLE_LABEL).map(([v, l]) => h('option', { value: v, selected: v === u.role }, l))),
+    'Владелец управляет пользователями. Баер работает с кампаниями, офферами и отчётами. «Только чтение» видит отчёты и ничего не меняет.'),
+    h('div', { class: 'field' }, h('span', {}, 'Права'), check('hideRevenue', 'Скрывать доход'), check('offersAccess', 'Только офферы своих кампаний', 'own', 'all'), viewAll,
+      h('span', { class: 'hint' }, 'Не действуют на владельца. Доход, прибыль, ROI, EPC и URL офферов вырезаются на сервере.')),
+  ];
+}
+
 async function pageUsers() {
-  const roleLabel = { owner: 'Владелец', buyer: 'Баер' };
+  const roleLabel = ROLE_LABEL;
+  const permsText = (r) => (r.role === 'owner' ? '—' : [r.hideRevenue ? 'без дохода' : null, r.offersAccess === 'own' ? 'свои офферы' : null, r.role === 'viewer' && r.viewAll ? 'все кампании' : null].filter(Boolean).join(', ') || 'полные');
+  const editUser = (r) => {
+    const u = { role: r.role, hideRevenue: r.hideRevenue, offersAccess: r.offersAccess, viewAll: r.viewAll };
+    const err = h('p', { class: 'err' });
+    const close = openModal({
+      title: 'Права пользователя',
+      body: h('div', {}, h('p', {}, r.email), ...permissionFields(u), err),
+      footer: [h('button', { class: 'btn', onclick: () => close() }, 'Отмена'), h('button', { class: 'btn primary', onclick: async () => {
+        try { await api('/api/users/' + r.id, { method: 'PATCH', body: u }); toast('Права сохранены'); close(); load(); }
+        catch (e) { err.textContent = ({ last_owner: 'Нельзя понизить последнего владельца.', cannot_change_own_role: 'Свою роль менять нельзя.' })[e.message] || 'Ошибка: ' + e.message; }
+      } }, 'Сохранить')],
+    });
+  };
   const table = dataTable({
     id: 'users', totals: false,
     columns: [
       { key: 'email', label: 'Email', fixed: true },
       { key: 'role', label: 'Роль', value: (r) => roleLabel[r.role] || r.role },
+      { key: 'perms', label: 'Права', value: permsText },
       { key: 'createdAt', label: 'Создан', render: (r) => dt(r.createdAt) },
       { key: 'menu', label: '', sortable: false, value: () => '', render: (r) => (r.id === state.me?.user?.id ? h('span', { class: 'muted' }, 'это вы') : h('span', { class: 'row-actions' },
+        h('button', { title: 'Права', 'aria-label': 'Права пользователя ' + r.email, onclick: () => editUser(r) }, '✎'),
         h('button', { title: 'Удалить', 'aria-label': 'Удалить пользователя', onclick: async (e) => {
           const b = e.currentTarget;
           if (!b.dataset.armed) { b.dataset.armed = '1'; b.textContent = 'Удалить?'; setTimeout(() => { if (b.isConnected) { delete b.dataset.armed; b.textContent = '✕'; } }, 3000); return; }
@@ -1918,15 +1954,14 @@ async function pageUsers() {
     ],
   });
   const create = () => {
-    const u = { email: '', password: '', role: 'buyer' };
+    const u = { email: '', password: '', role: 'buyer', hideRevenue: false, offersAccess: 'all', viewAll: false };
     const err = h('p', { class: 'err' });
     const close = openModal({
       title: 'Новый пользователь',
       body: h('div', {},
         field('Email', h('input', { class: 'input', type: 'email', autocomplete: 'off', oninput: (e) => { u.email = e.target.value; } })),
         field('Пароль', h('input', { class: 'input', type: 'password', autocomplete: 'new-password', oninput: (e) => { u.password = e.target.value; } }), 'Минимум 10 символов. Передайте его пользователю лично.'),
-        field('Роль', h('div', { class: 'radios' }, Object.entries(roleLabel).map(([v, l]) => h('label', {}, h('input', { type: 'radio', name: 'urole', checked: v === 'buyer', onchange: () => { u.role = v; } }), l))),
-          'Владелец управляет пользователями. Баер работает с кампаниями, офферами и отчётами.'),
+        ...permissionFields(u),
         err),
       footer: [h('button', { class: 'btn', onclick: () => close() }, 'Отмена'), h('button', { class: 'btn primary', onclick: async () => {
         try { await api('/api/users', { method: 'POST', body: u }); toast('Пользователь создан'); close(); load(); }
