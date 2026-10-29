@@ -22,6 +22,10 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
       - run: npm ci --no-audit --no-fund
+      - name: Syntax check (catches files that tests do not import, e.g. migrate.js)
+        run: |
+          for f in src/*.js scripts/*.mjs deploy/*.mjs public/admin/admin.js; do node --check "$f" || exit 1; done
+          if grep -l $'^\xEF\xBB\xBF' src/*.js public/admin/*.js public/admin/*.html scripts/*.mjs 2>/dev/null; then echo "::error::UTF-8 BOM found in the files above"; exit 1; fi
       - run: npm test
 
   deploy:
