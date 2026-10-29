@@ -37,7 +37,7 @@ export function createRates({ dataDir, defaultCurrency = 'EUR', refreshMs = 12 *
       const perEur = base === 'EUR' ? data.rates : Object.fromEntries(Object.entries(data.rates).map(([k, v]) => [k, v / data.rates.EUR]));
       table = { base: 'EUR', rates: { ...perEur, EUR: 1 }, updatedAt: new Date((data.time_last_update_unix || Date.now() / 1000) * 1000).toISOString(), source: 'exchangerate-api.com' };
       await mkdir(dataDir, { recursive: true });
-      await writeFile(cacheFile, JSON.stringify(table) + '\n');
+      await writeFile(cacheFile, JSON.stringify(table) + '\n', { mode: 0o600 });
     } catch (error) { log.warn('[fx] refresh failed, keeping last rates:', error.message); }
   }
 

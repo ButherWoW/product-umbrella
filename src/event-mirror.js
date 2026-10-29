@@ -99,7 +99,7 @@ export function createEventMirror({ query, onError = () => {}, retryDelays = [20
     // Click events keep their order per click; cost updates keep their order among themselves.
     const key = ['click', 'conversion', 'lp_click'].includes(type) ? record.clickId : type === 'cost_update' ? '\u0000cost' : null;
     const run = () => apply(record);
-    const task = (key === null ? run() : lock(key, run)).catch((error) => { counters.errors += 1; onError(type, error); });
+    const task = (key === null ? run() : lock(key, run)).catch((error) => { counters.errors += 1; onError(type, error, record); });
     // A logging callback must not cause an unhandled rejected mirror promise.
     const settled = task.catch(() => {});
     pending.add(settled);

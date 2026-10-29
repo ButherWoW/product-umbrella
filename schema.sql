@@ -153,3 +153,9 @@ CREATE TABLE IF NOT EXISTS landings (
   name text,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- Owner of an offer / landing / source / network: the creating user's id; NULL = team (created by the owner or ADMIN_TOKEN).
+ALTER TABLE offers ADD COLUMN IF NOT EXISTS owner_id text;
+ALTER TABLE landings ADD COLUMN IF NOT EXISTS owner_id text;
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS owner_id text;
+ALTER TABLE networks ADD COLUMN IF NOT EXISTS owner_id text;
