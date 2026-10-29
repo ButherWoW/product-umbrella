@@ -186,9 +186,13 @@ test("offersAccess 'own' limits the offer catalog to offers used in the user's c
   assert.deepEqual(Object.keys((await call('/api/offers', { cookie: buyer.cookie })).json.offers), ['offer-mine']);
   assert.equal((await call('/api/offers/offer-team', { method: 'PATCH', cookie: buyer.cookie, body: { name: 'x' } })).status, 404, 'foreign offer cannot be edited');
   assert.equal((await call('/api/offers/offer-team/clone', { method: 'POST', cookie: buyer.cookie })).status, 404);
-  assert.equal((await call('/api/offers', { method: 'POST', cookie: buyer.cookie, body: { id: 'offer-free', url: 'https://evil.example.com/' } })).json.error, 'offer_id_taken', 'no overwrite of hidden offers');
-  assert.equal((await call('/api/offers/offer-mine', { method: 'PATCH', cookie: buyer.cookie, body: { name: 'Mine' } })).status, 200, 'own offer editable');
-  assert.equal(Object.keys((await call('/api/offers', { cookie: owner })).json.offers).length, total, 'owner unaffected');
+  assert.equal((await call('/api/offers', { method: 'POST', cookie: buyer.cookie, body: { id: 'offer-free', url: 'https://evil.example.com/' } })).json.error, 'id_taken', 'no overwrite of hidden offers');
+  // An offer used in the buyer's campaign but created by the team is visible read-only; offers the buyer created are theirs.
+  assert.equal((await call('/api/offers/offer-mine', { method: 'PATCH', cookie: buyer.cookie, body: { name: 'Mine' } })).json.error, 'offer_not_yours', 'team offer read-only');
+  assert.equal((await call('/api/offers', { method: 'POST', cookie: buyer.cookie, body: { id: 'offer-own', url: 'https://own.example.com/' } })).status, 201);
+  assert.deepEqual(Object.keys((await call('/api/offers', { cookie: buyer.cookie })).json.offers).sort(), ['offer-mine', 'offer-own'], 'own offers listed');
+  assert.equal((await call('/api/offers/offer-own', { method: 'PATCH', cookie: buyer.cookie, body: { name: 'Mine' } })).status, 200, 'own offer editable');
+  assert.equal(Object.keys((await call('/api/offers', { cookie: owner })).json.offers).length, total + 1, 'owner sees everything');
   assert.equal((await call('/api/users', { cookie: owner })).json.users.find((u) => u.id === buyer.id).offersAccess, 'own', 'stored with the user');
 });
 

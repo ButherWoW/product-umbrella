@@ -734,6 +734,11 @@ async function todayRevenue(campaign) {
   } catch { return 0; }
 }
 
+// Owner of an offer, landing, source or network: the id of the user who created it; null = team (owner / ADMIN_TOKEN).
+function parseOwnerId(value) {
+  return /^[0-9a-f-]{36}$/i.test(String(value || '')) ? String(value).toLowerCase() : null;
+}
+
 function parseOffer(raw) {
   // Accept bare string (legacy) or object { url, postbackUrl? }.
   const urlStr = typeof raw === 'string' ? raw : String(raw?.url || '');
@@ -750,7 +755,7 @@ function parseOffer(raw) {
   const capTz = typeof raw?.capTz === 'string' && validTimeZone(raw.capTz) ? raw.capTz : 'UTC';
   const altOfferId = OFFER_ID_RE.test(String(raw?.altOfferId || '')) ? String(raw.altOfferId) : null;
   return { url: urlStr, postbackUrl, payoutType, payout, payoutCurrency, dailyCap, name, networkId, archived: raw?.archived === true, group: typeof raw?.group === 'string' ? raw.group.trim().slice(0, 60) : '',
-    conversionCap, capTz, altOfferId };
+    conversionCap, capTz, altOfferId, ownerId: parseOwnerId(raw?.ownerId) };
 }
 
 // Validation of the payout fields in POST/PATCH /api/offers (absent fields are not checked).
@@ -775,9 +780,9 @@ function conversionCapError(id, body) {
 async function loadOffers() {
   if (db) {
     try {
-      const { rows } = await db.query('SELECT id, url, postback_url, payout_type, payout, payout_currency, daily_cap, name, network_id, "group", archived, conversion_cap, cap_tz, alt_offer_id FROM offers');
+      const { rows } = await db.query('SELECT id, url, postback_url, payout_type, payout, payout_currency, daily_cap, name, network_id, "group", archived, conversion_cap, cap_tz, alt_offer_id, owner_id FROM offers');
       for (const row of rows) if (/^[a-z0-9_-]{2,80}$/i.test(row.id) && /^https:\/\//i.test(row.url)) offers.set(row.id, parseOffer({ url: row.url, postbackUrl: row.postback_url, payoutType: row.payout_type, payout: row.payout, payoutCurrency: row.payout_currency, dailyCap: row.daily_cap, name: row.name, networkId: row.network_id, group: row.group, archived: row.archived === true,
-        conversionCap: row.conversion_cap, capTz: row.cap_tz, altOfferId: row.alt_offer_id }));
+        conversionCap: row.conversion_cap, capTz: row.cap_tz, altOfferId: row.alt_offer_id, ownerId: row.owner_id }));
       return;
     } catch (error) { console.warn('[db] offers load fallback:', error.message); }
   }
@@ -798,7 +803,7 @@ async function saveOffers() {
 
 async function persistOffer(id, value) {
   const offer = typeof value === 'string' ? { url: value, postbackUrl: null } : value;
-  if (db) await db.query('INSERT INTO offers (id, url, postback_url, daily_cap, name, network_id, "group", archived, conversion_cap, cap_tz, alt_offer_id, payout_type, payout, payout_currency) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) ON CONFLICT (id) DO UPDATE SET url = EXCLUDED.url, postback_url = EXCLUDED.postback_url, payout_type = EXCLUDED.payout_type, payout = EXCLUDED.payout, payout_currency = EXCLUDED.payout_currency, daily_cap = EXCLUDED.daily_cap, name = EXCLUDED.name, network_id = EXCLUDED.network_id, "group" = EXCLUDED."group", archived = EXCLUDED.archived, conversion_cap = EXCLUDED.conversion_cap, cap_tz = EXCLUDED.cap_tz, alt_offer_id = EXCLUDED.alt_offer_id', [id, offer.url, offer.postbackUrl, offer.dailyCap ?? null, offer.name ?? null, offer.networkId ?? null, offer.group ?? '', offer.archived === true, offer.conversionCap ?? null, offer.capTz || 'UTC', offer.altOfferId ?? null, offer.payoutType || 'cpa', offer.payout ?? null, offer.payoutCurrency ?? null]);
+  if (db) await db.query('INSERT INTO offers (id, url, postback_url, daily_cap, name, network_id, "group", archived, conversion_cap, cap_tz, alt_offer_id, payout_type, payout, payout_currency, owner_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) ON CONFLICT (id) DO UPDATE SET url = EXCLUDED.url, postback_url = EXCLUDED.postback_url, payout_type = EXCLUDED.payout_type, payout = EXCLUDED.payout, payout_currency = EXCLUDED.payout_currency, daily_cap = EXCLUDED.daily_cap, name = EXCLUDED.name, network_id = EXCLUDED.network_id, "group" = EXCLUDED."group", archived = EXCLUDED.archived, conversion_cap = EXCLUDED.conversion_cap, cap_tz = EXCLUDED.cap_tz, alt_offer_id = EXCLUDED.alt_offer_id, owner_id = EXCLUDED.owner_id', [id, offer.url, offer.postbackUrl, offer.dailyCap ?? null, offer.name ?? null, offer.networkId ?? null, offer.group ?? '', offer.archived === true, offer.conversionCap ?? null, offer.capTz || 'UTC', offer.altOfferId ?? null, offer.payoutType || 'cpa', offer.payout ?? null, offer.payoutCurrency ?? null, offer.ownerId ?? null]);
   else await saveOffers();
 }
 
@@ -816,16 +821,17 @@ function parseSource(raw) {
     // Postback to the traffic source: URL with macros and the conversion statuses that trigger it.
     postbackUrl: parsePostbackUrl(raw.postbackUrl, { allowHttp: sourcePostbackAllowPrivate }),
     postbackStatuses: parsePostbackStatuses(raw.postbackStatuses),
+    ownerId: parseOwnerId(raw.ownerId),
   };
 }
 
 async function loadSources() {
   if (db) {
     try {
-      const { rows } = await db.query('SELECT id, name, param_map, cost_model, cpc, cost_from_param, postback_url, postback_statuses FROM sources');
+      const { rows } = await db.query('SELECT id, name, param_map, cost_model, cpc, cost_from_param, postback_url, postback_statuses, owner_id FROM sources');
       for (const row of rows) if (OFFER_ID_RE.test(row.id)) {
         const s = parseSource({ name: row.name, paramMap: row.param_map, costModel: row.cost_model, cpc: row.cpc, costFromParam: row.cost_from_param,
-          postbackUrl: row.postback_url, postbackStatuses: row.postback_statuses });
+          postbackUrl: row.postback_url, postbackStatuses: row.postback_statuses, ownerId: row.owner_id });
         if (s) sources.set(row.id, s);
       }
       return;
@@ -847,22 +853,22 @@ async function saveSources() {
 }
 
 async function persistSource(id, value) {
-  if (db) await db.query('INSERT INTO sources (id, name, param_map, cost_model, cpc, cost_from_param, postback_url, postback_statuses) VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8::jsonb) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, param_map = EXCLUDED.param_map, cost_model = EXCLUDED.cost_model, cpc = EXCLUDED.cpc, cost_from_param = EXCLUDED.cost_from_param, postback_url = EXCLUDED.postback_url, postback_statuses = EXCLUDED.postback_statuses',
-    [id, value.name ?? null, JSON.stringify(value.paramMap || {}), value.costModel, value.cpc, value.costFromParam, value.postbackUrl ?? null, JSON.stringify(value.postbackStatuses || ['sale'])]);
+  if (db) await db.query('INSERT INTO sources (id, name, param_map, cost_model, cpc, cost_from_param, postback_url, postback_statuses, owner_id) VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8::jsonb, $9) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, param_map = EXCLUDED.param_map, cost_model = EXCLUDED.cost_model, cpc = EXCLUDED.cpc, cost_from_param = EXCLUDED.cost_from_param, postback_url = EXCLUDED.postback_url, postback_statuses = EXCLUDED.postback_statuses, owner_id = EXCLUDED.owner_id',
+    [id, value.name ?? null, JSON.stringify(value.paramMap || {}), value.costModel, value.cpc, value.costFromParam, value.postbackUrl ?? null, JSON.stringify(value.postbackStatuses || ['sale']), value.ownerId ?? null]);
   else await saveSources();
 }
 
 function parseNetwork(raw) {
   const name = typeof raw?.name === 'string' ? raw.name.trim().slice(0, 120) : '';
   if (!name) return null;
-  return { name, offerParams: typeof raw?.offerParams === 'string' ? raw.offerParams.trim().slice(0, 1000) : '', clickIdParam: typeof raw?.clickIdParam === 'string' ? raw.clickIdParam.trim().slice(0, 80) : 'sub1', payoutParam: typeof raw?.payoutParam === 'string' ? raw.payoutParam.trim().slice(0, 80) : 'payout', notes: typeof raw?.notes === 'string' ? raw.notes.slice(0, 2000) : '' };
+  return { name, offerParams: typeof raw?.offerParams === 'string' ? raw.offerParams.trim().slice(0, 1000) : '', clickIdParam: typeof raw?.clickIdParam === 'string' ? raw.clickIdParam.trim().slice(0, 80) : 'sub1', payoutParam: typeof raw?.payoutParam === 'string' ? raw.payoutParam.trim().slice(0, 80) : 'payout', notes: typeof raw?.notes === 'string' ? raw.notes.slice(0, 2000) : '', ownerId: parseOwnerId(raw?.ownerId) };
 }
 async function loadNetworks() {
-  if (db) { try { const { rows } = await db.query('SELECT id,name,offer_params,click_id_param,payout_param,notes FROM networks'); for (const r of rows) { const n=parseNetwork({name:r.name,offerParams:r.offer_params,clickIdParam:r.click_id_param,payoutParam:r.payout_param,notes:r.notes}); if(n) networks.set(r.id,n); } return; } catch (e) { console.warn('[db] networks load fallback:', e.message); } }
+  if (db) { try { const { rows } = await db.query('SELECT id,name,offer_params,click_id_param,payout_param,notes,owner_id FROM networks'); for (const r of rows) { const n=parseNetwork({name:r.name,offerParams:r.offer_params,clickIdParam:r.click_id_param,payoutParam:r.payout_param,notes:r.notes,ownerId:r.owner_id}); if(n) networks.set(r.id,n); } return; } catch (e) { console.warn('[db] networks load fallback:', e.message); } }
   try { const saved=JSON.parse(await readFile(networksFile,'utf8')); for (const [id,raw] of Object.entries(saved||{})) if (OFFER_ID_RE.test(id) && parseNetwork(raw)) networks.set(id,parseNetwork(raw)); } catch (e) { if(e.code!=='ENOENT') console.warn('[networks] invalid config ignored'); }
 }
 async function saveNetworks() { await mkdir(dataDir,{recursive:true}); await writeFile(networksFile,JSON.stringify(Object.fromEntries(networks),null,2)+'\n'); }
-async function persistNetwork(id,v) { if(db) await db.query('INSERT INTO networks (id,name,offer_params,click_id_param,payout_param,notes) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,offer_params=EXCLUDED.offer_params,click_id_param=EXCLUDED.click_id_param,payout_param=EXCLUDED.payout_param,notes=EXCLUDED.notes',[id,v.name,v.offerParams,v.clickIdParam,v.payoutParam,v.notes]); else await saveNetworks(); }
+async function persistNetwork(id,v) { if(db) await db.query('INSERT INTO networks (id,name,offer_params,click_id_param,payout_param,notes,owner_id) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,offer_params=EXCLUDED.offer_params,click_id_param=EXCLUDED.click_id_param,payout_param=EXCLUDED.payout_param,notes=EXCLUDED.notes,owner_id=EXCLUDED.owner_id',[id,v.name,v.offerParams,v.clickIdParam,v.payoutParam,v.notes,v.ownerId??null]); else await saveNetworks(); }
 
 function parseCampaign(id, value) {
   return {
@@ -1148,14 +1154,14 @@ function parseLanding(raw) {
   const url = String(raw?.url || '').trim();
   if (!/^https:\/\//i.test(url)) return null;
   const name = typeof raw?.name === 'string' && raw.name.trim() ? raw.name.trim().slice(0, 200) : null;
-  return { url: url.slice(0, 2048), name };
+  return { url: url.slice(0, 2048), name, ownerId: parseOwnerId(raw?.ownerId) };
 }
 
 async function loadLandings() {
   if (db) {
     try {
-      const { rows } = await db.query('SELECT id, url, name FROM landings');
-      for (const row of rows) { const l = OFFER_ID_RE.test(row.id) && parseLanding(row); if (l) landings.set(row.id, l); }
+      const { rows } = await db.query('SELECT id, url, name, owner_id FROM landings');
+      for (const row of rows) { const l = OFFER_ID_RE.test(row.id) && parseLanding({ ...row, ownerId: row.owner_id }); if (l) landings.set(row.id, l); }
       return;
     } catch (error) { console.warn('[db] landings load fallback:', error.message); }
   }
@@ -1165,7 +1171,7 @@ async function loadLandings() {
 }
 
 async function persistLanding(id, landing) {
-  if (db) await db.query('INSERT INTO landings (id, url, name) VALUES ($1, $2, $3) ON CONFLICT (id) DO UPDATE SET url = EXCLUDED.url, name = EXCLUDED.name', [id, landing.url, landing.name]);
+  if (db) await db.query('INSERT INTO landings (id, url, name, owner_id) VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO UPDATE SET url = EXCLUDED.url, name = EXCLUDED.name, owner_id = EXCLUDED.owner_id', [id, landing.url, landing.name, landing.ownerId ?? null]);
   else { await mkdir(dataDir, { recursive: true }); await writeFile(landingsFile, JSON.stringify(Object.fromEntries(landings), null, 2) + '\n'); }
 }
 
@@ -1325,10 +1331,75 @@ async function readPostbacks({ direction, campaign, allowed, from, to, limit }) 
   return { storage: 'jsonl', postbacks: out };
 }
 
-// Manual cost update (G8). Matching clicks: campaign, local dates from..to in tz, optional offer/stream/source/sub_id_N
-// filters, optionally unique clicks only. Bots are never clicks, so they get no cost. The amount (in `currency`) is
-// converted to DEFAULT_CURRENCY and split equally; the last click takes the rounding remainder, so the sum is exact.
-const COST_FILTERS = ['offer', 'stream', 'source', ...SUB_ID_FIELDS];
+// Manual cost update (G8). Matching clicks: campaign, local dates from..to in tz, optional offer/stream/tracked-parameter
+// filters (source, sub_id_N, ad_campaign_id, …), optionally unique clicks only. Bots are never clicks, so they get no cost.
+// The amount (in `currency`) is converted to DEFAULT_CURRENCY and split equally; the last click takes the rounding
+// remainder, so the sum is exact.
+const COST_FILTERS = ['offer', 'stream', ...TRACK_FIELDS];
+const round6 = (v) => Math.round(v * 1e6) / 1e6;
+const nextIsoDay = (day) => new Date(Date.parse(`${day}T00:00:00Z`) + 86400000).toISOString().slice(0, 10);
+function costAmount(raw) {
+  const value = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value < 1e8 ? value : null;
+}
+function costCurrency(raw) {
+  const value = raw === undefined || raw === null || raw === '' ? rates.defaultCurrency : String(raw).toUpperCase();
+  return /^[A-Z]{3}$/.test(value) ? value : null;
+}
+const costTz = (raw) => {
+  const tz = raw === undefined || raw === null || raw === '' ? 'UTC' : raw;
+  return typeof tz === 'string' && validTimeZone(tz) ? tz : null;
+};
+
+// The JSONL journal, read once per cost update or import (`cache` lives for one request).
+async function cachedJournal(cache) {
+  if (!cache.lines) {
+    try { cache.lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; cache.lines = []; }
+  }
+  return cache.lines;
+}
+
+// Click ids of the campaigns in [start, end) that match the filters, in time order.
+async function matchCostClicks({ campaignIds, start, end, filters, uniqueOnly }, cache) {
+  const paramFilters = Object.entries(filters).filter(([key]) => key !== 'offer' && key !== 'stream');
+  if (db && !cache.dbFailed) {
+    try {
+      if (!cache.flushed) { await eventMirror?.flush(); cache.flushed = true; } // clicks still queued for PostgreSQL must be matched too
+      const values = [campaignIds, new Date(start).toISOString(), new Date(end).toISOString()];
+      const conditions = ['campaign = ANY($1::text[])', 'created_at >= $2', 'created_at < $3'];
+      if (filters.offer) { values.push(filters.offer); conditions.push(`offer_id = $${values.length}`); }
+      if (filters.stream) { values.push(filters.stream); conditions.push(`COALESCE(NULLIF(stream, ''), 'default') = $${values.length}`); }
+      for (const [key, value] of paramFilters) { values.push(key, value); conditions.push(`params->>$${values.length - 1} = $${values.length}`); }
+      if (uniqueOnly) conditions.push('is_unique_campaign');
+      const { rows } = await db.query(`SELECT click_id FROM clicks WHERE ${conditions.join(' AND ')} ORDER BY created_at, click_id`, values);
+      return rows.map((r) => String(r.click_id));
+    } catch (error) { cache.dbFailed = true; console.warn('[db] cost update fallback:', error.message); }
+  }
+  if (!cache.clicks) cache.clicks = applyClickUpdates(await cachedJournal(cache)).filter((item) => item.type === 'click');
+  return cache.clicks.filter((item) => {
+    if (!campaignIds.includes(item.campaign)) return false;
+    const t = Date.parse(item.at);
+    if (!(t >= start && t < end)) return false;
+    if (filters.offer && item.offerId !== filters.offer) return false;
+    if (filters.stream && (item.stream || 'default') !== filters.stream) return false;
+    if (paramFilters.some(([key, value]) => item.params?.[key] !== value)) return false;
+    return !uniqueOnly || item.uniqueCampaign !== false;
+  }).map((item) => item.clickId);
+}
+
+// One cost_update event: `total` split equally over the clicks, the remainder on the last one. Answers once
+// PostgreSQL has the new costs too, so a report right after the update shows them.
+async function writeCostSplit({ campaignIds, clickIds, total, importKey }) {
+  const perClick = clickIds.length ? Math.floor(total * 1e6 / clickIds.length) / 1e6 : 0;
+  const lastCost = clickIds.length ? round6(total - perClick * (clickIds.length - 1)) : 0;
+  const { mirrored } = await event('cost_update', { campaign: campaignIds[0], ...(campaignIds.length > 1 ? { campaigns: campaignIds } : {}), clickIds, cost: perClick,
+    ...(clickIds.length && lastCost !== perClick ? { lastClickId: clickIds.at(-1), lastCost } : {}),
+    ...(importKey ? { importKey, importCost: total } : {}) });
+  await mirrored;
+  return perClick;
+}
+
 async function updateCosts(body, req) {
   const campaignId = String(body?.campaign || '');
   const campaign = campaigns.get(campaignId);
@@ -1337,12 +1408,12 @@ async function updateCosts(body, req) {
   const from = isoDate(body.from), to = isoDate(body.to);
   if (!from || !to) return { status: 400, error: 'from_and_to_dates_required' };
   if (to < from) return { status: 400, error: 'invalid_date_range' };
-  const tz = body.tz === undefined || body.tz === null || body.tz === '' ? 'UTC' : body.tz;
-  if (typeof tz !== 'string' || !validTimeZone(tz)) return { status: 400, error: 'invalid_tz' };
-  const amount = typeof body.amount === 'string' && body.amount.trim() !== '' ? Number(body.amount) : body.amount;
-  if (typeof amount !== 'number' || !Number.isFinite(amount) || amount < 0 || amount >= 1e8) return { status: 400, error: 'invalid_amount' };
-  const currency = body.currency === undefined || body.currency === null || body.currency === '' ? rates.defaultCurrency : String(body.currency).toUpperCase();
-  if (!/^[A-Z]{3}$/.test(currency)) return { status: 400, error: 'invalid_currency' };
+  const tz = costTz(body.tz);
+  if (!tz) return { status: 400, error: 'invalid_tz' };
+  const amount = costAmount(body.amount);
+  if (amount === null) return { status: 400, error: 'invalid_amount' };
+  const currency = costCurrency(body.currency);
+  if (!currency) return { status: 400, error: 'invalid_currency' };
   const rawFilters = body.filters ?? {};
   if (typeof rawFilters !== 'object' || Array.isArray(rawFilters)) return { status: 400, error: 'invalid_filters' };
   const filters = {};
@@ -1353,50 +1424,96 @@ async function updateCosts(body, req) {
     filters[key] = value;
   }
   const uniqueOnly = body.uniqueOnly === true;
-  const start = zonedDayStart(from, tz);
-  const end = zonedDayStart(new Date(Date.parse(`${to}T00:00:00Z`) + 86400000).toISOString().slice(0, 10), tz);
-  const paramFilters = Object.entries(filters).filter(([key]) => key !== 'offer' && key !== 'stream');
-
-  let clickIds = null;
-  if (db) {
-    try {
-      await eventMirror?.flush(); // clicks still queued for PostgreSQL must be matched too
-      const values = [campaignId, new Date(start).toISOString(), new Date(end).toISOString()];
-      const conditions = ['campaign = $1', 'created_at >= $2', 'created_at < $3'];
-      if (filters.offer) { values.push(filters.offer); conditions.push(`offer_id = $${values.length}`); }
-      if (filters.stream) { values.push(filters.stream); conditions.push(`COALESCE(NULLIF(stream, ''), 'default') = $${values.length}`); }
-      for (const [key, value] of paramFilters) { values.push(key, value); conditions.push(`params->>$${values.length - 1} = $${values.length}`); }
-      if (uniqueOnly) conditions.push('is_unique_campaign');
-      const { rows } = await db.query(`SELECT click_id FROM clicks WHERE ${conditions.join(' AND ')} ORDER BY created_at, click_id`, values);
-      clickIds = rows.map((r) => r.click_id);
-    } catch (error) { console.warn('[db] cost update fallback:', error.message); }
-  }
-  if (!clickIds) {
-    let lines = [];
-    try { lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); }
-    catch (error) { if (error.code !== 'ENOENT') throw error; }
-    clickIds = applyClickUpdates(lines).filter((item) => {
-      if (item.type !== 'click' || item.campaign !== campaignId) return false;
-      const t = Date.parse(item.at);
-      if (!(t >= start && t < end)) return false;
-      if (filters.offer && item.offerId !== filters.offer) return false;
-      if (filters.stream && (item.stream || 'default') !== filters.stream) return false;
-      if (paramFilters.some(([key, value]) => item.params?.[key] !== value)) return false;
-      return !uniqueOnly || item.uniqueCampaign !== false;
-    }).map((item) => item.clickId);
-  }
-  const total = Math.round(amount * rates.factor(currency, rates.defaultCurrency) * 1e6) / 1e6;
+  const clickIds = await matchCostClicks({ campaignIds: [campaignId], start: zonedDayStart(from, tz), end: zonedDayStart(nextIsoDay(to), tz), filters, uniqueOnly }, {});
+  const total = round6(amount * rates.factor(currency, rates.defaultCurrency));
   const result = { ok: true, campaign: campaignId, from, to, tz, amount, currency, cost: total, costCurrency: rates.defaultCurrency, updated: clickIds.length };
   if (!clickIds.length) return { ...result, perClick: 0 };
-  const perClick = Math.floor(total * 1e6 / clickIds.length) / 1e6;
-  const lastCost = Math.round((total - perClick * (clickIds.length - 1)) * 1e6) / 1e6;
-  const { mirrored } = await event('cost_update', { campaign: campaignId, clickIds, cost: perClick,
-    ...(lastCost !== perClick ? { lastClickId: clickIds.at(-1), lastCost } : {}) });
-  // Answer once PostgreSQL has the new costs too, so a report right after the update shows them.
-  await mirrored;
+  const perClick = await writeCostSplit({ campaignIds: [campaignId], clickIds, total });
   await audit(req, 'update', 'costs', campaignId, null, { amount, currency, from, to, tz, clicks: clickIds.length, perClick,
     filters: Object.keys(filters).length ? JSON.stringify(filters) : null, uniqueOnly });
   return { ...result, perClick };
+}
+
+// Spend import (e.g. a Facebook Ads Manager CSV parsed in /admin). Each row {date, id, amount, currency} is a cost update
+// of the chosen campaign(s) for that local day (tz), filtered by `param` = id (sub_id_2 = ad set id, …).
+// Idempotency: the import key `campaigns|param|id|date` is stored on the cost_update event (and in cost_imports in
+// PostgreSQL). Re-importing the same key replaces the previous import: its clicks get the new split, and clicks it
+// had but that no longer match are reset to 0 — so the spend is never counted twice. Rows of one request with the same
+// key are summed (e.g. an export broken down by placement).
+const COST_IMPORT_MAX_ROWS = 5000;
+async function previousCostImports(keys, cache) {
+  const found = new Map();
+  if (!keys.length) return found;
+  if (db) {
+    try {
+      const { rows } = await db.query('SELECT import_key, click_ids FROM cost_imports WHERE import_key = ANY($1::text[])', [keys]);
+      for (const row of rows) found.set(row.import_key, (row.click_ids || []).map(String));
+      return found;
+    } catch (error) { console.warn('[db] cost import lookup fallback:', error.message); }
+  }
+  const wanted = new Set(keys);
+  for (const item of await cachedJournal(cache)) if (item.type === 'cost_update' && wanted.has(item.importKey)) found.set(item.importKey, item.clickIds || []);
+  return found;
+}
+
+async function importCosts(body, req) {
+  const rawCampaigns = Array.isArray(body?.campaign) ? body.campaign : Array.isArray(body?.campaigns) ? body.campaigns : [body?.campaign];
+  const campaignIds = [...new Set(rawCampaigns.filter((c) => typeof c === 'string' && c))].sort();
+  if (!campaignIds.length || campaignIds.length > 50) return { status: 400, error: 'campaign_required' };
+  for (const id of campaignIds) {
+    if (!campaigns.has(id)) return { status: 404, error: 'campaign_not_found' };
+    if (!canEditCampaign(req, campaigns.get(id))) return { status: 403, error: 'campaign_not_yours' };
+  }
+  const param = String(body.param || '');
+  if (!TRACK_FIELDS.includes(param)) return { status: 400, error: 'invalid_param' };
+  const tz = costTz(body.tz);
+  if (!tz) return { status: 400, error: 'invalid_tz' };
+  if (!Array.isArray(body.rows) || !body.rows.length) return { status: 400, error: 'rows_required' };
+  if (body.rows.length > COST_IMPORT_MAX_ROWS) return { status: 400, error: 'too_many_rows' };
+  const uniqueOnly = body.uniqueOnly === true;
+
+  const results = body.rows.map((row, index) => {
+    const rawId = typeof row?.id === 'number' ? String(row.id) : typeof row?.id === 'string' ? row.id.trim() : '';
+    const out = { row: index, date: typeof row?.date === 'string' ? row.date : null, id: rawId, amount: costAmount(row?.amount), currency: costCurrency(row?.currency), clicks: 0, cost: 0 };
+    if (!isoDate(row?.date)) return { ...out, error: 'invalid_date' };
+    if (!rawId || rawId.length > 255) return { ...out, error: 'invalid_id' };
+    if (out.amount === null) return { ...out, error: 'invalid_amount' };
+    if (!out.currency) return { ...out, error: 'invalid_currency' };
+    return out;
+  });
+  const groups = new Map();
+  for (const row of results) {
+    if (row.error) continue;
+    row.cost = round6(row.amount * rates.factor(row.currency, rates.defaultCurrency));
+    const key = `${campaignIds.join(',')}|${param}|${row.id}|${row.date}`;
+    if (groups.has(key)) groups.get(key).push(row); else groups.set(key, [row]);
+  }
+  const cache = {};
+  const previous = await previousCostImports([...groups.keys()], cache);
+  for (const [key, rows] of groups) {
+    const { date, id } = rows[0];
+    const clickIds = await matchCostClicks({ campaignIds, start: zonedDayStart(date, tz), end: zonedDayStart(nextIsoDay(date), tz), filters: { [param]: id }, uniqueOnly }, cache);
+    const before = previous.get(key);
+    const fresh = new Set(clickIds);
+    const stale = (before || []).filter((clickId) => !fresh.has(clickId));
+    if (stale.length) {
+      const { mirrored } = await event('cost_update', { campaign: campaignIds[0], clickIds: stale, cost: 0, importReset: key });
+      await mirrored;
+    }
+    // Recorded even without clicks when the key was imported before, so the next import knows there is nothing to reset.
+    if (clickIds.length || before) await writeCostSplit({ campaignIds, clickIds, total: clickIds.length ? round6(rows.reduce((t, r) => t + r.cost, 0)) : 0, importKey: key });
+    for (const row of rows) {
+      row.clicks = clickIds.length;
+      if (before) row.replaced = true;
+      if (rows.length > 1) row.merged = rows.length;
+      if (!clickIds.length) row.error = 'no_matching_clicks';
+    }
+  }
+  const applied = results.filter((r) => !r.error);
+  const summary = { rows: results.length, applied: applied.length, failed: results.length - applied.length,
+    clicks: [...groups.values()].reduce((t, rows) => t + (rows[0].error ? 0 : rows[0].clicks), 0), cost: round6(applied.reduce((t, r) => t + r.cost, 0)) };
+  await audit(req, 'import', 'costs', campaignIds.join(','), null, { ...summary, param, tz, uniqueOnly });
+  return { ok: true, campaigns: campaignIds, param, tz, costCurrency: rates.defaultCurrency, ...summary, results };
 }
 
 const sourcePostbacks = createSourcePostbacks({
@@ -1472,7 +1589,11 @@ function loginBlocked(ip) {
 }
 
 async function readJson(req, maxBytes = 64 * 1024) {
-  if (req.jsonBody !== undefined) return req.jsonBody;
+  // Already read by the hideRevenue write check (with the largest route limit); the route's own limit still applies.
+  if (req.jsonBody !== undefined) {
+    if (req.jsonBodyBytes > maxBytes) throw Object.assign(new Error('request_too_large'), { statusCode: 413 });
+    return req.jsonBody;
+  }
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
@@ -1480,6 +1601,7 @@ async function readJson(req, maxBytes = 64 * 1024) {
     if (size > maxBytes) throw Object.assign(new Error('request_too_large'), { statusCode: 413 });
     chunks.push(chunk);
   }
+  req.jsonBodyBytes = size;
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); }
   catch { throw Object.assign(new Error('invalid_json'), { statusCode: 400 }); }
 }
@@ -1543,16 +1665,63 @@ function revenueFilterFor(path) {
 // Top-level body fields a hideRevenue user may not write: payout, payoutType, payoutCurrency, revenueCap,
 // dailyRevenueGoal, dailyProfitGoal… (every key the filter hides from them, even null to clear a value).
 const revenueWriteFields = (body) => (body && typeof body === 'object' && !Array.isArray(body) ? Object.keys(body).filter(isRevenueKey) : []);
-// offersAccess 'own': ids of offers used in the streams of campaigns the user can see; null = no restriction.
+// Offer and landing ids referenced by streams (conditional and legacy flat streams).
+function streamRefs(streams) {
+  const refs = { offers: new Set(), landings: new Set() };
+  for (const st of streams || []) {
+    (st.offers ? st.offers.map((o) => o.offerId) : st.offerId ? [st.offerId] : []).forEach((o) => refs.offers.add(o));
+    (st.landings || []).forEach((l) => refs.landings.add(l.landingId));
+  }
+  return refs;
+}
+// offersAccess 'own': the user's own offers plus the offers used in the streams of campaigns the user can see
+// (those are read-only unless the user owns them); null = no restriction.
 function visibleOfferIds(req) {
   if (!restrictedUser(req) || req.user.offersAccess !== 'own') return null;
   const allowed = scopeCampaigns(req);
-  const ids = new Set();
+  const ids = new Set([...offers].filter(([, o]) => o.ownerId === req.user.id).map(([id]) => id));
   for (const [id, c] of campaigns) {
     if (allowed && !allowed.includes(id)) continue;
-    for (const st of c.streams || []) (st.offers ? st.offers.map((o) => o.offerId) : st.offerId ? [st.offerId] : []).forEach((o) => ids.add(o));
+    streamRefs(c.streams).offers.forEach((o) => ids.add(o));
   }
   return ids;
+}
+// Ownership of offers, landings, sources and networks. The owner, ADMIN_TOKEN and a fresh dev install manage everything;
+// anyone else changes (edits, archives, clones) only entities whose ownerId is their own id. Team entities (ownerId null)
+// and other users' entities are read-only for them.
+const canManage = (req, entity) => !restrictedUser(req) || (Boolean(entity?.ownerId) && entity.ownerId === req.user.id);
+// ownerId of a new entity: the creating user; the owner / ADMIN_TOKEN create team entities unless they name an owner.
+const creatorOwnerId = (req, body) => (restrictedUser(req) ? req.user.id : parseOwnerId(body?.ownerId));
+// The owner may reassign an entity (PATCH ownerId); everyone else keeps the current owner.
+const nextOwnerId = (req, body, cur) => (!restrictedUser(req) && body?.ownerId !== undefined ? parseOwnerId(body.ownerId) : cur.ownerId ?? null);
+// May the user send traffic to this offer? Team offers and their own ('own' access: only the offers visible to them).
+function offerUsable(req, id, visible = visibleOfferIds(req)) {
+  if (!restrictedUser(req)) return true;
+  const offer = offers.get(id);
+  if (!offer) return false;
+  return visible ? visible.has(id) : !offer.ownerId || offer.ownerId === req.user.id;
+}
+function landingUsable(req, id) {
+  if (!restrictedUser(req)) return true;
+  const landing = landings.get(id);
+  return Boolean(landing) && (!landing.ownerId || landing.ownerId === req.user.id);
+}
+// Every offer and landing a restricted user puts into streams must be usable by them. Ids already present in the
+// campaign's current streams stay allowed (the owner may have put them there), so saving such a campaign keeps working.
+function streamRefsError(req, streams, current = []) {
+  if (!restrictedUser(req)) return null;
+  const keep = streamRefs(current), refs = streamRefs(streams), visible = visibleOfferIds(req);
+  for (const id of refs.offers) if (!keep.offers.has(id) && !offerUsable(req, id, visible)) return { error: 'offer_not_usable', offerId: id };
+  for (const id of refs.landings) if (!keep.landings.has(id) && !landingUsable(req, id)) return { error: 'landing_not_usable', landingId: id };
+  return null;
+}
+// /r/:campaign/:offer may only send traffic to an offer of that campaign's streams. A legacy campaign without offer
+// streams accepts team offers and offers of the campaign's owner. Unknown campaigns fall through to the usual 404.
+function explicitOfferAllowed(campaign, offerId, offer) {
+  if (!campaign) return true;
+  const refs = streamRefs(campaign.streams).offers;
+  if (refs.size) return refs.has(offerId);
+  return !offer.ownerId || offer.ownerId === campaign.ownerId;
 }
 
 // Change history (Keitaro «Лог»): who changed what and when. Kept in the JSONL journal; never stores passwords.
@@ -1728,7 +1897,7 @@ const server = http.createServer(async (req, res) => {
       // Revenue settings cannot be written by someone who cannot see them. The body is read here once and
       // handed to the route through readJson (req.jsonBody).
       if (res.revenueFilter && ['POST', 'PATCH', 'PUT'].includes(req.method)) {
-        req.jsonBody = await readJson(req);
+        req.jsonBody = await readJson(req, 2 * 1024 * 1024);
         const fields = revenueWriteFields(req.jsonBody);
         if (fields.length) return json(res, 403, { error: 'revenue_hidden', fields });
       }
@@ -1916,7 +2085,7 @@ const server = http.createServer(async (req, res) => {
     if (match && req.method === 'GET') {
       const [, campaignId, offerId] = match;
       const offer = offers.get(offerId);
-      if (!offer || offer.archived) return json(res, 404, { error: 'offer_not_found' });
+      if (!offer || offer.archived || !explicitOfferAllowed(campaigns.get(campaignId), offerId, offer)) return json(res, 404, { error: 'offer_not_found' });
       // Conversion cap on an explicit offer: its alternative if one is usable, otherwise capUrl / 429 like the click cap.
       if (offer.conversionCap) {
         const routing = await offerRouting([{ offerId }]);
@@ -2136,6 +2305,14 @@ const server = http.createServer(async (req, res) => {
       if (result.error) return json(res, result.status, { error: result.error });
       return json(res, 200, result);
     }
+    // Spend import (FB Ads Manager CSV parsed in the browser): one cost update per row and day, idempotent per import key.
+    if (url.pathname === '/api/costs/import' && req.method === 'POST') {
+      const body = await readJson(req, 2 * 1024 * 1024);
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      const result = await importCosts(body, req);
+      if (result.error) return json(res, result.status, { error: result.error });
+      return json(res, 200, result);
+    }
     if (url.pathname === '/api/monitor' && req.method === 'GET') {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       return json(res, 200, { enabled: monitorEnabled, intervalMs: monitorIntervalMs, targets: monitor.snapshot(scopeCampaigns(req)) });
@@ -2153,7 +2330,8 @@ const server = http.createServer(async (req, res) => {
       const body = await readJson(req);
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       if (!OFFER_ID_RE.test(String(body.id || ''))) return json(res, 400, { error: 'valid_id_required' });
-      const landing = parseLanding(body);
+      if (landings.has(String(body.id))) return json(res, 409, { error: 'id_taken' });
+      const landing = parseLanding({ ...body, ownerId: creatorOwnerId(req, body) });
       if (!landing) return json(res, 400, { error: 'https_url_required' });
       landings.set(String(body.id), landing);
       await persistLanding(String(body.id), landing);
@@ -2167,7 +2345,8 @@ const server = http.createServer(async (req, res) => {
       const id = landingUpdate[1];
       const cur = landings.get(id);
       if (!cur) return json(res, 404, { error: 'landing_not_found' });
-      const updated = parseLanding({ url: body.url ?? cur.url, name: body.name !== undefined ? body.name : cur.name });
+      if (!canManage(req, cur)) return json(res, 403, { error: 'landing_not_yours' });
+      const updated = parseLanding({ url: body.url ?? cur.url, name: body.name !== undefined ? body.name : cur.name, ownerId: nextOwnerId(req, body, cur) });
       if (!updated) return json(res, 400, { error: 'https_url_required' });
       landings.set(id, updated);
       await persistLanding(id, updated);
@@ -2182,13 +2361,14 @@ const server = http.createServer(async (req, res) => {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const body = await readJson(req);
       if (!/^[a-z0-9_-]{2,80}$/i.test(String(body.id || '')) || !/^https:\/\//i.test(String(body.url || ''))) return json(res, 400, { error: 'id_and_https_url_required' });
-      // offersAccess 'own' must not overwrite an offer the user cannot see.
-      if (offers.has(String(body.id)) && visibleOfferIds(req) && !visibleOfferIds(req).has(String(body.id))) return json(res, 409, { error: 'offer_id_taken' });
+      // POST never overwrites: changes go through PATCH, where ownership is checked.
+      if (offers.has(String(body.id))) return json(res, 409, { error: 'id_taken' });
+      if (body.altOfferId && !offerUsable(req, String(body.altOfferId))) return json(res, 403, { error: 'offer_not_usable', offerId: String(body.altOfferId) });
       if (body.networkId !== undefined && body.networkId !== null && !networks.has(String(body.networkId))) return json(res, 400, { error: 'network_not_found' });
       const capError = conversionCapError(String(body.id), body) || payoutError(body);
       if (capError) return json(res, 400, { error: capError });
       const offer = parseOffer({ url: String(body.url), postbackUrl: body.postbackUrl, payoutType: body.payoutType, payout: body.payout, payoutCurrency: body.payoutCurrency, dailyCap: body.dailyCap, name: body.name, networkId: body.networkId, archived: body.archived, group: body.group,
-        conversionCap: body.conversionCap, capTz: body.capTz, altOfferId: body.altOfferId });
+        conversionCap: body.conversionCap, capTz: body.capTz, altOfferId: body.altOfferId, ownerId: creatorOwnerId(req, body) });
       if (!offer) return json(res, 400, { error: 'id_and_https_url_required' });
       offers.set(String(body.id), offer);
       await persistOffer(String(body.id), offer);
@@ -2200,15 +2380,18 @@ const server = http.createServer(async (req, res) => {
     if (offerClone && req.method === 'POST') {
       if (!(await adminAuthorized(req))) return json(res,401,{error:'admin_authorization_required'});
       const id=offerClone[1],cur=offers.get(id); if(!cur || (visibleOfferIds(req) && !visibleOfferIds(req).has(id))) return json(res,404,{error:'offer_not_found'});
+      if (!canManage(req, cur)) return json(res, 403, { error: 'offer_not_yours' });
       let nextId=`${id}-copy`, n=2; while(offers.has(nextId)) nextId=`${id}-copy${n++}`;
-      const copy=parseOffer({...cur,name:`${cur.name||id} (копия)`,archived:false}); offers.set(nextId,copy); await persistOffer(nextId,copy); await audit(req,'create','offer',nextId,null,copy); return json(res,201,{id:nextId,...copy});
+      const copy=parseOffer({...cur,name:`${cur.name||id} (копия)`,archived:false,ownerId:creatorOwnerId(req, {})}); offers.set(nextId,copy); await persistOffer(nextId,copy); await audit(req,'create','offer',nextId,null,copy); return json(res,201,{id:nextId,...copy});
     }
     if (offerUpdate && req.method === 'PATCH') {
       const id = offerUpdate[1];
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       if (!offers.has(id) || (visibleOfferIds(req) && !visibleOfferIds(req).has(id))) return json(res, 404, { error: 'offer_not_found' });
+      if (!canManage(req, offers.get(id))) return json(res, 403, { error: 'offer_not_yours' });
       const body = await readJson(req);
       const cur = offers.get(id);
+      if (body.altOfferId && String(body.altOfferId) !== cur.altOfferId && !offerUsable(req, String(body.altOfferId))) return json(res, 403, { error: 'offer_not_usable', offerId: String(body.altOfferId) });
       const newUrl = body.url !== undefined ? String(body.url) : cur.url;
       const newPostbackUrl = body.postbackUrl !== undefined ? body.postbackUrl : cur.postbackUrl;
       const newDailyCap = body.dailyCap !== undefined ? body.dailyCap : cur.dailyCap;
@@ -2216,7 +2399,7 @@ const server = http.createServer(async (req, res) => {
       const capError = conversionCapError(id, body) || payoutError(body);
       if (capError) return json(res, 400, { error: capError });
       const updated = parseOffer({ url: newUrl, postbackUrl: newPostbackUrl, payoutType: body.payoutType !== undefined ? body.payoutType : cur.payoutType, payout: body.payout !== undefined ? body.payout : cur.payout, payoutCurrency: body.payoutCurrency !== undefined ? body.payoutCurrency : cur.payoutCurrency, dailyCap: newDailyCap, name: body.name !== undefined ? body.name : cur.name, networkId: body.networkId !== undefined ? body.networkId : cur.networkId, archived: body.archived !== undefined ? body.archived : cur.archived, group: body.group !== undefined ? body.group : cur.group,
-        conversionCap: body.conversionCap !== undefined ? body.conversionCap : cur.conversionCap, capTz: body.capTz !== undefined ? body.capTz : cur.capTz, altOfferId: body.altOfferId !== undefined ? body.altOfferId : cur.altOfferId });
+        conversionCap: body.conversionCap !== undefined ? body.conversionCap : cur.conversionCap, capTz: body.capTz !== undefined ? body.capTz : cur.capTz, altOfferId: body.altOfferId !== undefined ? body.altOfferId : cur.altOfferId, ownerId: nextOwnerId(req, body, cur) });
       if (!updated) return json(res, 400, { error: 'invalid_url' });
       offers.set(id, updated);
       await persistOffer(id, updated);
@@ -2242,9 +2425,10 @@ const server = http.createServer(async (req, res) => {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const body = await readJson(req);
       if (!OFFER_ID_RE.test(String(body.id || ''))) return json(res, 400, { error: 'valid_id_required' });
+      if (sources.has(String(body.id))) return json(res, 409, { error: 'id_taken' });
       if (!canSeeSourcePostback) { delete body.postbackUrl; delete body.postbackStatuses; }
       if (body.postbackUrl && !parsePostbackUrl(body.postbackUrl, { allowHttp: sourcePostbackAllowPrivate })) return json(res, 400, { error: 'invalid_postback_url' });
-      const source = parseSource(body);
+      const source = parseSource({ ...body, ownerId: creatorOwnerId(req, body) });
       if (!source) return json(res, 400, { error: 'invalid_source' });
       sources.set(String(body.id), source);
       await persistSource(String(body.id), source);
@@ -2255,6 +2439,7 @@ const server = http.createServer(async (req, res) => {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const id = sourceUpdate[1];
       if (!sources.has(id)) return json(res, 404, { error: 'source_not_found' });
+      if (!canManage(req, sources.get(id))) return json(res, 403, { error: 'source_not_yours' });
       const body = await readJson(req);
       if (!canSeeSourcePostback) { delete body.postbackUrl; delete body.postbackStatuses; }
       if (body.postbackUrl && !parsePostbackUrl(body.postbackUrl, { allowHttp: sourcePostbackAllowPrivate })) return json(res, 400, { error: 'invalid_postback_url' });
@@ -2267,6 +2452,7 @@ const server = http.createServer(async (req, res) => {
         costFromParam: body.costFromParam !== undefined ? body.costFromParam : cur.costFromParam,
         postbackUrl: body.postbackUrl !== undefined ? body.postbackUrl : cur.postbackUrl,
         postbackStatuses: body.postbackStatuses !== undefined ? body.postbackStatuses : cur.postbackStatuses,
+        ownerId: nextOwnerId(req, body, cur),
       });
       sources.set(id, updated);
       await persistSource(id, updated);
@@ -2275,12 +2461,12 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/networks' && req.method === 'GET') return json(res, 200, { networks: Object.fromEntries(networks) });
     if (url.pathname === '/api/networks' && req.method === 'POST') {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
-      const body=await readJson(req), id=String(body.id||''), network=parseNetwork(body);
-      if(!OFFER_ID_RE.test(id)) return json(res,400,{error:'valid_id_required'}); if(!network) return json(res,400,{error:'name_required'}); if(networks.has(id)) return json(res,409,{error:'network_exists'});
+      const body=await readJson(req), id=String(body.id||''), network=parseNetwork({ ...body, ownerId: creatorOwnerId(req, body) });
+      if(!OFFER_ID_RE.test(id)) return json(res,400,{error:'valid_id_required'}); if(!network) return json(res,400,{error:'name_required'}); if(networks.has(id)) return json(res,409,{error:'id_taken'});
       networks.set(id,network); await persistNetwork(id,network); await audit(req,'create','network',id,null,network); return json(res,201,{id,...network});
     }
     const networkUpdate=url.pathname.match(/^\/api\/networks\/([A-Za-z0-9_-]{2,80})$/);
-    if(networkUpdate && req.method==='PATCH') { if(!(await adminAuthorized(req))) return json(res,401,{error:'admin_authorization_required'}); const id=networkUpdate[1],cur=networks.get(id); if(!cur) return json(res,404,{error:'network_not_found'}); const next=parseNetwork({...cur,...await readJson(req)}); if(!next) return json(res,400,{error:'name_required'}); networks.set(id,next); await persistNetwork(id,next); await audit(req,'update','network',id,cur,next); return json(res,200,{id,...next}); }
+    if(networkUpdate && req.method==='PATCH') { if(!(await adminAuthorized(req))) return json(res,401,{error:'admin_authorization_required'}); const id=networkUpdate[1],cur=networks.get(id); if(!cur) return json(res,404,{error:'network_not_found'}); if(!canManage(req,cur)) return json(res,403,{error:'network_not_yours'}); const body=await readJson(req); const next=parseNetwork({...cur,...body,ownerId:nextOwnerId(req,body,cur)}); if(!next) return json(res,400,{error:'name_required'}); networks.set(id,next); await persistNetwork(id,next); await audit(req,'update','network',id,cur,next); return json(res,200,{id,...next}); }
     if (url.pathname === '/api/campaigns' && req.method === 'GET') {
       const allowed = scopeCampaigns(req);
       return json(res, 200, { campaigns: Object.fromEntries([...campaigns].filter(([id]) => !allowed || allowed.includes(id))) });
@@ -2294,6 +2480,8 @@ const server = http.createServer(async (req, res) => {
       if (campaigns.has(String(body.id)) && !canEditCampaign(req, campaigns.get(String(body.id)))) return json(res, 403, { error: 'campaign_not_yours' });
       const cloaking = streamPolicyError(parseStreams(body.streams));
       if (cloaking) return json(res, 400, cloaking);
+      const refsError = streamRefsError(req, parseStreams(body.streams), campaigns.get(String(body.id))?.streams);
+      if (refsError) return json(res, 403, refsError);
       // A buyer's new campaign is always theirs; the owner may assign it to someone.
       const ownerId = isBuyer(req) ? req.user.id : (body.ownerId ?? req.user?.id ?? null);
       const sourceDefaults = body.sourceId ? sources.get(String(body.sourceId)) : null;
@@ -2322,6 +2510,8 @@ const server = http.createServer(async (req, res) => {
       if (OFFER_ID_RE.test(String(body.sourceId ?? '')) && !sources.has(String(body.sourceId))) return json(res, 400, { error: 'source_not_found' });
       if (body.sourcePostbackUrl && !parsePostbackUrl(body.sourcePostbackUrl, { allowHttp: sourcePostbackAllowPrivate })) return json(res, 400, { error: 'invalid_postback_url' });
       const cur = campaigns.get(id);
+      const refsError = body.streams === undefined ? null : streamRefsError(req, parseStreams(body.streams), cur.streams);
+      if (refsError) return json(res, 403, refsError);
       campaigns.set(id, parseCampaign(id, {
         name: body.name === undefined ? cur.name : body.name,
         group: body.group === undefined ? cur.group : body.group,
@@ -2395,6 +2585,8 @@ const server = http.createServer(async (req, res) => {
       const cloaking = streamPolicyError(streams);
       if (cloaking) return json(res, 400, cloaking);
       const current = campaigns.get(id);
+      const refsError = streamRefsError(req, streams, current.streams);
+      if (refsError) return json(res, 403, refsError);
       campaigns.set(id, { ...current, streams });
       await persistCampaign(id, campaigns.get(id));
       await audit(req, 'update', 'campaign', id, current, campaigns.get(id));

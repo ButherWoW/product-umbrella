@@ -494,6 +494,17 @@ try {
     await p2.locator('[data-nav=dashboard]').click();
     await p2.locator('.kpi', { hasText: 'Заработок баера' }).waitFor();
     assert.equal(await p2.getByRole('heading', { name: 'Баеры' }).count(), 0, 'buyers do not see the per-buyer table');
+    // Ownership: a team offer is read-only for the buyer (badge, no edit/copy/archive); their own offer keeps the controls.
+    await lockedApi('/api/offers', { id: 'buyer-own', url: 'https://own.example.com/', ownerId: buyerUser.id });
+    await p2.goto(locked.url + '/admin#/offers');
+    const teamRow = p2.locator('table.grid tbody tr', { hasText: 'offer-1' });
+    const ownRow = p2.locator('table.grid tbody tr', { hasText: 'buyer-own' });
+    await ownRow.waitFor();
+    assert.equal(await teamRow.locator('.badge', { hasText: 'командный' }).count(), 1, 'team offer badge');
+    assert.equal(await teamRow.getByRole('button', { name: 'Изменить' }).count(), 0, 'no edit button on a team offer');
+    assert.equal(await teamRow.getByRole('button', { name: 'Копировать' }).count(), 0, 'no copy button on a team offer');
+    assert.equal(await ownRow.getByRole('button', { name: 'Изменить' }).count(), 1, 'own offer stays editable');
+    assert.equal(await ownRow.locator('.badge').count(), 0);
     await p2.screenshot({ path: join(tmpdir(), 'umbrella-admin-buyer.png') });
   } finally { await locked.stop(); await rm(dir2, { recursive: true, force: true }); }
 
@@ -984,6 +995,66 @@ try {
   await page.goto(server.url + '/admin#/reports?group=connection&campaign=conn-ui');
   await page.locator('.chip-btn.on', { hasText: 'Тип соединения' }).waitFor();
   await page.locator('table.grid tbody tr', { hasText: '(неизвестно)' }).waitFor();
+
+  // Task 11 «Обновить расходы» and the FB spend CSV import (campaigns list).
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await api('/api/campaigns', { id: 'cost-ui', name: 'Cost UI', streams: [{ name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] }] });
+  for (let i = 0; i < 4; i++) await fetch(server.url + '/r/cost-ui', { redirect: 'manual' });
+  await page.goto(server.url + '/admin#/campaigns');
+  await page.getByRole('combobox', { name: 'Период' }).selectOption('today');
+  await page.getByRole('combobox', { name: 'Валюта' }).selectOption('EUR');
+  const costRow = page.locator('table.grid tbody tr', { hasText: 'Cost UI' });
+  await costRow.waitFor();
+  const costCell = async () => page.evaluate(() => {
+    const ths = [...document.querySelectorAll('table.grid thead th')].map((th) => th.textContent.trim());
+    const row = [...document.querySelectorAll('table.grid tbody tr')].find((r) => r.textContent.includes('Cost UI'));
+    return [...row.querySelectorAll('td')][ths.indexOf('Расход')]?.textContent.trim();
+  });
+  await costRow.getByRole('button', { name: 'Обновить расходы' }).click();
+  const costDlg = page.getByRole('dialog', { name: 'Обновить расходы' });
+  await costDlg.getByRole('button', { name: 'Обновить' }).click();
+  await costDlg.locator('.err', { hasText: 'Сумма — число не меньше нуля.' }).waitFor();
+  await costDlg.getByLabel('Сумма расхода').fill('2');
+  await costDlg.getByLabel('Валюта расхода').selectOption('EUR');
+  await costDlg.getByRole('button', { name: 'Обновить' }).click();
+  await page.locator('#toast', { hasText: /Распределено 4 клика, 2,00\s?€/ }).waitFor();
+  assert.equal(await costDlg.count(), 0, 'dialog closed');
+  await page.waitForFunction(() => {
+    const ths = [...document.querySelectorAll('table.grid thead th')].map((th) => th.textContent.trim());
+    const row = [...document.querySelectorAll('table.grid tbody tr')].find((r) => r.textContent.includes('Cost UI'));
+    return /^2,00\s?€$/.test([...row.querySelectorAll('td')][ths.indexOf('Расход')]?.textContent.trim() || '');
+  });
+
+  // FB CSV (Russian headers, BOM, «;», decimal comma, a totals row and an ad set without clicks): preview → apply.
+  for (let i = 0; i < 2; i++) await fetch(server.url + '/r/cost-ui?sub_id_2=777', { redirect: 'manual' });
+  const csvToday = new Date().toISOString().slice(0, 10);
+  const csv = '﻿Дата начала отчётности;Дата окончания отчётности;Название группы объявлений;ID группы объявлений;Потраченная сумма (EUR)\r\n'
+    + `${csvToday};${csvToday};"Группа; №1";777;"3,50"\r\n${csvToday};${csvToday};Пустая;999;1,00\r\n${csvToday};${csvToday};;;4,50\r\n`;
+  await page.getByRole('button', { name: 'Импорт расходов' }).click();
+  const fbDlg = page.getByRole('dialog', { name: 'Импорт расходов из Facebook' });
+  await fbDlg.getByRole('button', { name: 'Применить' }).click();
+  await fbDlg.locator('.err', { hasText: 'Сначала выберите CSV файл.' }).waitFor();
+  await fbDlg.getByLabel('CSV файл расходов').setInputFiles({ name: 'fb-spend.csv', mimeType: 'text/csv', buffer: Buffer.from(csv, 'utf8') });
+  const fbPreview = fbDlg.getByRole('table', { name: 'Предпросмотр расходов' });
+  await fbPreview.locator('tbody tr', { hasText: '777' }).waitFor();
+  assert.equal(await fbPreview.locator('tbody tr').count(), 3, 'all rows in the preview');
+  assert.match(await fbPreview.locator('tbody tr', { hasText: '777' }).innerText(), /3,50\s?€[\s\S]*готово/);
+  assert.match(await fbPreview.locator('tbody tr').nth(2).innerText(), /нет ID/);
+  assert.equal(await fbDlg.getByLabel('Параметр с ID').inputValue(), 'sub_id_2', 'ad set ID → sub_id_2 by default');
+  await fbDlg.getByRole('button', { name: 'Применить' }).click();
+  await fbDlg.locator('.err', { hasText: 'Отметьте хотя бы одну кампанию.' }).waitFor();
+  await fbDlg.getByLabel('Cost UI (cost-ui)').check();
+  await fbDlg.getByRole('button', { name: 'Применить' }).click();
+  await page.locator('#toast', { hasText: /Импортировано строк: 1, 2 клика, 3,50\s?€; без кликов: 1/ }).waitFor();
+  assert.match(await fbPreview.locator('tbody tr', { hasText: '777' }).innerText(), /применено/);
+  assert.match(await fbPreview.locator('tbody tr', { hasText: '999' }).innerText(), /нет кликов/);
+  await fbDlg.getByRole('button', { name: 'Закрыть' }).last().click();
+  await page.waitForFunction(() => {
+    const ths = [...document.querySelectorAll('table.grid thead th')].map((th) => th.textContent.trim());
+    const row = [...document.querySelectorAll('table.grid tbody tr')].find((r) => r.textContent.includes('Cost UI'));
+    return /^5,50\s?€$/.test([...row.querySelectorAll('td')][ths.indexOf('Расход')]?.textContent.trim() || '');
+  });
+  assert.match(await costCell(), /^5,50\s?€$/);
 
   assert.deepEqual(errors, []);
   console.log('Admin UI browser test passed');

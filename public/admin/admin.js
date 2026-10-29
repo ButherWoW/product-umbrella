@@ -100,6 +100,10 @@ const isOwnerView = () => state.me?.user?.role === 'owner';
 const hideRev = () => Boolean(state.me?.user?.hideRevenue) && state.me.user.role !== 'owner';
 const REV_COLS = new Set(['revenue', 'profit', 'roi', 'epc', 'rpm', 'uepc', 'pendingRevenue', 'earn']);
 const ROLE_LABEL = { owner: 'Владелец', buyer: 'Баер', viewer: 'Только чтение' };
+// Offers, landings, sources and networks: a buyer changes only what they created (the server enforces it; the panel
+// only hides the controls). Without a signed-in user (ADMIN_TOKEN / fresh install) everything is editable.
+const canManage = (e) => !state.me?.user || state.me.user.role === 'owner' || (Boolean(e?.ownerId) && e.ownerId === state.me.user.id);
+const ownerBadge = (e) => (canManage(e) ? null : [' ', h('span', { class: 'badge', title: 'Только просмотр: изменить может создатель или владелец' }, e?.ownerId ? 'чужой' : 'командный')]);
 const userEmail = (id) => state.users.find((u) => u.id === id)?.email || (id ? 'удалённый пользователь' : '—');
 
 // ---------- period ----------
@@ -671,6 +675,7 @@ async function pageCampaigns() {
         h('a', { href: '#/clicks' + qs({ campaign: r.id }), title: 'Лог кликов', 'aria-label': 'Лог кликов' }, '☰'),
         h('button', { title: r.active ? 'Выключить' : 'Включить', 'aria-label': r.active ? 'Выключить' : 'Включить', onclick: () => setActive([r.id], !r.active) }, r.active ? '⏸' : '▶'),
         h('button', { title: 'Копировать', 'aria-label': 'Копировать', onclick: () => cloneEntity('campaigns', r.id, load) }, '⧉'),
+        canEditCampaignCosts(r) ? h('button', { title: 'Обновить расходы', 'aria-label': 'Обновить расходы', onclick: () => costUpdateModal(r.id, load) }, '€') : null,
         archiveButton('campaigns', r, load)) },
       { key: 'group', label: 'Группа', value: (r) => r.group || '', render: (r) => r.group || '—' },
       { key: 'owner', label: 'Баер', hidden: !isOwnerView(), value: (r) => (r.ownerId ? userEmail(r.ownerId) : '—') },
@@ -739,7 +744,8 @@ async function pageCampaigns() {
     } catch (e) { toast('Не удалось изменить состояние: ' + e.message, true); }
   }
   put(view, 
-    h('div', { class: 'toolbar' }, h('a', { class: 'btn primary', href: '#/campaigns/new' }, 'Создать'), bulk),
+    h('div', { class: 'toolbar' }, h('a', { class: 'btn primary', href: '#/campaigns/new' }, 'Создать'),
+      state.me?.user?.role === 'viewer' ? null : h('button', { class: 'btn', onclick: () => fbImportModal(table.selected(), load) }, 'Импорт расходов'), bulk),
     h('div', { class: 'toolbar' }, stateFilter, groupSel, periodControl(() => load()), currencyControl(() => load()),
       h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'),
       h('button', { class: 'btn square', title: 'Колонки', 'aria-label': 'Колонки', onclick: () => table.chooser() }, '⚙')),
@@ -762,6 +768,258 @@ async function pageCampaigns() {
   }
   load();
   return () => table.detach();
+}
+
+// ---------- costs: «Обновить расходы» (task 11) and FB spend CSV import ----------
+// Viewers never edit; a buyer edits only own campaigns (the server checks it anyway).
+function canEditCampaignCosts(c) {
+  const user = state.me?.user;
+  if (!user) return true; // admin key / local mode act as the owner
+  if (user.role === 'viewer') return false;
+  return user.role !== 'buyer' || c?.ownerId === user.id;
+}
+const plural = (n, one, few, many) => { const m10 = n % 10, m100 = n % 100; return m10 === 1 && m100 !== 11 ? one : m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14) ? few : many; };
+const clicksWord = (n) => `${num(n)} ${plural(n, 'клик', 'клика', 'кликов')}`;
+const moneyIn = (v, code) => { try { return (Number(v) || 0).toLocaleString('ru-RU', { style: 'currency', currency: code, minimumFractionDigits: 2, maximumFractionDigits: 2 }); } catch { return amount(v) + ' ' + code; } };
+const COST_TRACK_FIELDS = ['source', 'keyword', 'external_id', 'creative_id', 'ad_campaign_id', ...Array.from({ length: 30 }, (_, i) => `sub_id_${i + 1}`)];
+const costZones = () => ['UTC', ...TIME_ZONES.filter((z) => z !== 'UTC')];
+function currencyOptions(selected) {
+  const info = currency.info || { currencies: ['EUR'], defaultCurrency: 'EUR' };
+  const codes = [...POPULAR.filter((c) => info.currencies.includes(c)), ...info.currencies.filter((c) => !POPULAR.includes(c))];
+  if (!codes.includes(selected)) codes.unshift(selected);
+  return codes.map((c) => h('option', { value: c, selected: c === selected }, c));
+}
+const COST_ERRORS = { campaign_not_yours: 'это не ваша кампания', campaign_not_found: 'кампания не найдена', invalid_tz: 'неверный часовой пояс', invalid_amount: 'неверная сумма',
+  invalid_currency: 'неверная валюта', invalid_filter: 'неверный фильтр', invalid_param: 'неверный параметр', invalid_date_range: 'дата «по» раньше даты «с»', read_only: 'только чтение',
+  rows_required: 'нет строк', too_many_rows: 'слишком много строк (до 5000)', no_matching_clicks: 'нет кликов', invalid_date: 'неверная дата', invalid_id: 'нет ID' };
+const costError = (e) => COST_ERRORS[e?.message || e] || e?.message || String(e);
+
+async function costUpdateModal(campaignId, onDone) {
+  await loadRates();
+  const c = state.campaigns[campaignId] || {};
+  const range = periodRange();
+  const today = new Date().toISOString().slice(0, 10);
+  const d = { from: range.from || today, to: range.to || today, tz: 'UTC', amount: '', currency: currency.info?.defaultCurrency || 'EUR', uniqueOnly: false, filters: [] };
+  const err = h('p', { class: 'err', role: 'alert' });
+  const filtersBox = h('div');
+  const offerIds = [...new Set((c.streams || []).flatMap((s) => (s.offers || []).map((o) => o.offerId)).filter(Boolean))];
+  const streamNames = (c.streams || []).map((s) => s.name).filter(Boolean);
+  const FILTERS = [['offer', 'Оффер'], ['stream', 'Поток'], ...COST_TRACK_FIELDS.map((f) => [f, f])];
+  function drawFilters() {
+    put(filtersBox, d.filters.map((f, i) => {
+      const listId = `cost-filter-list-${i}`;
+      const options = f.key === 'offer' ? offerIds : f.key === 'stream' ? streamNames : [];
+      return h('div', { class: 'toolbar', style: 'margin:0 0 6px' },
+        h('select', { class: 'select', 'aria-label': `Фильтр ${i + 1}: поле`, onchange: (e) => { f.key = e.target.value; drawFilters(); } },
+          FILTERS.map(([k, l]) => h('option', { value: k, selected: k === f.key }, l))),
+        h('input', { class: 'input', value: f.value, maxlength: 255, list: options.length ? listId : null, placeholder: 'значение', 'aria-label': `Фильтр ${i + 1}: значение`, oninput: (e) => { f.value = e.target.value; } }),
+        options.length ? h('datalist', { id: listId }, options.map((o) => h('option', { value: o }))) : null,
+        h('button', { type: 'button', class: 'btn square', title: 'Убрать фильтр', 'aria-label': `Убрать фильтр ${i + 1}`, onclick: () => { d.filters.splice(i, 1); drawFilters(); } }, '✕'));
+    }), h('button', { type: 'button', class: 'btn', onclick: () => { d.filters.push({ key: 'sub_id_1', value: '' }); drawFilters(); } }, '+ Фильтр'));
+  }
+  drawFilters();
+  const submit = h('button', { class: 'btn primary', onclick: async () => {
+    err.textContent = '';
+    if (!d.from || !d.to) { err.textContent = 'Укажите период: даты «с» и «по».'; return; }
+    if (d.to < d.from) { err.textContent = 'Дата «по» раньше даты «с».'; return; }
+    const value = Number(String(d.amount).replace(',', '.').replace(/\s/g, ''));
+    if (String(d.amount).trim() === '' || !Number.isFinite(value) || value < 0) { err.textContent = 'Сумма — число не меньше нуля.'; return; }
+    if (value >= 1e8) { err.textContent = 'Слишком большая сумма.'; return; }
+    const filters = {};
+    for (const f of d.filters) {
+      const v = f.value.trim();
+      if (!v) { err.textContent = `Укажите значение фильтра «${f.key}» или уберите его.`; return; }
+      if (filters[f.key] !== undefined) { err.textContent = `Фильтр «${f.key}» указан дважды.`; return; }
+      filters[f.key] = v;
+    }
+    submit.disabled = true;
+    try {
+      const r = await api('/api/costs', { method: 'POST', body: { campaign: campaignId, from: d.from, to: d.to, tz: d.tz, amount: value, currency: d.currency, filters, uniqueOnly: d.uniqueOnly } });
+      if (!r.updated) { err.textContent = 'За этот период нет подходящих кликов — расход не распределён.'; return; }
+      toast(`Распределено ${clicksWord(r.updated)}, ${moneyIn(r.cost, r.costCurrency)}`);
+      close(); onDone();
+    } catch (e) { err.textContent = 'Не обновлено: ' + costError(e); }
+    finally { submit.disabled = false; }
+  } }, 'Обновить');
+  const close = openModal({
+    title: 'Обновить расходы',
+    body: h('div', {},
+      h('p', { class: 'muted' }, `Кампания: ${c.name || campaignId}. Сумма делится поровну между кликами за период и заменяет их прежний расход.`),
+      h('div', { class: 'toolbar', style: 'margin:0' },
+        field('С', h('input', { class: 'input', type: 'date', value: d.from, 'aria-label': 'Расходы с', onchange: (e) => { d.from = e.target.value; } })),
+        field('По', h('input', { class: 'input', type: 'date', value: d.to, 'aria-label': 'Расходы по', onchange: (e) => { d.to = e.target.value; } })),
+        field('Часовой пояс', h('select', { class: 'select', 'aria-label': 'Часовой пояс расходов', onchange: (e) => { d.tz = e.target.value; } },
+          costZones().map((z) => h('option', { value: z, selected: z === d.tz }, z))))),
+      h('div', { class: 'toolbar', style: 'margin:0' },
+        field('Сумма', h('input', { class: 'input', type: 'text', inputmode: 'decimal', value: d.amount, placeholder: '0.00', 'aria-label': 'Сумма расхода', oninput: (e) => { d.amount = e.target.value; } })),
+        field('Валюта', h('select', { class: 'select', 'aria-label': 'Валюта расхода', onchange: (e) => { d.currency = e.target.value; } }, currencyOptions(d.currency)))),
+      fieldGroup('Фильтры (необязательно)', filtersBox),
+      h('label', { class: 'radios' }, h('input', { type: 'checkbox', onchange: (e) => { d.uniqueOnly = e.target.checked; } }), 'Только уникальные клики'),
+      err),
+    footer: [h('button', { class: 'btn', onclick: () => close() }, 'Отмена'), submit],
+  });
+}
+
+// CSV from Facebook Ads Manager (or any spreadsheet): quotes, `,` / `;` / tab separators, BOM, CRLF.
+function parseCsv(text) {
+  text = String(text || '').replace(/^﻿/, '');
+  const firstLine = text.split(/\r?\n/, 1)[0] || '';
+  const count = (ch) => { let n = 0, q = false; for (const c of firstLine) { if (c === '"') q = !q; else if (c === ch && !q) n++; } return n; };
+  const sep = [';', '\t', ','].reduce((best, ch) => (count(ch) > count(best) ? ch : best), ',');
+  const rows = []; let row = [], cell = '', quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quoted) {
+      if (ch === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else quoted = false; }
+      else cell += ch;
+    } else if (ch === '"') quoted = true;
+    else if (ch === sep) { row.push(cell); cell = ''; }
+    else if (ch === '\n' || ch === '\r') {
+      if (ch === '\r' && text[i + 1] === '\n') i++;
+      row.push(cell); rows.push(row); row = []; cell = '';
+    } else cell += ch;
+  }
+  if (cell !== '' || row.length) { row.push(cell); rows.push(row); }
+  return rows.filter((r) => r.some((c) => c.trim() !== ''));
+}
+// «1 234,56», «1,234.56», «€12.50», «12,5» → number; null when it is not a number.
+function parseSpend(raw) {
+  let s = String(raw ?? '').replace(/[\s  ]/g, '').replace(/[^\d.,-]/g, '');
+  if (!s) return null;
+  const lastComma = s.lastIndexOf(','), lastDot = s.lastIndexOf('.');
+  if (lastComma > -1 && lastDot > -1) s = lastComma > lastDot ? s.replace(/\./g, '').replace(',', '.') : s.replace(/,/g, '');
+  else if (lastComma > -1) s = /^-?\d{1,3}(,\d{3})+$/.test(s) ? s.replace(/,/g, '') : s.replace(',', '.');
+  const n = Number(s);
+  return s !== '' && Number.isFinite(n) ? n : null;
+}
+// 2026-10-28, 2026/10/28, 28.10.2026 → 2026-10-28; anything else → null.
+function parseSpendDate(raw) {
+  const s = String(raw ?? '').trim();
+  let m = s.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})/);
+  let iso = m ? `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}` : null;
+  if (!iso && (m = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/))) iso = `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
+  return iso && !Number.isNaN(Date.parse(iso + 'T00:00:00Z')) && new Date(iso + 'T00:00:00Z').toISOString().startsWith(iso) ? iso : null;
+}
+// Column detection for English and Russian Ads Manager exports.
+const FB_DATE_COLS = [/^day$/i, /^date$/i, /^reporting starts$/i, /^день$/i, /^дата$/i, /^дата начала отч[её]тности$/i, /^начало отч[её]тности$/i];
+const FB_END_COLS = [/^reporting ends$/i, /^дата окончания отч[её]тности$/i, /^окончание отч[её]тности$/i];
+const FB_ID_COLS = [[/^ad set id$/i, 'sub_id_2'], [/^id группы объявлений$/i, 'sub_id_2'], [/^ad id$/i, 'creative_id'], [/^id объявления$/i, 'creative_id'],
+  [/^campaign id$/i, 'ad_campaign_id'], [/^id кампании$/i, 'ad_campaign_id']];
+const FB_SPEND_COL = /^(amount spent|потраченная сумма|spend|расход)\s*(\(([A-Za-z]{3})\))?$/i;
+function fbColumns(header) {
+  const find = (patterns) => header.findIndex((c) => patterns.some((p) => p.test(c.trim())));
+  const ids = header.map((c, i) => ({ i, name: c.trim(), param: FB_ID_COLS.find(([p]) => p.test(c.trim()))?.[1] })).filter((c) => c.param);
+  const spendIndex = header.findIndex((c) => FB_SPEND_COL.test(c.trim()));
+  const spendCurrency = spendIndex >= 0 ? (header[spendIndex].trim().match(FB_SPEND_COL)[3] || '').toUpperCase() : '';
+  return { date: find(FB_DATE_COLS), end: find(FB_END_COLS), ids, spend: spendIndex, spendCurrency };
+}
+
+async function fbImportModal(preselected, onDone) {
+  await loadRates();
+  const editable = Object.entries(state.campaigns).filter(([id, c]) => !c.archived && canEditCampaignCosts(c)).sort(([a], [b]) => a.localeCompare(b));
+  const saved = store.get('fbImport', {});
+  const d = { campaigns: new Set(preselected.filter((id) => editable.some(([cid]) => cid === id))), param: saved.param || '', tz: saved.tz || 'UTC',
+    currency: currency.info?.defaultCurrency || 'EUR', header: null, rows: [], idCol: -1, cols: null, results: null, fileName: '' };
+  const err = h('p', { class: 'err', role: 'alert' });
+  const info = h('p', { class: 'muted', role: 'status', 'aria-label': 'Файл расходов' }, 'Выгрузите отчёт из Ads Manager в CSV с разбивкой по дням (Day) и колонкой ID группы объявлений, объявления или кампании.');
+  const mapping = h('div');
+  const preview = h('div');
+  const fileInput = h('input', { type: 'file', accept: '.csv,text/csv,text/plain', class: 'input', 'aria-label': 'CSV файл расходов', onchange: async (e) => {
+    const file = e.target.files?.[0];
+    err.textContent = ''; d.results = null;
+    if (!file) return;
+    if (file.size > 5 * 1024 * 1024) { err.textContent = 'Файл больше 5 МБ.'; return; }
+    const rows = parseCsv(await file.text());
+    if (rows.length < 2) { err.textContent = 'В файле нет строк с данными.'; return; }
+    d.fileName = file.name; d.header = rows[0]; d.rows = rows.slice(1); d.cols = fbColumns(d.header);
+    if (d.cols.date < 0) { err.textContent = 'Нет колонки с датой («Day», «Reporting starts», «Дата начала отчётности»).'; d.header = null; }
+    else if (d.cols.spend < 0) { err.textContent = 'Нет колонки с расходом («Amount spent (EUR)», «Потраченная сумма (EUR)»).'; d.header = null; }
+    else if (!d.cols.ids.length) { err.textContent = 'Нет колонки с ID («Ad set ID», «Ad ID», «Campaign ID», «ID группы объявлений»).'; d.header = null; }
+    if (!d.header) { put(mapping); put(preview); return; }
+    d.idCol = d.cols.ids[0].i;
+    if (!d.param) d.param = d.cols.ids[0].param;
+    if (d.cols.spendCurrency) d.currency = d.cols.spendCurrency;
+    info.textContent = `${file.name}: ${d.rows.length} ${plural(d.rows.length, 'строка', 'строки', 'строк')}`;
+    drawMapping(); drawPreview();
+  } });
+  // Rows as sent to the server, with a local check first (the server checks again).
+  function parsedRows() {
+    return d.rows.map((cells, index) => {
+      const date = parseSpendDate(cells[d.cols.date]);
+      const end = d.cols.end >= 0 ? parseSpendDate(cells[d.cols.end]) : date;
+      const id = String(cells[d.idCol] ?? '').trim();
+      const value = parseSpend(cells[d.cols.spend]);
+      const row = { line: index + 2, date, id, amount: value, currency: d.currency };
+      if (!date) row.problem = 'неверная дата';
+      else if (end && end !== date) row.problem = 'строка за несколько дней — нужна разбивка по дням';
+      else if (!id) row.problem = 'нет ID (строка итогов?)';
+      else if (value === null || value < 0) row.problem = 'неверная сумма';
+      return row;
+    });
+  }
+  function drawMapping() {
+    put(mapping,
+      h('div', { class: 'toolbar', style: 'margin:0;flex-wrap:wrap' },
+        field('Колонка ID', h('select', { class: 'select', 'aria-label': 'Колонка ID', onchange: (e) => { d.idCol = Number(e.target.value); const c = d.cols.ids.find((x) => x.i === d.idCol); if (c && !saved.param) { d.param = c.param; drawMapping(); } drawPreview(); } },
+          d.cols.ids.map((c) => h('option', { value: c.i, selected: c.i === d.idCol }, c.name)))),
+        field('Параметр в ссылке', h('select', { class: 'select', 'aria-label': 'Параметр с ID', onchange: (e) => { d.param = e.target.value; } },
+          h('option', { value: '', selected: !d.param }, '— выберите —'), COST_TRACK_FIELDS.map((f) => h('option', { value: f, selected: f === d.param }, f))), 'Куда в ссылке кликов приходит этот ID, напр. sub_id_2={{adset.id}}.'),
+        field('Валюта', h('select', { class: 'select', 'aria-label': 'Валюта расходов файла', disabled: Boolean(d.cols.spendCurrency), onchange: (e) => { d.currency = e.target.value; drawPreview(); } }, currencyOptions(d.currency)),
+          d.cols.spendCurrency ? 'Из заголовка колонки.' : null),
+        field('Часовой пояс', h('select', { class: 'select', 'aria-label': 'Часовой пояс отчёта', onchange: (e) => { d.tz = e.target.value; } },
+          [...new Set([d.tz, ...costZones()])].map((z) => h('option', { value: z, selected: z === d.tz }, z))), 'Как в рекламном кабинете.')),
+      fieldGroup('Кампании Umbrella', h('div', { class: 'checks', style: 'max-height:140px;overflow-y:auto' },
+        editable.length ? editable.map(([id, c]) => h('label', {}, h('input', { type: 'checkbox', checked: d.campaigns.has(id), onchange: (e) => { e.target.checked ? d.campaigns.add(id) : d.campaigns.delete(id); } }), c.name && c.name !== id ? `${c.name} (${id})` : id))
+          : h('span', { class: 'muted' }, 'Нет кампаний, которые вы можете менять.')),
+      'Сумма строки делится между кликами всех отмеченных кампаний за этот день.'));
+  }
+  function drawPreview() {
+    const rows = parsedRows();
+    const byLine = new Map((d.results || []).map((r) => [r.row, r]));
+    const ok = rows.filter((r) => !r.problem);
+    const total = ok.reduce((t, r) => t + r.amount, 0);
+    put(preview,
+      h('p', { class: 'muted' }, `К импорту: ${ok.length} из ${rows.length}, сумма ${moneyIn(total, d.currency)}`),
+      h('div', { class: 'table-wrap', style: 'max-height:320px;overflow:auto' },
+        h('table', { class: 'grid', 'aria-label': 'Предпросмотр расходов' },
+          h('thead', {}, h('tr', {}, ['Строка', 'Дата', 'ID', 'Сумма', 'Клики', 'Статус'].map((t) => h('th', {}, t)))),
+          h('tbody', {}, rows.map((r) => {
+            const sent = ok.indexOf(r);
+            const res = sent >= 0 ? byLine.get(sent) : null;
+            const status = r.problem || (res ? (res.error ? costError(res.error) : res.replaced ? 'заменено' : 'применено') : 'готово');
+            const bad = Boolean(r.problem || res?.error);
+            return h('tr', { class: bad ? 'inactive' : '' }, h('td', {}, r.line), h('td', {}, r.date || '—'), h('td', {}, r.id || '—'),
+              h('td', { class: 'num' }, r.amount === null ? '—' : moneyIn(r.amount, r.currency)), h('td', { class: 'num' }, res ? num(res.clicks) : '—'),
+              h('td', { class: bad ? 'neg' : '' }, status));
+          })))));
+  }
+  const apply = h('button', { class: 'btn primary', onclick: async () => {
+    err.textContent = '';
+    if (!d.header) { err.textContent = 'Сначала выберите CSV файл.'; return; }
+    if (!d.param) { err.textContent = 'Выберите параметр, в котором приходит ID.'; return; }
+    if (!d.campaigns.size) { err.textContent = 'Отметьте хотя бы одну кампанию.'; return; }
+    const ok = parsedRows().filter((r) => !r.problem);
+    if (!ok.length) { err.textContent = 'Нет строк для импорта — проверьте даты, ID и суммы.'; return; }
+    if (ok.length > 5000) { err.textContent = 'Слишком много строк: не больше 5000 за раз.'; return; }
+    store.set('fbImport', { param: d.param, tz: d.tz });
+    apply.disabled = true;
+    try {
+      const r = await api('/api/costs/import', { method: 'POST', body: { campaign: [...d.campaigns], param: d.param, tz: d.tz,
+        rows: ok.map(({ date, id, amount: value, currency: code }) => ({ date, id, amount: value, currency: code })) } });
+      d.results = r.results;
+      drawPreview();
+      const noClicks = r.results.filter((x) => x.error === 'no_matching_clicks').length;
+      toast(`Импортировано строк: ${r.applied}, ${clicksWord(r.clicks)}, ${moneyIn(r.cost, r.costCurrency)}` + (noClicks ? `; без кликов: ${noClicks}` : ''), r.applied === 0);
+      onDone();
+    } catch (e) { err.textContent = 'Не импортировано: ' + costError(e); }
+    finally { apply.disabled = false; }
+  } }, 'Применить');
+  const close = openModal({
+    title: 'Импорт расходов из Facebook', wide: true,
+    body: h('div', {}, info, field('CSV файл', fileInput), mapping, preview,
+      h('p', { class: 'muted', style: 'font-size:12px' }, 'Повторный импорт того же дня и ID заменяет прежнюю сумму, а не добавляет к ней. Строки без кликов показываются в таблице и не применяются.'), err),
+    footer: [h('button', { class: 'btn', onclick: () => close() }, 'Закрыть'), apply],
+  });
 }
 
 // Normalize legacy flat streams into the conditional shape used by the editor.
@@ -873,8 +1131,10 @@ function streamModal(stream, onApply, isNew = false, currentCampaignId = null) {
   s.action = s.action || 'offers';
   s.offers = s.offers || [];
   const err = h('p', { class: 'err' });
-  const offerIds = Object.keys(state.offers);
-  const landingIds = Object.keys(state.landings);
+  // Buyers may put only team entities and their own into streams; ids already in the stream stay selectable.
+  const usable = (e) => canManage(e) || !e?.ownerId;
+  const offerIds = Object.keys(state.offers).filter((id) => usable(state.offers[id]) || s.offers.some((o) => o.offerId === id));
+  const landingIds = Object.keys(state.landings).filter((id) => usable(state.landings[id]) || (s.landings || []).some((l) => l.landingId === id));
   s.landings = s.landings || [];
   const landingsBox = h('div');
   const drawLandings = () => put(landingsBox,
@@ -1299,10 +1559,10 @@ async function pageSources() {
   const table = dataTable({
     id: 'sources', pageSize: 250,
     columns: [
-      { key: 'id', label: 'ID', fixed: true, render: (r) => h('a', { href: '#/sources', onclick: (e) => { e.preventDefault(); sourceModal(r.id, load); } }, r.id) },
+      { key: 'id', label: 'ID', fixed: true, render: (r) => (canManage(r) ? h('a', { href: '#/sources', onclick: (e) => { e.preventDefault(); sourceModal(r.id, load); } }, r.id) : r.id) },
       { key: 'menu', label: '', title: 'Меню', sortable: false, value: () => '', render: (r) => h('span', { class: 'row-actions' },
-        h('button', { title: 'Изменить', 'aria-label': 'Изменить', onclick: () => sourceModal(r.id, load) }, '✎')) },
-      { key: 'name', label: 'Название', cls: 'name', value: (r) => r.name || '', render: (r) => h('span', { title: r.name || '' }, r.name || '—') },
+        canManage(r) ? h('button', { title: 'Изменить', 'aria-label': 'Изменить', onclick: () => sourceModal(r.id, load) }, '✎') : null) },
+      { key: 'name', label: 'Название', cls: 'name', value: (r) => r.name || '', render: (r) => h('span', { title: r.name || '' }, r.name || '—', ownerBadge(r)) },
       { key: 'costModel', label: 'Модель', value: (r) => r.costModel === 'cpc' ? 'CPC' : 'Нет' },
       { key: 'cpc', label: 'CPC', num: true, render: (r) => (r.cpc ? money4(r.cpc) : '—') },
       { key: 'postback', label: 'Постбэк', value: (r) => (r.postbackUrl ? (r.postbackStatuses || []).join(', ') : '—') },
@@ -1446,8 +1706,8 @@ async function pageLandings() {
   const table = dataTable({
     id: 'landings', pageSize: 250,
     columns: [
-      { key: 'id', label: 'ID', fixed: true, render: (r) => h('a', { href: '#/landings', onclick: (e) => { e.preventDefault(); landingModal(r.id, load); } }, r.id) },
-      { key: 'name', label: 'Название', cls: 'name', value: (r) => r.name || '', render: (r) => r.name || '—' },
+      { key: 'id', label: 'ID', fixed: true, render: (r) => (canManage(r) ? h('a', { href: '#/landings', onclick: (e) => { e.preventDefault(); landingModal(r.id, load); } }, r.id) : r.id) },
+      { key: 'name', label: 'Название', cls: 'name', value: (r) => r.name || '', render: (r) => h('span', {}, r.name || '—', ownerBadge(r)) },
       { key: 'url', label: 'URL', cls: 'name', hidden: true },
       { key: 'clicks', label: 'Просмотры', title: 'Просмотры лендинга (клики, попавшие на лендинг)', num: true, render: (r) => num(r.clicks), total: (rs) => num(sum(rs, 'clicks')) },
       { key: 'lpClicks', label: 'Клики LP', title: 'Переходы с лендинга на оффер', num: true, render: (r) => num(r.lpClicks), total: (rs) => num(sum(rs, 'lpClicks')) },
@@ -1475,10 +1735,10 @@ async function pageLandings() {
 
 async function pageNetworks() {
   const table = dataTable({ id: 'networks', pageSize: 250, columns: [
-    { key: 'id', label: 'ID', fixed: true }, { key: 'name', label: 'Название', cls: 'name' },
+    { key: 'id', label: 'ID', fixed: true }, { key: 'name', label: 'Название', cls: 'name', render: (r) => h('span', {}, r.name || '—', ownerBadge(r)) },
     { key: 'clickIdParam', label: 'Click ID' }, { key: 'payoutParam', label: 'Payout' }, { key: 'offerParams', label: 'Параметры оффера', cls: 'name' },
     { key: 'notes', label: 'Заметки', cls: 'name' },
-    { key: 'actions', label: '', sortable: false, render: (r) => h('span', { class: 'row-actions' }, h('button', { onclick: () => networkModal(r, load) }, 'Изменить')) },
+    { key: 'actions', label: '', sortable: false, render: (r) => h('span', { class: 'row-actions' }, canManage(r) ? h('button', { onclick: () => networkModal(r, load) }, 'Изменить') : null) },
   ] });
   function networkModal(current, onSaved) {
     const n = { id: current?.id || '', name: current?.name || '', offerParams: current?.offerParams || '', clickIdParam: current?.clickIdParam || 'sub1', payoutParam: current?.payoutParam || 'payout', notes: current?.notes || '' };
@@ -1509,14 +1769,14 @@ async function pageOffers() {
   const table = dataTable({
     id: 'offers', selectable: true, pageSize: 250,
     columns: [
-      { key: 'id', label: 'ID', fixed: true, render: (r) => h('a', { href: '#/offers', onclick: (e) => { e.preventDefault(); offerModal(r.id, load); } }, r.id) },
+      { key: 'id', label: 'ID', fixed: true, render: (r) => (canManage(r) ? h('a', { href: '#/offers', onclick: (e) => { e.preventDefault(); offerModal(r.id, load); } }, r.id) : r.id) },
       { key: 'menu', label: '', title: 'Меню', sortable: false, value: () => '', render: (r) => h('span', { class: 'row-actions' },
-        h('button', { title: 'Изменить', 'aria-label': 'Изменить', onclick: () => offerModal(r.id, load) }, '✎'),
+        canManage(r) ? h('button', { title: 'Изменить', 'aria-label': 'Изменить', onclick: () => offerModal(r.id, load) }, '✎') : null,
         h('a', { href: '#/reports' + qs({ group: 'country', offer: r.id }), title: 'Отчёт', 'aria-label': 'Отчёт' }, '▥'),
         h('a', { href: '#/clicks' + qs({ offer: r.id }), title: 'Лог кликов', 'aria-label': 'Лог кликов' }, '☰'),
-        h('button', { title: 'Копировать', 'aria-label': 'Копировать', onclick: () => cloneEntity('offers', r.id, load) }, '⧉'),
-        archiveButton('offers', r, load)) },
-      { key: 'name', label: 'Название', cls: 'name', value: (r) => r.name || '', render: (r) => h('span', { title: r.name || '' }, r.name || '—') },
+        canManage(r) ? h('button', { title: 'Копировать', 'aria-label': 'Копировать', onclick: () => cloneEntity('offers', r.id, load) }, '⧉') : null,
+        canManage(r) ? archiveButton('offers', r, load) : null) },
+      { key: 'name', label: 'Название', cls: 'name', value: (r) => r.name || '', render: (r) => h('span', { title: r.name || '' }, r.name || '—', ownerBadge(r)) },
       { key: 'group', label: 'Группа', value: (r) => r.group || '', render: (r) => r.group || '—' },
       { key: 'url', label: 'URL', cls: 'name', hidden: true, render: (r) => h('span', { title: r.url }, r.url) },
       { key: 's2s', label: 'S2S', value: (r) => (r.postbackUrl ? 'да' : 'нет') },
