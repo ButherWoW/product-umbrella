@@ -16,6 +16,7 @@ const dataDir = process.env.DATA_DIR || join(root, 'data');
 const eventsFile = join(dataDir, 'events.jsonl');
 const offersFile = join(dataDir, 'offers.json');
 const landingsFile = join(dataDir, 'landings.json');
+const settingsFile = join(dataDir, 'settings.json');
 const campaignsFile = join(dataDir, 'campaigns.json');
 const port = Number(process.env.PORT || 4100);
 // Public path prefix when served behind a proxy under a subpath (nginx strips it before proxying).
@@ -503,6 +504,7 @@ async function pauseCampaign(id, reason) {
   campaigns.set(id, updated);
   await persistCampaign(id, updated);
   await event('campaign_paused', { campaign: id, reason });
+  await event('audit', { actor: 'system', action: 'pause', entity: 'campaign', entityId: id, changes: { active: [true, false], reason: [null, reason] } });
 }
 
 async function event(type, payload) {
@@ -837,6 +839,40 @@ function sendRedirect(res, location, method = 'http') {
   return res.end();
 }
 
+// Change history (Keitaro «Лог»): who changed what and when. Kept in the JSONL journal; never stores passwords.
+const PRIMITIVE = (v) => v === null || ['string', 'number', 'boolean'].includes(typeof v);
+async function audit(req, action, entity, id, before = null, after = null) {
+  const actor = req.user?.email || (bearerAuthorized(req) ? 'admin-token' : 'anonymous');
+  const keys = [...new Set([...Object.keys(before || {}), ...Object.keys(after || {})])]
+    .filter((k) => JSON.stringify(before?.[k]) !== JSON.stringify(after?.[k]));
+  const changes = Object.fromEntries(keys.map((k) => [k, PRIMITIVE(before?.[k] ?? null) && PRIMITIVE(after?.[k] ?? null) ? [before?.[k] ?? null, after?.[k] ?? null] : null]));
+  try { await event('audit', { actor, action, entity, entityId: id, changes }); }
+  catch (error) { console.warn('[audit] not written:', error.message); }
+}
+
+// Team settings (owner-editable). buyerSharePct: the buyer's share of net profit shown on the dashboard.
+const SETTINGS_DEFAULTS = { buyerSharePct: 35 };
+let settings = { ...SETTINGS_DEFAULTS };
+async function loadSettings() {
+  try { settings = { ...SETTINGS_DEFAULTS, ...JSON.parse(await readFile(settingsFile, 'utf8')) }; }
+  catch (error) { if (error.code !== 'ENOENT') console.warn('[settings] unreadable, using defaults:', error.message); }
+}
+
+async function readAudit({ entity, id, limit }) {
+  let lines = [];
+  try { lines = (await readFile(eventsFile, 'utf8')).split('\n'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  const out = [];
+  for (let i = lines.length - 1; i >= 0 && out.length < limit; i -= 1) {
+    if (!lines[i].includes('"audit"')) continue;
+    try {
+      const item = JSON.parse(lines[i]);
+      if (item.type !== 'audit' || (entity && item.entity !== entity) || (id && item.entityId !== id)) continue;
+      out.push({ at: item.at, actor: item.actor, action: item.action, entity: item.entity, entityId: item.entityId, changes: item.changes || {} });
+    } catch { /* skip */ }
+  }
+  return out;
+}
+
 async function handleAuthRoute(req, res, url) {
   const path = url.pathname;
   const csrfOk = req.headers['x-requested-with'] === 'umbrella' || bearerAuthorized(req);
@@ -862,6 +898,8 @@ async function handleAuthRoute(req, res, url) {
     const user = await users.authenticate(body.email, body.password);
     if (!user) { loginFailures.get(ip).push(Date.now()); return json(res, 401, { error: 'invalid_credentials' }); }
     loginFailures.delete(ip);
+    req.user = user;
+    await audit(req, 'login', 'user', user.id, null, null);
     const token = await users.createSession(user.id);
     res.setHeader('set-cookie', sessionCookie(req, token, SESSION_TTL_MS / 1000));
     return json(res, 200, { user });
@@ -878,7 +916,9 @@ async function handleAuthRoute(req, res, url) {
   }
   if (path === '/api/users' && req.method === 'POST') {
     if (!isOwner) return json(res, 403, { error: 'owner_only' });
-    return json(res, 201, { user: await users.create({ email: body.email, password: body.password, role: body.role || 'buyer' }) });
+    const created = await users.create({ email: body.email, password: body.password, role: body.role || 'buyer' });
+    await audit(req, 'create', 'user', created.id, null, { email: created.email, role: created.role });
+    return json(res, 201, { user: created });
   }
   const userDelete = path.match(/^\/api\/users\/([0-9a-f-]{36})$/);
   if (userDelete && req.method === 'DELETE') {
@@ -890,6 +930,7 @@ async function handleAuthRoute(req, res, url) {
     if (!target) return json(res, 404, { error: 'user_not_found' });
     if (target.role === 'owner' && all.filter((u) => u.role === 'owner').length === 1) return json(res, 409, { error: 'last_owner' });
     await users.remove(id);
+    await audit(req, 'delete', 'user', id, { email: target.email, role: target.role }, null);
     return json(res, 200, { ok: true });
   }
   return json(res, 404, { error: 'not_found' });
@@ -1120,6 +1161,27 @@ const server = http.createServer(async (req, res) => {
       if (!offer.url.includes('{click_id}')) destination.searchParams.set('click_id', clickId);
       return sendRedirect(res, destination.toString(), campaigns.get(click.campaign)?.redirectMethod);
     }
+    if (url.pathname === '/api/settings' && req.method === 'GET') return json(res, 200, settings);
+    if (url.pathname === '/api/settings' && req.method === 'PATCH') {
+      const body = await readJson(req);
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      if (req.user && req.user.role !== 'owner') return json(res, 403, { error: 'owner_only' });
+      const pct = Number(body.buyerSharePct);
+      if (!Number.isFinite(pct) || pct < 0 || pct > 100) return json(res, 400, { error: 'invalid_buyer_share' });
+      const before = { ...settings };
+      settings = { ...settings, buyerSharePct: Math.round(pct * 100) / 100 };
+      await mkdir(dataDir, { recursive: true });
+      await writeFile(settingsFile, JSON.stringify(settings, null, 2) + '\n');
+      await audit(req, 'update', 'settings', 'team', before, settings);
+      return json(res, 200, settings);
+    }
+    if (url.pathname === '/api/audit' && req.method === 'GET') {
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      const entity = url.searchParams.get('entity') || null;
+      const entityId = url.searchParams.get('id') || null;
+      const limit = Math.min(Math.max(Number.parseInt(url.searchParams.get('limit') || '100', 10) || 100, 1), 500);
+      return json(res, 200, { entries: await readAudit({ entity, id: entityId, limit }) });
+    }
     if (url.pathname === '/api/rates' && req.method === 'GET') return json(res, 200, { defaultCurrency: rates.defaultCurrency, ...rates.info() });
     if (url.pathname === '/api/landings' && req.method === 'GET') return json(res, 200, { landings: Object.fromEntries(landings) });
     if (url.pathname === '/api/landings' && req.method === 'POST') {
@@ -1130,6 +1192,7 @@ const server = http.createServer(async (req, res) => {
       if (!landing) return json(res, 400, { error: 'https_url_required' });
       landings.set(String(body.id), landing);
       await persistLanding(String(body.id), landing);
+      await audit(req, 'create', 'landing', String(body.id), null, landing);
       return json(res, 201, { id: body.id, ...landing });
     }
     const landingUpdate = url.pathname.match(/^\/api\/landings\/([A-Za-z0-9_-]{2,80})$/);
@@ -1143,6 +1206,7 @@ const server = http.createServer(async (req, res) => {
       if (!updated) return json(res, 400, { error: 'https_url_required' });
       landings.set(id, updated);
       await persistLanding(id, updated);
+      await audit(req, 'update', 'landing', id, cur, updated);
       return json(res, 200, { id, ...updated });
     }
     if (url.pathname === '/api/offers' && req.method === 'GET') {
@@ -1156,6 +1220,7 @@ const server = http.createServer(async (req, res) => {
       if (!offer) return json(res, 400, { error: 'id_and_https_url_required' });
       offers.set(String(body.id), offer);
       await persistOffer(String(body.id), offer);
+      await audit(req, 'create', 'offer', String(body.id), null, offer);
       return json(res, 201, { id: body.id, ...offer });
     }
     const offerUpdate = url.pathname.match(/^\/api\/offers\/([A-Za-z0-9_-]{2,80})$/);
@@ -1172,6 +1237,7 @@ const server = http.createServer(async (req, res) => {
       if (!updated) return json(res, 400, { error: 'invalid_url' });
       offers.set(id, updated);
       await persistOffer(id, updated);
+      await audit(req, 'update', 'offer', id, cur, updated);
       return json(res, 200, { id, ...updated });
     }
     if (url.pathname === '/api/campaigns' && req.method === 'GET') return json(res, 200, { campaigns: Object.fromEntries(campaigns) });
@@ -1181,6 +1247,7 @@ const server = http.createServer(async (req, res) => {
       if (!/^[a-z0-9_-]{2,80}$/i.test(String(body.id || ''))) return json(res, 400, { error: 'valid_id_required' });
       campaigns.set(String(body.id), parseCampaign(String(body.id), body));
       await persistCampaign(String(body.id), campaigns.get(String(body.id)));
+      await audit(req, 'create', 'campaign', String(body.id), null, campaigns.get(String(body.id)));
       return json(res, 201, { id: body.id, ...campaigns.get(String(body.id)) });
     }
     const campaignUpdate = url.pathname.match(/^\/api\/campaigns\/([A-Za-z0-9_-]{2,80})$/);
@@ -1215,6 +1282,7 @@ const server = http.createServer(async (req, res) => {
         costFromParam: body.costFromParam === undefined ? cur.costFromParam : body.costFromParam,
       }));
       await persistCampaign(id, campaigns.get(id));
+      await audit(req, 'update', 'campaign', id, cur, campaigns.get(id));
       return json(res, 200, { id, ...campaigns.get(id) });
     }
     // Dedicated streams endpoint: PUT /api/campaigns/:id/streams
@@ -1230,6 +1298,7 @@ const server = http.createServer(async (req, res) => {
       const current = campaigns.get(id);
       campaigns.set(id, { ...current, streams });
       await persistCampaign(id, campaigns.get(id));
+      await audit(req, 'update', 'campaign', id, current, campaigns.get(id));
       return json(res, 200, { id, streams });
     }
     if (url.pathname === '/dashboard' && req.method === 'GET') return dashboard(res);
@@ -1374,6 +1443,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 await rates.start();
+await loadSettings();
 await loadOffers();
 await loadLandings();
 await loadCampaigns();

@@ -82,6 +82,15 @@ try {
   assert.match((await revenueTile.innerText()).replace(/\s/g, ''), /2000,00₽/);
   assert.match(await page.locator('.rates-note').innerText(), /1 EUR = 100 RUB/);
   await page.getByLabel('Валюта').selectOption('EUR');
+  // Buyer earnings: 35% of net profit (20 EUR revenue, no cost) = 7 EUR; owner can change the share.
+  const earnings = page.locator('.kpi', { hasText: 'Заработок баера' });
+  await earnings.locator('.v').filter({ hasText: '7,00' }).waitFor();
+  await earnings.click();
+  const shareDialog = page.getByRole('dialog', { name: 'Доля баера' });
+  await shareDialog.locator('input').fill('50');
+  await shareDialog.getByRole('button', { name: 'Сохранить' }).click();
+  await earnings.locator('.v').filter({ hasText: '10,00' }).waitFor();
+  assert.match(await earnings.locator('.k').innerText(), /50%/);
 
   const stored = (await (await fetch(server.url + '/api/campaigns')).json()).campaigns['ui-flows'].streams;
   assert.equal(stored[0].action, 'url');

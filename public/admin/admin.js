@@ -147,6 +147,28 @@ function ratesNote() {
     rate ? ` · 1 ${base} = ${rate.toLocaleString('ru-RU', { maximumFractionDigits: 4 })} ${currency.code}` : '', ' · суммы конверсий хранятся в исходной валюте.');
 }
 
+// ---------- change history ----------
+const ACTION_LABEL = { create: 'Создание', update: 'Изменение', delete: 'Удаление', pause: 'Автопауза', login: 'Вход' };
+const FIELD_LABEL = { name: 'Название', active: 'Состояние', dailyCap: 'Дневной кап', totalCap: 'Общий кап', revenueCap: 'Кап дохода', capUrl: 'URL капа', streams: 'Потоки',
+  allowGeos: 'Страны', allowDevices: 'Устройства', allowOS: 'ОС', allowBrowsers: 'Браузеры', blockedIps: 'Черный список IP', allowedIps: 'Белый список IP', botFilter: 'Фильтр ботов',
+  dedupeWindow: 'Уникальность', conversionWindowDays: 'Окно конверсии', redirectMethod: 'Способ редиректа', paramMap: 'Параметры', costModel: 'Модель затрат', cpc: 'CPC',
+  costFromParam: 'Расход из параметра', url: 'URL', postbackUrl: 'S2S постбэк', dailyCap_offer: 'Дневной кап', reason: 'Причина', email: 'Email', role: 'Роль' };
+const showValue = (v) => (v === null || v === undefined || v === '' ? '—' : v === true ? 'да' : v === false ? 'нет' : String(v));
+async function historyModal(entity, id, title) {
+  const list = h('div', {}, 'Загрузка…');
+  openModal({ title: `История: ${title || id}`, wide: true, body: list });
+  try {
+    const { entries } = await api('/api/audit' + qs({ entity, id, limit: 200 }));
+    put(list, entries.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'grid' },
+      h('thead', {}, h('tr', {}, h('th', {}, 'Когда'), h('th', {}, 'Кто'), h('th', {}, 'Действие'), h('th', {}, 'Что изменилось'))),
+      h('tbody', {}, entries.map((e) => h('tr', {},
+        h('td', {}, dt(e.at)), h('td', {}, e.actor === 'system' ? 'система' : e.actor === 'admin-token' ? 'ключ администратора' : e.actor),
+        h('td', {}, ACTION_LABEL[e.action] || e.action),
+        h('td', { style: 'white-space:normal' }, Object.entries(e.changes || {}).map(([k, v]) => h('div', {}, h('b', {}, FIELD_LABEL[k] || k), v ? `: ${showValue(v[0])} → ${showValue(v[1])}` : ': изменено'))))))))
+      : h('p', { class: 'muted' }, 'Изменений пока нет.'));
+  } catch (e) { put(list, h('p', { class: 'err' }, 'Не удалось загрузить историю: ' + e.message)); }
+}
+
 // ---------- modal ----------
 const modals = [];
 function openModal({ title, body, footer, wide }) {
@@ -392,7 +414,15 @@ async function pageDashboard() {
     const { from, to } = periodRange();
     const campaign = campSel.value || null;
     try {
-      const [s, series, recent] = await Promise.all([api('/stats' + qs({ from, to, campaign })), timeseries({ campaign, from, to }), api('/api/clicks' + qs({ from, to, campaign, limit: 10 })).catch(() => ({ clicks: [] }))]);
+      const [s, series, recent, team] = await Promise.all([api('/stats' + qs({ from, to, campaign })), timeseries({ campaign, from, to }), api('/api/clicks' + qs({ from, to, campaign, limit: 10 })).catch(() => ({ clicks: [] })), api('/api/settings').catch(() => ({ buyerSharePct: 35 }))]);
+      const sharePct = Number(team.buyerSharePct) || 0;
+      const profit = (s.revenue || 0) - (s.cost || 0);
+      // The buyer earns a share of positive net profit; a loss means 0, not a negative payout.
+      const buyerEarnings = Math.max(0, profit) * sharePct / 100;
+      const isOwner = state.me?.user?.role === 'owner' || !state.me?.loginRequired;
+      const earningsTile = h('div', { class: 'kpi' + (isOwner ? ' kpi-edit' : ''), style: 'background:var(--k6)', title: isOwner ? 'Нажмите, чтобы изменить процент' : null,
+        onclick: isOwner ? () => shareModal(sharePct, () => load()) : null },
+        h('div', { class: 'k' }, `Заработок баера · ${sharePct.toLocaleString('ru-RU')}%`), h('div', { class: 'v' }, money(buyerEarnings)));
       const kpi = (label, value, color) => h('div', { class: 'kpi', style: `background:${color}` }, h('div', { class: 'k' }, label), h('div', { class: 'v' }, value));
       const small = (title, id, rows, nameOf, link) => h('div', { class: 'card' }, h('h2', {}, title), dataTable({
         id: 'dash-' + id, pageSize: 10, compact: true, rows: rows.sort((a, b) => b.clicks - a.clicks),
@@ -401,7 +431,8 @@ async function pageDashboard() {
       }));
       put(body, 
         h('div', { class: 'kpis' }, kpi('Клики', num(s.clicks), 'var(--k1)'), kpi('Конверсии', num(s.conversions), 'var(--k3)'), kpi('CR', pct(ratio(s.conversions, s.clicks)), 'var(--k2)'),
-          kpi('Доход', money(s.revenue), 'var(--k5)'), kpi('EPC', money4(ratio(s.revenue, s.clicks)), 'var(--k6)'), kpi('RPM', money(ratio(s.revenue * 1000, s.clicks)), 'var(--k7)')),
+          kpi('Доход', money(s.revenue), 'var(--k5)'), kpi('Прибыль', h('span', { class: profit >= 0 ? '' : 'neg' }, money(profit)), 'var(--k4)'), earningsTile,
+          kpi('EPC', money4(ratio(s.revenue, s.clicks)), 'var(--k6)'), kpi('RPM', money(ratio(s.revenue * 1000, s.clicks)), 'var(--k7)')),
         ratesNote(),
         h('div', { class: 'card', style: 'margin-bottom:14px' }, lineChart([
           { key: 'clicks', label: 'Клики', color: '#4d86f0', values: series.map((p) => p.clicks) },
@@ -425,6 +456,24 @@ async function pageDashboard() {
     } catch (e) { put(body, h('p', { class: 'err' }, 'Ошибка загрузки: ' + e.message)); }
   }
   load();
+}
+
+function shareModal(current, onSaved) {
+  let value = String(current);
+  const err = h('p', { class: 'err' });
+  const close = openModal({
+    title: 'Доля баера',
+    body: h('div', {},
+      field('Процент от чистой прибыли', h('input', { class: 'input', type: 'number', min: 0, max: 100, step: '0.5', value, oninput: (e) => { value = e.target.value; } }),
+        'Чистая прибыль = доход − расход. При убытке заработок баера = 0.'),
+      err),
+    footer: [h('button', { class: 'btn', onclick: () => close() }, 'Отмена'), h('button', { class: 'btn primary', onclick: async () => {
+      const pct = Number(value);
+      if (!Number.isFinite(pct) || pct < 0 || pct > 100) { err.textContent = 'Процент от 0 до 100.'; return; }
+      try { await api('/api/settings', { method: 'PATCH', body: { buyerSharePct: pct } }); toast('Доля баера сохранена'); close(); onSaved(); }
+      catch (e) { err.textContent = e.message === 'owner_only' ? 'Менять процент может только владелец.' : 'Не сохранено: ' + e.message; }
+    } }, 'Сохранить')],
+  });
 }
 
 async function pageCampaigns() {
@@ -717,7 +766,8 @@ async function pageCampaignEditor(id) {
     h('div', { class: 'editor-head' }, nameInput,
       h('div', { class: 'toolbar', style: 'margin:0' }, saveBtn,
         h('button', { class: 'btn square', title: 'Копировать ссылку', 'aria-label': 'Копировать ссылку', disabled: isNew, onclick: () => copyText(trackingUrl(d.id)) }, '🔗'),
-        isNew ? null : h('a', { class: 'btn', href: '#/clicks' + qs({ campaign: d.id }) }, 'Лог'),
+        isNew ? null : h('a', { class: 'btn', href: '#/clicks' + qs({ campaign: d.id }) }, 'Клики'),
+        isNew ? null : h('button', { class: 'btn', onclick: () => historyModal('campaign', d.id, d.name) }, 'История'),
         isNew ? null : h('a', { class: 'btn', href: '#/reports' + qs({ group: 'stream', campaign: d.id }) }, 'Отчёт'),
         h('a', { class: 'btn', href: '#/campaigns' }, 'К списку'))),
     err,

@@ -1,5 +1,11 @@
 # Product Umbrella — handoff для Claude
 
+## @claude-code 2026-10-30 — DONE: история изменений + доля баера на дашборде
+
+- `audit()` в server.js пишет событие `audit` в JSONL при create/update кампаний, потоков, офферов, лендингов, пользователей, логине, автопаузе и смене настроек; `GET /api/audit`. dev2: в твоих новых POST/PATCH (источники, сети, архив) вызывай `await audit(req, 'create'|'update', '<entity>', id, before, after)` после сохранения
+- Настройки команды `settings.json` в DATA_DIR, `buyerSharePct` (35 по умолчанию), PATCH только владелец
+- Дашборд: плитки «Прибыль» и «Заработок баера · N%». dev2: в PR #1 ты добавлял плитки Расход/Прибыль — при rebase не дублируй «Прибыль»
+
 ## @claude-code 2026-10-30 — DONE: мультивалютность с актуальным курсом
 
 - `src/currency.js`: курсы open.er-api.com раз в 12 ч, кэш `fx-rates.json`, `factor(from, to)`, `factors(to)` для SQL

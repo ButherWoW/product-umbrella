@@ -99,3 +99,37 @@ test('REQUIRE_LOGIN + ADMIN_TOKEN: private reports, public tracking, token-gated
   for (let i = 0; i < 10; i++) await call('/api/auth/login', { method: 'POST', body: { email: 'o@example.com', password: 'bad-password-x' } });
   assert.equal((await call('/api/auth/login', { method: 'POST', body: { email: 'o@example.com', password: 'owner-password' } })).status, 429, 'brute force is throttled');
 });
+
+test('audit log: who changed what, never passwords', { timeout: 20000 }, async (t) => {
+  const { call } = await boot(t);
+  const owner = (await call('/api/auth/setup', { method: 'POST', body: { email: 'o@example.com', password: 'owner-password' } })).cookie;
+  await call('/api/campaigns', { method: 'POST', cookie: owner, body: { id: 'aud', name: 'Before', totalCap: 1 } });
+  await call('/api/campaigns/aud', { method: 'PATCH', cookie: owner, body: { name: 'After', dailyCap: 5 } });
+  await call('/api/users', { method: 'POST', cookie: owner, body: { email: 'b@example.com', password: 'buyer-password' } });
+  await call('/api/auth/login', { method: 'POST', body: { email: 'b@example.com', password: 'buyer-password' } });
+  await call('/r/aud/offer-1');
+  const all = (await call('/api/audit', { cookie: owner })).json.entries;
+  assert.ok(!JSON.stringify(all).includes('password'), 'no passwords in the log');
+  const camp = (await call('/api/audit?entity=campaign&id=aud', { cookie: owner })).json.entries;
+  assert.deepEqual(camp.map((e) => e.action), ['pause', 'update', 'create'], 'newest first, auto-pause by totalCap included');
+  assert.equal(camp[1].actor, 'o@example.com');
+  assert.deepEqual(camp[1].changes.name, ['Before', 'After']);
+  assert.deepEqual(camp[1].changes.dailyCap, [null, 5]);
+  assert.equal(camp[0].actor, 'system');
+  assert.ok(all.some((e) => e.action === 'login' && e.actor === 'b@example.com'));
+  assert.equal((await call('/api/audit')).status, 401, 'anonymous cannot read the log');
+});
+
+test('buyer share setting: owner only, validated, audited', { timeout: 20000 }, async (t) => {
+  const { call } = await boot(t);
+  assert.equal((await call('/api/settings')).json.buyerSharePct, 35, 'default 35%');
+  const owner = (await call('/api/auth/setup', { method: 'POST', body: { email: 'o@example.com', password: 'owner-password' } })).cookie;
+  await call('/api/users', { method: 'POST', cookie: owner, body: { email: 'b@example.com', password: 'buyer-password' } });
+  const buyer = (await call('/api/auth/login', { method: 'POST', body: { email: 'b@example.com', password: 'buyer-password' } })).cookie;
+  assert.equal((await call('/api/settings', { method: 'PATCH', cookie: buyer, body: { buyerSharePct: 90 } })).status, 403, 'buyers cannot raise their own share');
+  assert.equal((await call('/api/settings', { method: 'PATCH', cookie: owner, body: { buyerSharePct: 150 } })).status, 400);
+  assert.equal((await call('/api/settings', { method: 'PATCH', cookie: owner, body: { buyerSharePct: 40 } })).json.buyerSharePct, 40);
+  assert.equal((await call('/api/settings')).json.buyerSharePct, 40);
+  const log = (await call('/api/audit?entity=settings', { cookie: owner })).json.entries;
+  assert.deepEqual(log[0].changes.buyerSharePct, [35, 40]);
+});

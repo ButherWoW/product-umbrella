@@ -160,3 +160,6 @@ body.auth-mode .view { margin-left: 0; display: grid; place-items: start center;
 .attribution { margin: 24px 12px 0; font-size: 11px; }
 .attribution a { color: var(--fg-3); }
 .rates-note { margin: -8px 0 14px; font-size: 12px; }
+.kpi-edit { cursor: pointer; }
+.kpi-edit:hover { outline: 2px solid var(--fg-3); }
+.kpi .v .neg { color: #ffd2d0; }
