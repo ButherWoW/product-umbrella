@@ -1120,6 +1120,30 @@ async function pageLandings() {
   return () => table.detach();
 }
 
+async function pageNetworks() {
+  const table = dataTable({ id: 'networks', pageSize: 250, columns: [
+    { key: 'id', label: 'ID', fixed: true }, { key: 'name', label: 'Название', cls: 'name' },
+    { key: 'clickIdParam', label: 'Click ID' }, { key: 'payoutParam', label: 'Payout' }, { key: 'offerParams', label: 'Параметры оффера', cls: 'name' },
+    { key: 'notes', label: 'Заметки', cls: 'name' },
+    { key: 'actions', label: '', sortable: false, render: (r) => h('span', { class: 'row-actions' }, h('button', { onclick: () => networkModal(r, load) }, 'Изменить')) },
+  ] });
+  function networkModal(current, onSaved) {
+    const n = { id: current?.id || '', name: current?.name || '', offerParams: current?.offerParams || '', clickIdParam: current?.clickIdParam || 'sub1', payoutParam: current?.payoutParam || 'payout', notes: current?.notes || '' };
+    const err = h('p', { class: 'err' });
+    const close = openModal({ title: current ? 'Редактирование сети' : 'Новая сеть', body: h('div', {},
+      field('ID', h('input', { class: 'input', value: n.id, readonly: Boolean(current), oninput: (e) => { n.id = e.target.value.trim(); } })),
+      field('Название', h('input', { class: 'input', value: n.name, oninput: (e) => { n.name = e.target.value; } })),
+      field('Параметры оффера', h('input', { class: 'input', value: n.offerParams, oninput: (e) => { n.offerParams = e.target.value; } })),
+      field('Параметр click ID', h('input', { class: 'input', value: n.clickIdParam, oninput: (e) => { n.clickIdParam = e.target.value; } })),
+      field('Параметр выплаты', h('input', { class: 'input', value: n.payoutParam, oninput: (e) => { n.payoutParam = e.target.value; } })),
+      field('Заметки', h('textarea', { class: 'input', rows: 4, oninput: (e) => { n.notes = e.target.value; } }, n.notes)), err),
+      footer: [h('button', { class: 'btn', onclick: close }, 'Отмена'), h('button', { class: 'btn primary', onclick: async () => { try { await api(current ? '/api/networks/' + encodeURIComponent(n.id) : '/api/networks', { method: current ? 'PATCH' : 'POST', body: n }); toast('Сеть сохранена'); close(); onSaved(); } catch (e) { err.textContent = e.message; } } }, 'Сохранить')],
+    });
+  }
+  function load() { api('/api/networks').then((r) => table.setRows(Object.entries(r.networks || {}).map(([id, v]) => ({ id, ...v })))).catch((e) => toast('Ошибка сетей: ' + e.message, true)); }
+  put(view, h('div', { class: 'toolbar' }, h('button', { class: 'btn primary', onclick: () => networkModal(null, load) }, 'Создать сеть')), table); load(); return () => table.detach();
+}
+
 async function pageOffers() {
   const table = dataTable({
     id: 'offers', pageSize: 250,
@@ -1438,6 +1462,7 @@ async function route() {
     if (section === 'campaigns' && parts[1]) cleanup = await pageCampaignEditor(decodeURIComponent(parts[1]));
     else if (section === 'campaigns') cleanup = await pageCampaigns();
     else if (section === 'offers') cleanup = await pageOffers();
+    else if (section === 'networks') cleanup = await pageNetworks();
     else if (section === 'landings') cleanup = await pageLandings();
     else if (section === 'reports') cleanup = await pageReports(params);
     else if (section === 'clicks' || section === 'conversions') cleanup = pageLog(section, params);
