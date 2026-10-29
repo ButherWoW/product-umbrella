@@ -783,7 +783,17 @@ async function stats({ campaign = null, allowed = null, from = null, to = null, 
         ${where}
         GROUP BY c.campaign, c.country, c.offer_id, c.stream, c.landing_id
       `, params);
-      return { ...reportFromRows(rows), currency };
+      const report = { ...reportFromRows(rows), currency };
+      report.bySource = Object.create(null); report.byNetwork = Object.create(null);
+      for (const row of rows) {
+        const source = campaigns.get(row.campaign)?.sourceId; const network = offers.get(row.offer_id)?.networkId;
+        for (const [key, id] of [['bySource', source || 'none'], ['byNetwork', network || 'none']]) {
+          report[key][id] ||= { clicks: 0, conversions: 0, revenue: 0, cost: 0, uniqueClicks: 0 };
+          const target = report[key][id]; for (const f of ['clicks','conversions','revenue','cost','uniqueClicks','leads','sales','rejected','trash','pendingRevenue']) target[f] = (target[f] || 0) + (Number(row[f] ?? row[f.replace(/[A-Z]/g, (m) => '_' + m.toLowerCase())]) || 0);
+        }
+      }
+      report.bySource = Object.fromEntries(Object.entries(report.bySource).map(([k,v]) => [k, metrics(v)])); report.byNetwork = Object.fromEntries(Object.entries(report.byNetwork).map(([k,v]) => [k, metrics(v)]));
+      return report;
     } catch (e) {
       if (e.statusCode) throw e;
       console.warn('[db] stats fallback to JSONL:', e.message);
@@ -809,9 +819,13 @@ async function stats({ campaign = null, allowed = null, from = null, to = null, 
     });
     const visibleClickIds = new Set(clicks.map((c) => c.clickId));
     const conversions = [...latestConversions(lines).values()].filter((item) => visibleClickIds.has(item.clickId));
+    const conversionByClick = new Map(conversions.map((item) => [item.clickId, item]));
     const lpClicked = new Set(lines.filter((item) => item.type === 'lp_click').map((item) => item.clickId));
-    return { ...reportFromEvents(clicks.map((c) => convertClickCost(lpClicked.has(c.clickId) ? { ...c, lpClicked: true } : c, currency)),
-      conversions.map((cv) => convertConversion(cv, currency))), currency };
+    const report = { ...reportFromEvents(clicks.map((c) => convertClickCost(lpClicked.has(c.clickId) ? { ...c, lpClicked: true } : c, currency)), conversions.map((cv) => convertConversion(cv, currency))), currency };
+    report.bySource = Object.create(null); report.byNetwork = Object.create(null);
+    for (const click of clicks) { const source = campaigns.get(click.campaign)?.sourceId || 'none'; const network = offers.get(click.offerId)?.networkId || 'none'; const cv = conversionByClick.get(click.clickId); const one = reportFromEvents([click], cv ? [cv] : []); for (const [key,id] of [['bySource',source],['byNetwork',network]]) { report[key][id] ||= { clicks:0, conversions:0, revenue:0, cost:0, uniqueClicks:0 }; for (const f of ['clicks','conversions','revenue','cost','uniqueClicks','leads','sales','rejected','trash','pendingRevenue']) report[key][id][f] = (report[key][id][f] || 0) + (one[f] || 0); } }
+    report.bySource = Object.fromEntries(Object.entries(report.bySource).map(([k,v]) => [k, metrics(v)])); report.byNetwork = Object.fromEntries(Object.entries(report.byNetwork).map(([k,v]) => [k, metrics(v)]));
+    return report;
   } catch (error) {
     if (error.code === 'ENOENT') return { ...reportFromEvents([], []), currency };
     throw error;
@@ -832,7 +846,7 @@ async function paramReport({ field, campaign, allowed = null, from, to, currency
       if (to) { values.push(`${to}T23:59:59Z`); conditions.push(`c.created_at <= $${values.length}`); }
       const fx = sqlFx(values, currency);
       const { rows } = await db.query(`
-        SELECT ${isColumn ? `COALESCE(c.${field}, '')` : "COALESCE(c.params->>$1, '')"} AS value, COUNT(c.click_id)::int AS clicks, ${SQL_CONVERSIONS}::int AS conversions,
+        SELECT ${isColumn ? `COALESCE(c.${field}, '')` : "COALESCE(c.params->>$1, '')"} AS value, COUNT(c.click_id)::int AS clicks, COUNT(c.click_id) FILTER (WHERE c.is_unique_campaign IS DISTINCT FROM false)::int AS unique_clicks, ${SQL_CONVERSIONS}::int AS conversions,
           ${fx.revenue}::float AS revenue, ${fx.cost}::float AS cost
         FROM clicks c LEFT JOIN conversions cv USING (click_id)
         ${conditions.length ? 'WHERE ' + conditions.join(' AND ') : ''}
@@ -852,9 +866,9 @@ async function paramReport({ field, campaign, allowed = null, from, to, currency
     const t = Date.parse(click.at);
     if ((fromMs !== null && t < fromMs) || (toMs !== null && t > toMs)) continue;
     const key = (isColumn ? click[field] : click.params?.[field]) ?? '';
-    const g = groups.get(key) || { value: key, clicks: 0, conversions: 0, revenue: 0, cost: 0 };
+    const g = groups.get(key) || { value: key, clicks: 0, uniqueClicks: 0, conversions: 0, revenue: 0, cost: 0 };
     const cv = conv.get(click.clickId);
-    g.clicks += 1; g.cost += (Number(click.cost) || 0) * rates.factor(rates.defaultCurrency, currency);
+    g.clicks += 1; if (click.uniqueCampaign !== false) g.uniqueClicks += 1; g.cost += (Number(click.cost) || 0) * rates.factor(rates.defaultCurrency, currency);
     if (cv && conversionCounts(cv)) { g.conversions += 1; g.revenue += saleRevenue(cv) * rates.factor(cv.currency, currency); }
     groups.set(key, g);
   }
@@ -1527,7 +1541,7 @@ const server = http.createServer(async (req, res) => {
       if ((from && !/^\d{4}-\d{2}-\d{2}$/.test(from)) || (to && !/^\d{4}-\d{2}-\d{2}$/.test(to))) return json(res, 400, { error: 'invalid_date' });
       const campaign = req.scope?.campaign || null;
       const allowed = req.scope?.allowed || null;
-      const GROUP_PROP = { campaign: 'byCampaign', offer: 'byOffer', stream: 'byStream', landing: 'byLanding', country: 'byCountry' };
+      const GROUP_PROP = { campaign: 'byCampaign', offer: 'byOffer', stream: 'byStream', landing: 'byLanding', country: 'byCountry', source: 'bySource', network: 'byNetwork' };
       let rows;
       if (GROUP_PROP[group]) {
         const report = await stats({ campaign, allowed, from, to, currency, subid: url.searchParams.get('subid') || null,
@@ -1954,6 +1968,18 @@ const server = http.createServer(async (req, res) => {
       const from = url.searchParams.get('from') || null; const to = url.searchParams.get('to') || null;
       if ((from && !/^\d{4}-\d{2}-\d{2}$/.test(from)) || (to && !/^\d{4}-\d{2}-\d{2}$/.test(to))) return json(res, 400, { error: 'invalid_date' });
       const fromMs = from ? Date.parse(`${from}T00:00:00Z`) : -Infinity; const toMs = to ? Date.parse(`${to}T23:59:59Z`) : Infinity;
+      if (db) {
+        try {
+          const values = []; const where = [];
+          if (campaign) { values.push(campaign); where.push(`campaign = $${values.length}`); }
+          if (req.scope?.allowed) { values.push(req.scope.allowed); where.push(`campaign = ANY($${values.length}::text[])`); }
+          if (from) { values.push(`${from}T00:00:00Z`); where.push(`created_at >= $${values.length}`); }
+          if (to) { values.push(`${to}T23:59:59Z`); where.push(`created_at <= $${values.length}`); }
+          const { rows } = await db.query(`SELECT campaign, COUNT(*)::int AS count FROM bots ${where.length ? 'WHERE ' + where.join(' AND ') : ''} GROUP BY campaign`, values);
+          const byCampaign = Object.fromEntries(rows.map((r) => [r.campaign, r.count]));
+          return json(res, 200, { total: rows.reduce((sum, r) => sum + r.count, 0), byCampaign });
+        } catch (error) { console.warn('[db] bots report fallback:', error.message); }
+      }
       try {
         const lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map(JSON.parse);
         const byCampaign = {};
@@ -2000,6 +2026,23 @@ await loadNetworks();
 await loadOffers();
 await loadLandings();
 await loadCampaigns();
+// One-time copy of bot events recorded before the bots table existed (only while the table is empty).
+if (db) {
+  try {
+    const { rows } = await db.query('SELECT 1 FROM bots LIMIT 1');
+    if (!rows.length) {
+      const old = (await readFile(eventsFile, 'utf8').catch(() => '')).split('\n').filter(Boolean)
+        .map((line) => { try { return JSON.parse(line); } catch { return null; } }).filter((e) => e?.type === 'bot' && e.campaign);
+      for (let i = 0; i < old.length; i += 500) {
+        const chunk = old.slice(i, i + 500); const values = [];
+        const tuples = chunk.map((e, j) => { values.push(e.campaign, e.offerId ?? null, e.stream ?? null, e.userAgent ?? null, e.ip ?? null, e.reason ?? null, e.at || new Date().toISOString());
+          const b = j * 7; return `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7})`; });
+        await db.query(`INSERT INTO bots (campaign, offer_id, stream, user_agent, ip, reason, created_at) VALUES ${tuples.join(',')}`, values);
+      }
+      if (old.length) console.log(`[db] copied ${old.length} bot events from the journal`);
+    }
+  } catch (error) { console.warn('[db] bot backfill skipped:', error.message); }
+}
 if (requirePostgres && !db) throw new Error('REQUIRE_POSTGRES=1, но PostgreSQL недоступен');
 server.listen(port, '127.0.0.1', () => console.log(`Product Umbrella listening on http://127.0.0.1:${server.address().port}`));
 

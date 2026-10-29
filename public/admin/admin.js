@@ -478,7 +478,7 @@ async function pageDashboard() {
     const { from, to } = periodRange();
     const campaign = campSel.value || null;
     try {
-      const [s, series, recent, team, botsData] = await Promise.all([api('/stats' + qs({ from, to, campaign })), timeseries({ campaign, from, to }), api('/api/clicks' + qs({ from, to, campaign, limit: 10 })).catch(() => ({ clicks: [] })), api('/api/settings').catch(() => ({ buyerSharePct: 35 })), api('/api/bots' + qs({ from, to, campaign, limit: 1000 })).catch(() => ({ bots: [] }))]);
+      const [s, series, recent, team, botsData, statsBotsData] = await Promise.all([api('/stats' + qs({ from, to, campaign })), timeseries({ campaign, from, to }), api('/api/clicks' + qs({ from, to, campaign, limit: 10 })).catch(() => ({ clicks: [] })), api('/api/settings').catch(() => ({ buyerSharePct: 35 })), api('/api/bots' + qs({ from, to, campaign, limit: 1000 })).catch(() => ({ bots: [] })), api('/stats/bots' + qs({ from, to, campaign })).catch(() => ({ total: 0, byCampaign: {} }))]);
       const sharePct = Number(team.buyerSharePct) || 0;
       const profit = (s.revenue || 0) - (s.cost || 0);
       // The buyer earns a share of positive net profit; a loss means 0, not a negative payout.
@@ -501,6 +501,26 @@ async function pageDashboard() {
           botsData.bots?.length > 0 ? h('a', { href: '#/botlog' + (campaign ? qs({ campaign }) : ''), style: 'text-decoration:none' },
             h('div', { class: 'kpi', style: 'background:var(--bad)' }, h('div', { class: 'k' }, 'Боты'), h('div', { class: 'v' }, botsData.bots.length >= 1000 ? '1000+' : num(botsData.bots.length)))) : null),
         ratesNote(),
+        (() => {
+          const MIN_CLICKS = 100; const ROI_ALERT = -0.5; const BOT_PCT_ALERT = 0.3;
+          const campRows = groupRows(s.byCampaign);
+          const botsByCamp = statsBotsData.byCampaign || {};
+          const items = [
+            ...campRows.filter((r) => r.clicks >= MIN_CLICKS && ratio(r.revenue - r.cost, r.cost) <= ROI_ALERT)
+              .map((r) => ({ text: `${state.campaigns[r.id]?.name || r.id}: ROI ${pct(ratio(r.revenue - r.cost, r.cost))}`, link: '#/reports' + qs({ group: 'stream', campaign: r.id }) })),
+            ...groupRows(s.byOffer).filter((r) => r.clicks >= MIN_CLICKS && (r.conversions || 0) === 0)
+              .map((r) => ({ text: `Оффер ${r.id}: ${num(r.clicks)} кл., 0 конв.`, link: '#/reports' + qs({ group: 'country', offer: r.id }) })),
+            ...campRows.filter((r) => r.clicks >= MIN_CLICKS && (botsByCamp[r.id] || 0) / r.clicks > BOT_PCT_ALERT)
+              .map((r) => ({ text: `${state.campaigns[r.id]?.name || r.id}: боты ${pct((botsByCamp[r.id] || 0) / r.clicks)}`, link: '#/botlog' + qs({ campaign: r.id }) })),
+          ];
+          return items.length > 0
+            ? h('div', { class: 'card', style: 'margin-bottom:14px;border-left:3px solid var(--bad,#c0392b)' },
+                h('h2', { style: 'color:var(--bad,#c0392b);margin:0 0 8px' }, 'Требуют внимания'),
+                ...items.map((item) => h('div', { style: 'display:flex;align-items:center;gap:8px;padding:4px 0;border-top:1px solid var(--border,#e0e0e0)' },
+                  h('span', { style: 'flex:1' }, item.text),
+                  h('a', { href: item.link, class: 'btn' }, 'Открыть'))))
+            : null;
+        })(),
         h('div', { class: 'card', style: 'margin-bottom:14px' }, lineChart([
           { key: 'clicks', label: 'Клики', color: '#4d86f0', values: series.map((p) => p.clicks) },
           { key: 'conversions', label: 'Конв.', color: '#e0496a', values: series.map((p) => p.conversions) },
@@ -1363,11 +1383,58 @@ async function pageReports(params) {
         note.textContent = 'Рефереры и пути считаются за всё время, применяется только фильтр кампании; конверсии здесь не считаются.';
       }
       const nameOf = (r) => (key === 'campaign' ? state.campaigns[r.id]?.name || r.id : key === 'landing' ? (r.id === 'none' ? '(без лендинга)' : state.landings[r.id]?.name || r.id) : r.id);
+      const expandedRows = new Map();
+      const expandRow = async (r, btn) => {
+        const tr = btn.closest('tr');
+        if (!tr) return;
+        if (expandedRows.has(r.id)) {
+          expandedRows.get(r.id).remove();
+          expandedRows.delete(r.id);
+          btn.textContent = '▸';
+          return;
+        }
+        if (expandedRows.size >= 3) return;
+        btn.textContent = '▾';
+        const subTr = document.createElement('tr');
+        subTr.className = 'sub-row';
+        const subTd = document.createElement('td');
+        subTd.colSpan = 99;
+        subTd.style.cssText = 'padding:4px 8px 8px 28px;background:var(--bg2,var(--bg))';
+        subTr.appendChild(subTd);
+        tr.after(subTr);
+        expandedRows.set(r.id, subTr);
+        try {
+          const dp = drill(r);
+          const nextEntry = GROUPS.find((g) => g[0] === dp.group);
+          const s2 = await api('/stats' + qs({ from, to, ...dp }));
+          const subRows = nextEntry?.[2] ? groupRows(s2[nextEntry[2]]) : [];
+          const subNameOf = (sr) => (dp.group === 'campaign' ? state.campaigns[sr.id]?.name || sr.id : sr.id);
+          const subTable = dataTable({
+            id: 'sub-' + key + '-' + String(r.id).replace(/[^a-z0-9_-]/gi, '_').slice(0, 30),
+            pageSize: 20, compact: true, totals: true,
+            rows: subRows,
+            columns: [
+              { key: 'id', label: nextEntry?.[1] || 'ID', fixed: true, cls: 'name', render: subNameOf },
+              ...metricCols({ rpm: true }),
+            ],
+          });
+          put(subTd, subTable);
+        } catch (e) {
+          expandedRows.delete(r.id);
+          btn.textContent = '▸';
+          put(subTd, h('p', { class: 'err' }, e.message));
+        }
+      };
       table?.detach();
       table = dataTable({
         id: 'report-' + key, pageSize: 100,
         rows,
-        columns: [{ key: 'id', label: f.field ? 'Значение' : label, fixed: true, cls: 'name', value: nameOf, render: (r) => (drill ? h('a', { href: '#/reports' + qs({ ...f, ...drill(r) }), title: 'Детализировать' }, nameOf(r)) : nameOf(r)) },
+        columns: [{ key: 'id', label: f.field ? 'Значение' : label, fixed: true, cls: 'name', value: nameOf,
+          render: (r) => drill
+            ? h('span', { style: 'display:inline-flex;align-items:center;gap:4px' },
+                h('button', { style: 'all:unset;cursor:pointer;font-size:10px;color:var(--fg-2,#999);user-select:none', 'aria-label': 'Развернуть', onclick: (e) => { e.stopPropagation(); expandRow(r, e.currentTarget); } }, '▸'),
+                nameOf(r))
+            : nameOf(r) },
           ...metricCols({ rpm: true })],
       });
       put(holder, table);
