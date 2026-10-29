@@ -28,7 +28,8 @@ export const conversionTid = (raw) => (raw === null || raw === undefined ? '' : 
 export const conversionKey = (item) => `${item.clickId}|${conversionTid(item.tid)}`;
 
 // Latest conversion of a click and tid ({ status, revenue, currency }) or null. Rows written before statuses existed are sales.
-export async function findRecordedConversion({ clickId, tid = '', eventsFile, db = null, onFallback = () => {} }) {
+// `journal` (src/journal-index.js) answers from memory instead of reading the journal file.
+export async function findRecordedConversion({ clickId, tid = '', eventsFile, db = null, journal = null, onFallback = () => {} }) {
   tid = conversionTid(tid);
   if (db) {
     try {
@@ -36,6 +37,7 @@ export async function findRecordedConversion({ clickId, tid = '', eventsFile, db
       if (rows.length) return { status: rows[0].status || 'sale', revenue: rows[0].revenue === null ? null : Number(rows[0].revenue), currency: rows[0].currency };
     } catch (error) { onFallback(error); }
   }
+  if (journal) return journal.conversion(clickId, tid);
   let latest = null;
   try {
     for (const line of (await readFile(eventsFile, 'utf8')).split('\n')) {
@@ -46,7 +48,7 @@ export async function findRecordedConversion({ clickId, tid = '', eventsFile, db
   return latest ? { status: latest.status || 'sale', revenue: latest.revenue ?? null, currency: latest.currency ?? null } : null;
 }
 
-export async function hasRecordedConversion({ clickId, tid = '', eventsFile, db = null, onFallback = () => {} }) {
+export async function hasRecordedConversion({ clickId, tid = '', eventsFile, db = null, journal = null, onFallback = () => {} }) {
   tid = conversionTid(tid);
   if (db) {
     try {
@@ -56,6 +58,7 @@ export async function hasRecordedConversion({ clickId, tid = '', eventsFile, db 
       // prove that the source JSONL journal has no conversion yet.
     } catch (error) { onFallback(error); }
   }
+  if (journal) return journal.conversion(clickId, tid) !== null;
   try {
     const lines = (await readFile(eventsFile, 'utf8')).split('\n');
     return lines.some((line) => {

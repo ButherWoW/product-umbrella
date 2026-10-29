@@ -1,7 +1,7 @@
 import './log-setup.js';
 import http from 'node:http';
 import { randomUUID, createHash, timingSafeEqual } from 'node:crypto';
-import { mkdir, appendFile, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, appendFile, readFile, writeFile, stat } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { db, query, closeDb } from './db.js';
@@ -17,6 +17,7 @@ import { createSourcePostbacks, resolveSourcePostback, parsePostbackUrl, parsePo
 import { connectionType, CONNECTION_TYPES } from './connection-type.js';
 import { createBindingStore, bindingKey, boundChoice, streamRef, parseBindMode, parseBindTtl } from './visitor-binding.js';
 import { createMonitor, MONITOR_MODES } from './monitor.js';
+import { createJournalIndex, createClickCounters, createScanQueue, readJournalRecords, scanJournalLines } from './journal-index.js';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const dataDir = process.env.DATA_DIR || join(root, 'data');
@@ -140,6 +141,30 @@ function rateLimited(ip) {
 const campaigns = new Map([['demo', { name: 'Demo campaign', active: true, streams: [], dailyCap: null, capUrl: null, allowDevices: [], allowGeos: [], geoCapUrl: null }]]);
 const eventMirror = db ? createEventMirror({ query,
   onError: (type, error) => console.warn(`[db] ${type} insert:`, error.message) }) : null;
+// The click path never reads the whole journal: click counts, last click per (campaign, IP), recent clicks (LRU),
+// conversions and source postbacks are indexed in memory (src/journal-index.js). Reports stream the journal,
+// one scan at a time. CLICK_INDEX_LIMIT: clicks kept for /lp/click and postback lookups (older ones are streamed).
+const clickIndexLimit = Number.parseInt(process.env.CLICK_INDEX_LIMIT || '', 10);
+const journalIndex = createJournalIndex({ clickLimit: clickIndexLimit > 0 ? clickIndexLimit : 200000 });
+const journalScans = createScanQueue();
+const journalRecords = (types = null) => journalScans.run(() => readJournalRecords(eventsFile, types));
+// Journal size the index covers: what it was built from plus this process's own appends. A different size on disk
+// means someone else appended (tests, manual repair), and the index is rebuilt before it answers "not found".
+let indexedBytes = 0;
+const journalSize = () => stat(eventsFile).then((s) => s.size, (error) => { if (error.code === 'ENOENT') return 0; throw error; });
+async function buildJournalIndex() {
+  await journalIndex.build(eventsFile);
+  indexedBytes = await journalSize();
+}
+async function syncJournalIndex() {
+  if (await journalSize() === indexedBytes) return false;
+  return journalGate.rewrite(async () => {
+    if (await journalSize() === indexedBytes) return false;
+    await buildJournalIndex();
+    clickCounters.clear();
+    return true;
+  });
+}
 
 // Offer / landing monitoring: MONITOR=0 turns the timer off (POST /api/monitor/check still works).
 // MONITOR_ALLOW_PRIVATE lists private IPs that may be fetched anyway — only for tests against 127.0.0.1.
@@ -540,28 +565,26 @@ async function countClicks({ campaign = null, offerId = null, since = null } = {
       return rows[0].n;
     } catch (e) { console.warn('[db] countClicks fallback:', e.message); }
   }
-  const sinceMs = since ? Date.parse(since) : null;
-  try {
-    const lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean);
-    return lines.filter((line) => {
-      try {
-        const item = JSON.parse(line);
-        return item.type === 'click'
-          && (!campaign || item.campaign === campaign)
-          && (!offerId || item.offerId === offerId)
-          && (sinceMs === null || Date.parse(item.at) >= sinceMs);
-      } catch { return false; }
-    }).length;
-  } catch { return 0; }
+  // Journal index: whole UTC days (`since` is the start of a day) or all time, per campaign or per offer.
+  const day = since ? String(since).slice(0, 10) : null;
+  if (day) return journalIndex.count(campaign ? `c|${campaign}|${day}` : `o|${offerId}|${day}`);
+  return campaign ? journalIndex.count(`t|${campaign}`) : 0;
 }
 
 const todayStart = () => `${new Date().toISOString().slice(0, 10)}T00:00:00Z`;
 
-async function countTodayClicks(campaign) {
-  return countClicks({ campaign, since: todayStart() });
-}
+// Click cap counters: c|campaign|day, o|offer|day (UTC days) and t|campaign (lifetime). Seeded from PostgreSQL
+// (or the journal index), refreshed in the background every CAP_REFRESH_MS, reserved synchronously per click.
+const capDayKey = (kind, id) => `${kind}|${id}|${todayStart().slice(0, 10)}`;
+const capRefreshMs = Number.parseInt(process.env.CAP_REFRESH_MS || '', 10);
+const clickCounters = createClickCounters({ ttlMs: capRefreshMs > 0 ? capRefreshMs : 60000, seed: (key) => {
+  const [kind, id, day] = key.split('|');
+  if (kind === 't') return countClicks({ campaign: id });
+  return countClicks(kind === 'c' ? { campaign: id, since: `${day}T00:00:00Z` } : { offerId: id, since: `${day}T00:00:00Z` });
+} });
 
 const conversionCaps = createConversionCapCounter({ db, eventsFile,
+  countJournal: (offerId, since) => journalIndex.conversionCapCount(offerId, since.getTime()),
   onFallback: (error) => console.warn('[db] conversion cap fallback:', error.message) });
 
 // null when the offer can take traffic, otherwise why not: missing, archived, click_cap (dailyCap) or conversion_cap.
@@ -569,7 +592,11 @@ async function offerState(id) {
   const offer = offers.get(id);
   if (!offer) return 'missing';
   if (offer.archived) return 'archived';
-  if (offer.dailyCap && await countClicks({ offerId: id, since: todayStart() }) >= offer.dailyCap) return 'click_cap';
+  if (offer.dailyCap) {
+    const key = capDayKey('o', id);
+    await clickCounters.ensure([key]);
+    if (clickCounters.get(key) >= offer.dailyCap) return 'click_cap';
+  }
   if (offer.conversionCap && await conversionCaps.count(id, offer.capTz) >= offer.conversionCap) return 'conversion_cap';
   return null;
 }
@@ -639,28 +666,25 @@ function parseIpRules(raw) {
   }).slice(0, 1000);
 }
 
-// Check if IP already clicked this campaign within the dedup window (minutes). Returns true if duplicate.
+// Same IP clicked this campaign within the dedup window (minutes)? The journal index knows every click of this
+// process (marked at decision time, so concurrent clicks see each other); PostgreSQL covers clicks from before
+// a restart with an empty data directory.
+const recentClick = (campaign, ip, windowMinutes) => Boolean(windowMinutes && ip)
+  && (journalIndex.lastClickAt(campaign, ip) ?? -Infinity) >= Date.now() - windowMinutes * 60 * 1000;
 async function isDuplicateClick(campaign, ip, windowMinutes) {
   if (!windowMinutes || !ip) return false;
-  const since = new Date(Date.now() - windowMinutes * 60 * 1000).toISOString();
+  if (recentClick(campaign, ip, windowMinutes)) return true;
   if (db) {
     try {
+      const since = new Date(Date.now() - windowMinutes * 60 * 1000).toISOString();
       const { rows } = await db.query(
         'SELECT 1 FROM clicks WHERE campaign = $1 AND ip = $2 AND created_at >= $3 LIMIT 1',
         [campaign, ip, since],
       );
-      return rows.length > 0;
+      if (rows.length) return true;
     } catch (e) { console.warn('[db] dedupe fallback:', e.message); }
   }
-  try {
-    const lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean);
-    return lines.some((line) => {
-      try {
-        const item = JSON.parse(line);
-        return item.type === 'click' && item.campaign === campaign && item.ip === ip && Date.parse(item.at) >= Date.parse(since);
-      } catch { return false; }
-    });
-  } catch { return false; }
+  return false;
 }
 
 // Sum revenue from conversions today for a campaign. Non-fatal — returns 0 on error.
@@ -950,7 +974,10 @@ async function event(type, payload) {
   await mkdir(dataDir, { recursive: true });
   return journalGate.shared(async () => {
     const record = { id: randomUUID(), type, at: new Date().toISOString(), ...payload };
-    await appendFile(eventsFile, `${JSON.stringify(record)}\n`);
+    const line = `${JSON.stringify(record)}\n`;
+    await appendFile(eventsFile, line);
+    indexedBytes += Buffer.byteLength(line);
+    journalIndex.observe(record);
     // `mirrored` settles once PostgreSQL has the event (null without a database).
     return { mirrored: eventMirror?.enqueue(record) ?? null };
   });
@@ -963,8 +990,10 @@ async function removeStats(plan, deleteRows) {
     await eventMirror?.drain();
     let postgres = null;
     const counts = await filterJournal(eventsFile, plan, async () => { if (db) postgres = await deleteRows(db); });
+    await buildJournalIndex();
     return { ...counts, postgres };
   });
+  clickCounters.clear();
   for (const offerId of offers.keys()) conversionCaps.invalidate(offerId);
   return result;
 }
@@ -1041,7 +1070,7 @@ async function stats({ campaign = null, allowed = null, from = null, to = null, 
   }
   // JSONL fallback
   try {
-    const lines = applyClickUpdates((await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map(JSON.parse));
+    const lines = applyClickUpdates(await journalRecords(['click', 'conversion', 'lp_click', 'cost_update']));
     const fromMs = from ? Date.parse(`${from}T00:00:00Z`) : null;
     const toMs = to ? Date.parse(`${to}T23:59:59Z`) : null;
     const allClicks = lines.filter((item) => item.type === 'click');
@@ -1095,8 +1124,7 @@ async function paramReport({ field, campaign, allowed = null, from, to, currency
     } catch (e) { console.warn('[db] paramReport fallback:', e.message); }
   }
   let lines = [];
-  try { lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); }
-  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  lines = await journalRecords(['click', 'conversion', 'cost_update']);
   const fromMs = from ? Date.parse(`${from}T00:00:00Z`) : null;
   const toMs = to ? Date.parse(`${to}T23:59:59Z`) : null;
   lines = applyClickUpdates(lines);
@@ -1174,14 +1202,25 @@ async function getClickRecord(clickId) {
       if (rows.length) { const r = rows[0]; return { campaign: r.campaign, offerId: r.offer_id, landingId: r.landing_id, subid: r.subid, country: r.country, params: r.params, cost: Number(r.cost) || 0 }; }
     } catch (e) { console.warn('[db] getClickRecord fallback:', e.message); }
   }
+  return journalClick(clickId);
+}
+
+// A click from the journal index; only a click older than the index (CLICK_INDEX_LIMIT) is streamed from the file.
+async function journalClick(clickId) {
+  let cached = journalIndex.click(clickId);
+  if (cached) return { ...cached };
+  if (await syncJournalIndex()) { cached = journalIndex.click(clickId); if (cached) return { ...cached }; }
+  if (journalIndex.complete) return null;
+  let found = null;
   try {
-    const lines = (await readFile(eventsFile, 'utf8')).split('\n');
-    for (let i = lines.length - 1; i >= 0; i -= 1) {
-      if (!lines[i].includes(clickId)) continue;
-      try { const item = JSON.parse(lines[i]); if (item.type === 'click' && item.clickId === clickId) return item; } catch { /* skip */ }
-    }
+    await journalScans.run(() => scanJournalLines(eventsFile, (line) => {
+      if (!line.includes(clickId)) return;
+      try { const item = JSON.parse(line); if (item.type === 'click' && item.clickId === clickId) found = item; } catch { /* skip */ }
+    }));
   } catch { /* non-fatal */ }
-  return null;
+  if (!found) return null;
+  journalIndex.remember(clickId, found);
+  return { ...journalIndex.click(clickId) };
 }
 
 async function getClickData(clickId) {
@@ -1191,16 +1230,8 @@ async function getClickData(clickId) {
       if (rows.length) return { offerId: rows[0].offer_id, campaign: rows[0].campaign, at: new Date(rows[0].created_at).toISOString() };
     } catch (e) { console.warn('[db] getClickData fallback:', e.message); }
   }
-  try {
-    const lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean);
-    for (const line of lines) {
-      try {
-        const item = JSON.parse(line);
-        if (item.type === 'click' && item.clickId === clickId) return { offerId: item.offerId, campaign: item.campaign, at: item.at };
-      } catch { /* skip */ }
-    }
-  } catch { /* non-fatal */ }
-  return null;
+  const click = await journalClick(clickId);
+  return click ? { offerId: click.offerId, campaign: click.campaign, at: click.at } : null;
 }
 
 // Constant-time comparison so response timing does not leak how much of a secret matched.
@@ -1281,18 +1312,23 @@ async function readPostbacks({ direction, campaign, allowed, from, to, limit }) 
         tid: r.tid, status: r.status, revenue: r.revenue, currency: r.currency, url: r.url, statusCode: r.status_code, error: r.error, attempt: r.attempt, ip: r.ip })) };
     } catch (error) { console.warn('[db] postbacks fallback:', error.message); }
   }
-  let lines = [];
-  try { lines = (await readFile(eventsFile, 'utf8')).split('\n'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  // Streamed oldest → newest; only the newest `limit` matches are kept.
   const type = `"postback_${direction}"`;
-  const out = [];
-  for (let i = lines.length - 1; i >= 0 && out.length < limit; i -= 1) {
-    if (!lines[i].includes(type)) continue;
-    let item; try { item = JSON.parse(lines[i]); } catch { continue; }
-    if (item.type !== `postback_${direction}`) continue;
-    if (campaign && item.campaign !== campaign) continue;
-    if (allowed && !allowed.includes(item.campaign)) continue;
+  const items = [];
+  await journalScans.run(() => scanJournalLines(eventsFile, (line) => {
+    if (!line.includes(type)) return;
+    let item; try { item = JSON.parse(line); } catch { return; }
+    if (item?.type !== `postback_${direction}`) return;
+    if (campaign && item.campaign !== campaign) return;
+    if (allowed && !allowed.includes(item.campaign)) return;
     const t = Date.parse(item.at);
-    if ((fromMs !== null && !(t >= fromMs)) || (toMs !== null && !(t <= toMs))) continue;
+    if ((fromMs !== null && !(t >= fromMs)) || (toMs !== null && !(t <= toMs))) return;
+    items.push(item);
+    if (items.length > limit * 2) items.splice(0, items.length - limit);
+  }));
+  const out = [];
+  for (let i = items.length - 1; i >= 0 && out.length < limit; i -= 1) {
+    const item = items[i];
     out.push({ at: item.at, direction, clickId: item.clickId ?? null, campaign: item.campaign ?? null, offerId: item.offerId ?? null, tid: item.tid ?? null,
       status: item.status ?? null, revenue: item.revenue ?? null, currency: item.currency ?? null, url: item.url ?? null, statusCode: item.statusCode ?? null,
       error: item.error ?? null, attempt: item.attempt ?? null, ip: item.ip ?? null });
@@ -1323,8 +1359,7 @@ const costTz = (raw) => {
 // The JSONL journal, read once per cost update or import (`cache` lives for one request).
 async function cachedJournal(cache) {
   if (!cache.lines) {
-    try { cache.lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); }
-    catch (error) { if (error.code !== 'ENOENT') throw error; cache.lines = []; }
+    cache.lines = await journalRecords(['click', 'conversion', 'cost_update']);
   }
   return cache.lines;
 }
@@ -1488,7 +1523,7 @@ async function importCosts(body, req) {
 const sourcePostbacks = createSourcePostbacks({
   targetFor: (click) => { const c = campaigns.get(click.campaign); return resolveSourcePostback(c, c?.sourceId ? sources.get(c.sourceId) : null); },
   loadClick: getClickRecord,
-  alreadySent: (clickId, status) => journalHasSourcePostback(eventsFile, clickId, status),
+  alreadySent: async (clickId, status) => journalIndex.hasSourcePostback(clickId, status),
   record: (payload) => event('source_postback', payload),
   allowPrivate: sourcePostbackAllowPrivate,
   onError: (error) => console.warn('[source-postback] failed:', error.message),
@@ -1496,9 +1531,9 @@ const sourcePostbacks = createSourcePostbacks({
 
 const recordPostback = createConversionRecorder({
   findClick: getClickData,
-  hasConversion: (clickId, tid) => hasRecordedConversion({ clickId, tid, eventsFile, db,
+  hasConversion: (clickId, tid) => hasRecordedConversion({ clickId, tid, eventsFile, db, journal: journalIndex,
     onFallback: (error) => console.warn('[db] hasConversion fallback:', error.message) }),
-  currentConversion: (clickId, tid) => findRecordedConversion({ clickId, tid, eventsFile, db,
+  currentConversion: (clickId, tid) => findRecordedConversion({ clickId, tid, eventsFile, db, journal: journalIndex,
     onFallback: (error) => console.warn('[db] currentConversion fallback:', error.message) }),
   windowDaysForClick: (click) => campaigns.get(click.campaign)?.conversionWindowDays,
   // A postback without revenue earns the CPA offer's payout (CPC offers are paid per click, not here).
@@ -1726,18 +1761,18 @@ async function loadSettings() {
 }
 
 async function readAudit({ entity, id, limit }) {
-  let lines = [];
-  try { lines = (await readFile(eventsFile, 'utf8')).split('\n'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
-  const out = [];
-  for (let i = lines.length - 1; i >= 0 && out.length < limit; i -= 1) {
-    if (!lines[i].includes('"audit"')) continue;
+  // Streamed oldest → newest; only the newest `limit` matches are kept.
+  const items = [];
+  await journalScans.run(() => scanJournalLines(eventsFile, (line) => {
+    if (!line.includes('"audit"')) return;
     try {
-      const item = JSON.parse(lines[i]);
-      if (item.type !== 'audit' || (entity && item.entity !== entity) || (id && item.entityId !== id)) continue;
-      out.push({ at: item.at, actor: item.actor, action: item.action, entity: item.entity, entityId: item.entityId, changes: item.changes || {} });
+      const item = JSON.parse(line);
+      if (item.type !== 'audit' || (entity && item.entity !== entity) || (id && item.entityId !== id)) return;
+      items.push(item);
+      if (items.length > limit * 2) items.splice(0, items.length - limit);
     } catch { /* skip */ }
-  }
-  return out;
+  }));
+  return items.slice(-limit).reverse().map((item) => ({ at: item.at, actor: item.actor, action: item.action, entity: item.entity, entityId: item.entityId, changes: item.changes || {} }));
 }
 
 async function handleAuthRoute(req, res, url) {
@@ -1945,15 +1980,6 @@ const server = http.createServer(async (req, res) => {
         return res.end();
       }
 
-      // Daily click cap
-      if (c.dailyCap !== null) {
-        const todayCount = await countTodayClicks(campaignId);
-        if (todayCount >= c.dailyCap) {
-          if (c.capUrl) { res.writeHead(302, { location: c.capUrl, 'cache-control': 'no-store' }); return res.end(); }
-          return json(res, 429, { error: 'daily_cap_reached', dailyCap: c.dailyCap });
-        }
-      }
-
       // Revenue cap: stop sending traffic when daily revenue >= revenueCap
       if (c.revenueCap !== null) {
         const rev = await todayRevenue(campaignId);
@@ -1963,23 +1989,30 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
-      // Offer-level daily cap (shared across all campaigns sending to this offer)
+      // Click caps: daily, offer daily (shared across all campaigns sending to this offer) and total (lifetime,
+      // the campaign auto-pauses). Counters are seeded first; from here to the reservation nothing awaits, so
+      // concurrent clicks see each other's reservations and a cap is never overrun (single process).
       const offerCap = offers.get(offerId)?.dailyCap;
-      if (offerCap && await countClicks({ offerId, since: todayStart() }) >= offerCap) {
+      const dayKey = capDayKey('c', campaignId), offerKey = offerId ? capDayKey('o', offerId) : null, totalKey = `t|${campaignId}`;
+      const capKeys = [dayKey, totalKey, ...(offerKey ? [offerKey] : [])];
+      await clickCounters.ensure([...(c.dailyCap !== null ? [dayKey] : []), ...(offerCap ? [offerKey] : []), ...(c.totalCap !== null ? [totalKey] : [])]);
+      // A concurrent click from the same IP may have been accepted while this one awaited.
+      if (c.dedupeWindow > 0 && recentClick(campaignId, ip, c.dedupeWindow)) {
+        res.writeHead(302, { location: applyMacros(targetTemplate, { campaign: campaignId, offer_id: offerId }), 'cache-control': 'no-store' });
+        return res.end();
+      }
+      const capped = (body) => {
         if (c.capUrl) { res.writeHead(302, { location: c.capUrl, 'cache-control': 'no-store' }); return res.end(); }
-        return json(res, 429, { error: 'offer_cap_reached', offerId, dailyCap: offerCap });
+        return json(res, 429, body);
+      };
+      if (c.dailyCap !== null && clickCounters.get(dayKey) >= c.dailyCap) return capped({ error: 'daily_cap_reached', dailyCap: c.dailyCap });
+      if (offerCap && clickCounters.get(offerKey) >= offerCap) return capped({ error: 'offer_cap_reached', offerId, dailyCap: offerCap });
+      if (c.totalCap !== null && clickCounters.get(totalKey) >= c.totalCap) {
+        await pauseCampaign(campaignId, 'total_cap_reached');
+        return capped({ error: 'total_cap_reached', totalCap: c.totalCap });
       }
-
-      // Total (lifetime) cap: campaign auto-pauses when reached
-      let totalCount = null;
-      if (c.totalCap !== null) {
-        totalCount = await countClicks({ campaign: campaignId });
-        if (totalCount >= c.totalCap) {
-          await pauseCampaign(campaignId, 'total_cap_reached');
-          if (c.capUrl) { res.writeHead(302, { location: c.capUrl, 'cache-control': 'no-store' }); return res.end(); }
-          return json(res, 429, { error: 'total_cap_reached', totalCap: c.totalCap });
-        }
-      }
+      const reservation = countClick ? clickCounters.reserve(capKeys) : null;
+      if (countClick) journalIndex.markClick(campaignId, ip);
 
       const clickId = randomUUID();
       const subid = url.searchParams.get('subid') || null;
@@ -2015,10 +2048,16 @@ const server = http.createServer(async (req, res) => {
           uniqueGlobal: firstVisit(`g|${visitor}`, windowMs) };
         Object.assign(extra, uniqueness);
         const lang = String(req.headers['accept-language'] || '').trim().slice(0, 2).toLowerCase();
-        await event('click', { clickId, campaign: campaignId, offerId, path: url.pathname, referrer: req.headers.referer || null, userAgent: req.headers['user-agent'] || null, subid, country, ip,
-          device, os, browser, language: /^[a-z]{2}$/.test(lang) ? lang : null,
-          ...(network ? { asn: network.asn, isp: network.isp, datacenter: network.datacenter, connection: network.connection } : {}), stream: streamName, ...extra, ...(Object.keys(params).length ? { params } : {}), ...(cost ? { cost } : {}), ...(clickRevenue ? { revenue: clickRevenue } : {}) });
-        if (totalCount !== null && totalCount + 1 >= c.totalCap) await pauseCampaign(campaignId, 'total_cap_reached');
+        let recorded;
+        try {
+          recorded = await event('click', { clickId, campaign: campaignId, offerId, path: url.pathname, referrer: req.headers.referer || null, userAgent: req.headers['user-agent'] || null, subid, country, ip,
+            device, os, browser, language: /^[a-z]{2}$/.test(lang) ? lang : null,
+            ...(network ? { asn: network.asn, isp: network.isp, datacenter: network.datacenter, connection: network.connection } : {}), stream: streamName, ...extra, ...(Object.keys(params).length ? { params } : {}), ...(cost ? { cost } : {}), ...(clickRevenue ? { revenue: clickRevenue } : {}) });
+        } catch (error) { reservation.release(); throw error; }
+        // The reservation stays "not yet in storage" until PostgreSQL has the click (JSONL: written already).
+        if (recorded?.mirrored) recorded.mirrored.then(() => reservation.settle(), () => reservation.settle());
+        else reservation.settle();
+        if (c.totalCap !== null && clickCounters.get(totalKey) >= c.totalCap) await pauseCampaign(campaignId, 'total_cap_reached');
       }
       return sendRedirect(res, destination.toString(), c.redirectMethod);
     }
@@ -2200,7 +2239,7 @@ const server = http.createServer(async (req, res) => {
         } catch (e) { console.warn('[db] bot log fallback:', e.message); }
       }
       try {
-        const lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+        const lines = await journalRecords(['bot']);
         const fromMs = botFrom ? Date.parse(`${botFrom}T00:00:00Z`) : null;
         const toMs = botTo ? Date.parse(`${botTo}T23:59:59Z`) : null;
         const bots = lines.filter((item) => {
@@ -2606,7 +2645,7 @@ const server = http.createServer(async (req, res) => {
       }
       // JSONL fallback
       try {
-        const lines = applyClickUpdates((await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map(JSON.parse));
+        const lines = applyClickUpdates(await journalRecords(['click', 'conversion', 'cost_update']));
         const fromMs = tsFrom ? Date.parse(`${tsFrom}T00:00:00Z`) : null;
         const toMs = tsTo ? Date.parse(`${tsTo}T23:59:59Z`) : null;
         const allClicks = lines.filter((item) => item.type === 'click');
@@ -2661,7 +2700,7 @@ const server = http.createServer(async (req, res) => {
         } catch (e) { console.warn('[db] referrers fallback:', e.message); }
       }
       try {
-        const lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map(JSON.parse);
+        const lines = await journalRecords(['click']);
         const clicks = lines.filter((item) => item.type === 'click' && (!refCampaign || item.campaign === refCampaign) && (!req.scope?.allowed || req.scope.allowed.includes(item.campaign)));
         const counts = {};
         for (const c of clicks) { const r = c.referrer || 'direct'; counts[r] = (counts[r] || 0) + 1; }
@@ -2699,7 +2738,7 @@ const server = http.createServer(async (req, res) => {
         } catch (error) { console.warn('[db] bots report fallback:', error.message); }
       }
       try {
-        const lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map(JSON.parse);
+        const lines = await journalRecords(['bot']);
         const byCampaign = {};
         for (const item of lines) if (item.type === 'bot' && (!campaign || item.campaign === campaign) && (!req.scope?.allowed || req.scope.allowed.includes(item.campaign))) {
           const at = Date.parse(item.at || item.created_at || ''); if (at < fromMs || at > toMs) continue;
@@ -2723,7 +2762,7 @@ const server = http.createServer(async (req, res) => {
         } catch (e) { console.warn('[db] paths fallback:', e.message); }
       }
       try {
-        const lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map(JSON.parse);
+        const lines = await journalRecords(['click']);
         const clicks = lines.filter((item) => item.type === 'click' && (!pathCampaign || item.campaign === pathCampaign) && (!req.scope?.allowed || req.scope.allowed.includes(item.campaign)));
         const counts = {};
         for (const c of clicks) { const p = c.path || '/'; counts[p] = (counts[p] || 0) + 1; }
@@ -2749,8 +2788,7 @@ if (db) {
   try {
     const { rows } = await db.query('SELECT 1 FROM bots LIMIT 1');
     if (!rows.length) {
-      const old = (await readFile(eventsFile, 'utf8').catch(() => '')).split('\n').filter(Boolean)
-        .map((line) => { try { return JSON.parse(line); } catch { return null; } }).filter((e) => e?.type === 'bot' && e.campaign);
+      const old = (await readJournalRecords(eventsFile, ['bot'])).filter((e) => e.campaign);
       for (let i = 0; i < old.length; i += 500) {
         const chunk = old.slice(i, i + 500); const values = [];
         const tuples = chunk.map((e, j) => { values.push(e.campaign, e.offerId ?? null, e.stream ?? null, e.userAgent ?? null, e.ip ?? null, e.reason ?? null, e.isp ?? null, e.at || new Date().toISOString());
@@ -2762,6 +2800,12 @@ if (db) {
   } catch (error) { console.warn('[db] bot backfill skipped:', error.message); }
 }
 if (requirePostgres && !db) throw new Error('REQUIRE_POSTGRES=1, но PostgreSQL недоступен');
+{
+  const started = Date.now();
+  await buildJournalIndex();
+  const size = journalIndex.stats();
+  console.log(`[journal] index ready in ${Date.now() - started} ms: ${size.clicks} recent clicks, ${size.conversions} conversions`);
+}
 server.listen(port, '127.0.0.1', () => console.log(`Product Umbrella listening on http://127.0.0.1:${server.address().port}`));
 if (retentionDays > 0) {
   const retentionTick = () => runRetention().catch((error) => console.warn('[retention] failed:', error.message));
