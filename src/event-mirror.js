@@ -18,8 +18,12 @@ export function createEventMirror({ query, onError = () => {} }) {
     }
     if (type === 'cost_update') {
       // Manual cost update (G8): one cost for every listed click, the rounding remainder on the last one.
-      const task = query(`UPDATE clicks SET cost = CASE WHEN click_id::text = $3 THEN $4::numeric ELSE $2::numeric END WHERE click_id = ANY($1::uuid[])`,
-        [payload.clickIds || [], payload.cost ?? 0, payload.lastClickId ?? '', payload.lastCost ?? payload.cost ?? 0]).catch((error) => onError(type, error));
+      // An import (importKey) also remembers its clicks, so re-importing the same key replaces instead of adding.
+      const update = () => query(`UPDATE clicks SET cost = CASE WHEN click_id::text = $3 THEN $4::numeric ELSE $2::numeric END WHERE click_id = ANY($1::uuid[])`,
+        [payload.clickIds || [], payload.cost ?? 0, payload.lastClickId ?? '', payload.lastCost ?? payload.cost ?? 0]);
+      const task = (payload.importKey ? update().then(() => query(`INSERT INTO cost_imports (import_key, campaign, click_ids, cost, updated_at) VALUES ($1,$2,$3::text[],$4,$5)
+        ON CONFLICT (import_key) DO UPDATE SET campaign = EXCLUDED.campaign, click_ids = EXCLUDED.click_ids, cost = EXCLUDED.cost, updated_at = EXCLUDED.updated_at`,
+      [payload.importKey, payload.campaign ?? '', payload.clickIds || [], payload.importCost ?? 0, at])) : update()).catch((error) => onError(type, error));
       pending.add(task); task.then(() => pending.delete(task)); return task;
     }
     if (type === 'bot') {

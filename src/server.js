@@ -1300,10 +1300,75 @@ async function readPostbacks({ direction, campaign, allowed, from, to, limit }) 
   return { storage: 'jsonl', postbacks: out };
 }
 
-// Manual cost update (G8). Matching clicks: campaign, local dates from..to in tz, optional offer/stream/source/sub_id_N
-// filters, optionally unique clicks only. Bots are never clicks, so they get no cost. The amount (in `currency`) is
-// converted to DEFAULT_CURRENCY and split equally; the last click takes the rounding remainder, so the sum is exact.
-const COST_FILTERS = ['offer', 'stream', 'source', ...SUB_ID_FIELDS];
+// Manual cost update (G8). Matching clicks: campaign, local dates from..to in tz, optional offer/stream/tracked-parameter
+// filters (source, sub_id_N, ad_campaign_id, …), optionally unique clicks only. Bots are never clicks, so they get no cost.
+// The amount (in `currency`) is converted to DEFAULT_CURRENCY and split equally; the last click takes the rounding
+// remainder, so the sum is exact.
+const COST_FILTERS = ['offer', 'stream', ...TRACK_FIELDS];
+const round6 = (v) => Math.round(v * 1e6) / 1e6;
+const nextIsoDay = (day) => new Date(Date.parse(`${day}T00:00:00Z`) + 86400000).toISOString().slice(0, 10);
+function costAmount(raw) {
+  const value = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value < 1e8 ? value : null;
+}
+function costCurrency(raw) {
+  const value = raw === undefined || raw === null || raw === '' ? rates.defaultCurrency : String(raw).toUpperCase();
+  return /^[A-Z]{3}$/.test(value) ? value : null;
+}
+const costTz = (raw) => {
+  const tz = raw === undefined || raw === null || raw === '' ? 'UTC' : raw;
+  return typeof tz === 'string' && validTimeZone(tz) ? tz : null;
+};
+
+// The JSONL journal, read once per cost update or import (`cache` lives for one request).
+async function cachedJournal(cache) {
+  if (!cache.lines) {
+    try { cache.lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; cache.lines = []; }
+  }
+  return cache.lines;
+}
+
+// Click ids of the campaigns in [start, end) that match the filters, in time order.
+async function matchCostClicks({ campaignIds, start, end, filters, uniqueOnly }, cache) {
+  const paramFilters = Object.entries(filters).filter(([key]) => key !== 'offer' && key !== 'stream');
+  if (db && !cache.dbFailed) {
+    try {
+      if (!cache.flushed) { await eventMirror?.flush(); cache.flushed = true; } // clicks still queued for PostgreSQL must be matched too
+      const values = [campaignIds, new Date(start).toISOString(), new Date(end).toISOString()];
+      const conditions = ['campaign = ANY($1::text[])', 'created_at >= $2', 'created_at < $3'];
+      if (filters.offer) { values.push(filters.offer); conditions.push(`offer_id = $${values.length}`); }
+      if (filters.stream) { values.push(filters.stream); conditions.push(`COALESCE(NULLIF(stream, ''), 'default') = $${values.length}`); }
+      for (const [key, value] of paramFilters) { values.push(key, value); conditions.push(`params->>$${values.length - 1} = $${values.length}`); }
+      if (uniqueOnly) conditions.push('is_unique_campaign');
+      const { rows } = await db.query(`SELECT click_id FROM clicks WHERE ${conditions.join(' AND ')} ORDER BY created_at, click_id`, values);
+      return rows.map((r) => String(r.click_id));
+    } catch (error) { cache.dbFailed = true; console.warn('[db] cost update fallback:', error.message); }
+  }
+  if (!cache.clicks) cache.clicks = applyClickUpdates(await cachedJournal(cache)).filter((item) => item.type === 'click');
+  return cache.clicks.filter((item) => {
+    if (!campaignIds.includes(item.campaign)) return false;
+    const t = Date.parse(item.at);
+    if (!(t >= start && t < end)) return false;
+    if (filters.offer && item.offerId !== filters.offer) return false;
+    if (filters.stream && (item.stream || 'default') !== filters.stream) return false;
+    if (paramFilters.some(([key, value]) => item.params?.[key] !== value)) return false;
+    return !uniqueOnly || item.uniqueCampaign !== false;
+  }).map((item) => item.clickId);
+}
+
+// One cost_update event: `total` split equally over the clicks, the remainder on the last one. Answers once
+// PostgreSQL has the new costs too, so a report right after the update shows them.
+async function writeCostSplit({ campaignIds, clickIds, total, importKey }) {
+  const perClick = clickIds.length ? Math.floor(total * 1e6 / clickIds.length) / 1e6 : 0;
+  const lastCost = clickIds.length ? round6(total - perClick * (clickIds.length - 1)) : 0;
+  const { mirrored } = await event('cost_update', { campaign: campaignIds[0], ...(campaignIds.length > 1 ? { campaigns: campaignIds } : {}), clickIds, cost: perClick,
+    ...(clickIds.length && lastCost !== perClick ? { lastClickId: clickIds.at(-1), lastCost } : {}),
+    ...(importKey ? { importKey, importCost: total } : {}) });
+  await mirrored;
+  return perClick;
+}
+
 async function updateCosts(body, req) {
   const campaignId = String(body?.campaign || '');
   const campaign = campaigns.get(campaignId);
@@ -1312,12 +1377,12 @@ async function updateCosts(body, req) {
   const from = isoDate(body.from), to = isoDate(body.to);
   if (!from || !to) return { status: 400, error: 'from_and_to_dates_required' };
   if (to < from) return { status: 400, error: 'invalid_date_range' };
-  const tz = body.tz === undefined || body.tz === null || body.tz === '' ? 'UTC' : body.tz;
-  if (typeof tz !== 'string' || !validTimeZone(tz)) return { status: 400, error: 'invalid_tz' };
-  const amount = typeof body.amount === 'string' && body.amount.trim() !== '' ? Number(body.amount) : body.amount;
-  if (typeof amount !== 'number' || !Number.isFinite(amount) || amount < 0 || amount >= 1e8) return { status: 400, error: 'invalid_amount' };
-  const currency = body.currency === undefined || body.currency === null || body.currency === '' ? rates.defaultCurrency : String(body.currency).toUpperCase();
-  if (!/^[A-Z]{3}$/.test(currency)) return { status: 400, error: 'invalid_currency' };
+  const tz = costTz(body.tz);
+  if (!tz) return { status: 400, error: 'invalid_tz' };
+  const amount = costAmount(body.amount);
+  if (amount === null) return { status: 400, error: 'invalid_amount' };
+  const currency = costCurrency(body.currency);
+  if (!currency) return { status: 400, error: 'invalid_currency' };
   const rawFilters = body.filters ?? {};
   if (typeof rawFilters !== 'object' || Array.isArray(rawFilters)) return { status: 400, error: 'invalid_filters' };
   const filters = {};
@@ -1328,50 +1393,96 @@ async function updateCosts(body, req) {
     filters[key] = value;
   }
   const uniqueOnly = body.uniqueOnly === true;
-  const start = zonedDayStart(from, tz);
-  const end = zonedDayStart(new Date(Date.parse(`${to}T00:00:00Z`) + 86400000).toISOString().slice(0, 10), tz);
-  const paramFilters = Object.entries(filters).filter(([key]) => key !== 'offer' && key !== 'stream');
-
-  let clickIds = null;
-  if (db) {
-    try {
-      await eventMirror?.flush(); // clicks still queued for PostgreSQL must be matched too
-      const values = [campaignId, new Date(start).toISOString(), new Date(end).toISOString()];
-      const conditions = ['campaign = $1', 'created_at >= $2', 'created_at < $3'];
-      if (filters.offer) { values.push(filters.offer); conditions.push(`offer_id = $${values.length}`); }
-      if (filters.stream) { values.push(filters.stream); conditions.push(`COALESCE(NULLIF(stream, ''), 'default') = $${values.length}`); }
-      for (const [key, value] of paramFilters) { values.push(key, value); conditions.push(`params->>$${values.length - 1} = $${values.length}`); }
-      if (uniqueOnly) conditions.push('is_unique_campaign');
-      const { rows } = await db.query(`SELECT click_id FROM clicks WHERE ${conditions.join(' AND ')} ORDER BY created_at, click_id`, values);
-      clickIds = rows.map((r) => r.click_id);
-    } catch (error) { console.warn('[db] cost update fallback:', error.message); }
-  }
-  if (!clickIds) {
-    let lines = [];
-    try { lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); }
-    catch (error) { if (error.code !== 'ENOENT') throw error; }
-    clickIds = applyClickUpdates(lines).filter((item) => {
-      if (item.type !== 'click' || item.campaign !== campaignId) return false;
-      const t = Date.parse(item.at);
-      if (!(t >= start && t < end)) return false;
-      if (filters.offer && item.offerId !== filters.offer) return false;
-      if (filters.stream && (item.stream || 'default') !== filters.stream) return false;
-      if (paramFilters.some(([key, value]) => item.params?.[key] !== value)) return false;
-      return !uniqueOnly || item.uniqueCampaign !== false;
-    }).map((item) => item.clickId);
-  }
-  const total = Math.round(amount * rates.factor(currency, rates.defaultCurrency) * 1e6) / 1e6;
+  const clickIds = await matchCostClicks({ campaignIds: [campaignId], start: zonedDayStart(from, tz), end: zonedDayStart(nextIsoDay(to), tz), filters, uniqueOnly }, {});
+  const total = round6(amount * rates.factor(currency, rates.defaultCurrency));
   const result = { ok: true, campaign: campaignId, from, to, tz, amount, currency, cost: total, costCurrency: rates.defaultCurrency, updated: clickIds.length };
   if (!clickIds.length) return { ...result, perClick: 0 };
-  const perClick = Math.floor(total * 1e6 / clickIds.length) / 1e6;
-  const lastCost = Math.round((total - perClick * (clickIds.length - 1)) * 1e6) / 1e6;
-  const { mirrored } = await event('cost_update', { campaign: campaignId, clickIds, cost: perClick,
-    ...(lastCost !== perClick ? { lastClickId: clickIds.at(-1), lastCost } : {}) });
-  // Answer once PostgreSQL has the new costs too, so a report right after the update shows them.
-  await mirrored;
+  const perClick = await writeCostSplit({ campaignIds: [campaignId], clickIds, total });
   await audit(req, 'update', 'costs', campaignId, null, { amount, currency, from, to, tz, clicks: clickIds.length, perClick,
     filters: Object.keys(filters).length ? JSON.stringify(filters) : null, uniqueOnly });
   return { ...result, perClick };
+}
+
+// Spend import (e.g. a Facebook Ads Manager CSV parsed in /admin). Each row {date, id, amount, currency} is a cost update
+// of the chosen campaign(s) for that local day (tz), filtered by `param` = id (sub_id_2 = ad set id, …).
+// Idempotency: the import key `campaigns|param|id|date` is stored on the cost_update event (and in cost_imports in
+// PostgreSQL). Re-importing the same key replaces the previous import: its clicks get the new split, and clicks it
+// had but that no longer match are reset to 0 — so the spend is never counted twice. Rows of one request with the same
+// key are summed (e.g. an export broken down by placement).
+const COST_IMPORT_MAX_ROWS = 5000;
+async function previousCostImports(keys, cache) {
+  const found = new Map();
+  if (!keys.length) return found;
+  if (db) {
+    try {
+      const { rows } = await db.query('SELECT import_key, click_ids FROM cost_imports WHERE import_key = ANY($1::text[])', [keys]);
+      for (const row of rows) found.set(row.import_key, (row.click_ids || []).map(String));
+      return found;
+    } catch (error) { console.warn('[db] cost import lookup fallback:', error.message); }
+  }
+  const wanted = new Set(keys);
+  for (const item of await cachedJournal(cache)) if (item.type === 'cost_update' && wanted.has(item.importKey)) found.set(item.importKey, item.clickIds || []);
+  return found;
+}
+
+async function importCosts(body, req) {
+  const rawCampaigns = Array.isArray(body?.campaign) ? body.campaign : Array.isArray(body?.campaigns) ? body.campaigns : [body?.campaign];
+  const campaignIds = [...new Set(rawCampaigns.filter((c) => typeof c === 'string' && c))].sort();
+  if (!campaignIds.length || campaignIds.length > 50) return { status: 400, error: 'campaign_required' };
+  for (const id of campaignIds) {
+    if (!campaigns.has(id)) return { status: 404, error: 'campaign_not_found' };
+    if (!canEditCampaign(req, campaigns.get(id))) return { status: 403, error: 'campaign_not_yours' };
+  }
+  const param = String(body.param || '');
+  if (!TRACK_FIELDS.includes(param)) return { status: 400, error: 'invalid_param' };
+  const tz = costTz(body.tz);
+  if (!tz) return { status: 400, error: 'invalid_tz' };
+  if (!Array.isArray(body.rows) || !body.rows.length) return { status: 400, error: 'rows_required' };
+  if (body.rows.length > COST_IMPORT_MAX_ROWS) return { status: 400, error: 'too_many_rows' };
+  const uniqueOnly = body.uniqueOnly === true;
+
+  const results = body.rows.map((row, index) => {
+    const rawId = typeof row?.id === 'number' ? String(row.id) : typeof row?.id === 'string' ? row.id.trim() : '';
+    const out = { row: index, date: typeof row?.date === 'string' ? row.date : null, id: rawId, amount: costAmount(row?.amount), currency: costCurrency(row?.currency), clicks: 0, cost: 0 };
+    if (!isoDate(row?.date)) return { ...out, error: 'invalid_date' };
+    if (!rawId || rawId.length > 255) return { ...out, error: 'invalid_id' };
+    if (out.amount === null) return { ...out, error: 'invalid_amount' };
+    if (!out.currency) return { ...out, error: 'invalid_currency' };
+    return out;
+  });
+  const groups = new Map();
+  for (const row of results) {
+    if (row.error) continue;
+    row.cost = round6(row.amount * rates.factor(row.currency, rates.defaultCurrency));
+    const key = `${campaignIds.join(',')}|${param}|${row.id}|${row.date}`;
+    if (groups.has(key)) groups.get(key).push(row); else groups.set(key, [row]);
+  }
+  const cache = {};
+  const previous = await previousCostImports([...groups.keys()], cache);
+  for (const [key, rows] of groups) {
+    const { date, id } = rows[0];
+    const clickIds = await matchCostClicks({ campaignIds, start: zonedDayStart(date, tz), end: zonedDayStart(nextIsoDay(date), tz), filters: { [param]: id }, uniqueOnly }, cache);
+    const before = previous.get(key);
+    const fresh = new Set(clickIds);
+    const stale = (before || []).filter((clickId) => !fresh.has(clickId));
+    if (stale.length) {
+      const { mirrored } = await event('cost_update', { campaign: campaignIds[0], clickIds: stale, cost: 0, importReset: key });
+      await mirrored;
+    }
+    // Recorded even without clicks when the key was imported before, so the next import knows there is nothing to reset.
+    if (clickIds.length || before) await writeCostSplit({ campaignIds, clickIds, total: clickIds.length ? round6(rows.reduce((t, r) => t + r.cost, 0)) : 0, importKey: key });
+    for (const row of rows) {
+      row.clicks = clickIds.length;
+      if (before) row.replaced = true;
+      if (rows.length > 1) row.merged = rows.length;
+      if (!clickIds.length) row.error = 'no_matching_clicks';
+    }
+  }
+  const applied = results.filter((r) => !r.error);
+  const summary = { rows: results.length, applied: applied.length, failed: results.length - applied.length,
+    clicks: [...groups.values()].reduce((t, rows) => t + (rows[0].error ? 0 : rows[0].clicks), 0), cost: round6(applied.reduce((t, r) => t + r.cost, 0)) };
+  await audit(req, 'import', 'costs', campaignIds.join(','), null, { ...summary, param, tz, uniqueOnly });
+  return { ok: true, campaigns: campaignIds, param, tz, costCurrency: rates.defaultCurrency, ...summary, results };
 }
 
 const sourcePostbacks = createSourcePostbacks({
@@ -2176,6 +2287,14 @@ const server = http.createServer(async (req, res) => {
       const body = await readJson(req);
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const result = await updateCosts(body, req);
+      if (result.error) return json(res, result.status, { error: result.error });
+      return json(res, 200, result);
+    }
+    // Spend import (FB Ads Manager CSV parsed in the browser): one cost update per row and day, idempotent per import key.
+    if (url.pathname === '/api/costs/import' && req.method === 'POST') {
+      const body = await readJson(req, 2 * 1024 * 1024);
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      const result = await importCosts(body, req);
       if (result.error) return json(res, result.status, { error: result.error });
       return json(res, 200, result);
     }
