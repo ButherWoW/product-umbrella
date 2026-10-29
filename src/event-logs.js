@@ -59,14 +59,19 @@ function normalizeClick(item) {
     click_id: clickId, offer_id: offerId, created_at: at, user_agent: userAgent };
 }
 
+// One row per conversion (click, tid), the same in both storages: its latest status and amount,
+// `at` = first postback (the conversion time that from/to filter on), `updatedAt` = latest postback.
+// revenueIgnored: the amount is stored but not counted in revenue (CPC offers earn per click, see README).
 function normalizeConversion(item, click = item) {
   const clickId = item.clickId ?? item.click_id;
   const offerId = click.offerId ?? click.offer_id ?? null;
   const at = iso(item.at ?? item.created_at);
+  const updatedAt = iso(item.updatedAt ?? item.updated_at) ?? at;
   const revenue = item.revenue === null || item.revenue === undefined ? null : Number(item.revenue);
   return { type: 'conversion', clickId, campaign: click.campaign ?? null,
-    offerId, at, stream: click.stream || 'default', revenue: Number.isFinite(revenue) ? revenue : null, status: item.status || 'sale',
-    currency: item.currency ?? null, tid: item.tid || '', click_id: clickId, offer_id: offerId, created_at: at };
+    offerId, at, updatedAt, stream: click.stream || 'default', revenue: Number.isFinite(revenue) ? revenue : null, status: item.status || 'sale',
+    currency: item.currency ?? null, tid: item.tid || '', revenueIgnored: (item.revenueIgnored ?? item.revenue_ignored) === true,
+    click_id: clickId, offer_id: offerId, created_at: at };
 }
 
 function matches(item, query) {
@@ -86,6 +91,7 @@ async function fromJsonl(kind, query, eventsFile) {
   const lines = createInterface({ input, crlfDelay: Infinity });
   const clicks = new Map();
   const events = [];
+  const conversions = new Map(); // (click, tid) → { first, last } postback events
   const postbackParams = new Map(); // sub_id_N from postbacks overwrite click parameters, as in PostgreSQL
   const costUpdates = new Map(); // manual cost updates replace click costs, as in PostgreSQL
   try {
@@ -104,7 +110,11 @@ async function fromJsonl(kind, query, eventsFile) {
         if (kind === 'clicks') events.push(item);
         else clicks.set(item.clickId, item);
       } else if (item.type === 'conversion') {
-        if (kind === 'conversions') events.push(item);
+        if (kind === 'conversions') {
+          const key = `${item.clickId}|${item.tid || ''}`;
+          const seen = conversions.get(key);
+          if (seen) seen.last = item; else conversions.set(key, { first: item, last: item });
+        }
         else if (item.params) postbackParams.set(item.clickId, { ...(postbackParams.get(item.clickId) || {}), ...item.params });
       }
     }
@@ -118,9 +128,10 @@ async function fromJsonl(kind, query, eventsFile) {
     ? events.map((item) => normalizeClick({ ...item,
       ...(postbackParams.has(item.clickId) ? { params: { ...(item.params || {}), ...postbackParams.get(item.clickId) } } : {}),
       ...(costUpdates.has(item.clickId) ? { cost: costUpdates.get(item.clickId) } : {}) }))
-    : events.map((item) => normalizeConversion(item, clicks.get(item.clickId) || {})))
+    : [...conversions.values()].map(({ first, last }) => normalizeConversion({ ...last, at: first.at, updatedAt: last.at }, clicks.get(last.clickId) || {})))
     .filter((item) => matches(item, query))
-    .sort((a, b) => (b.at || '').localeCompare(a.at || '') || String(b.clickId).localeCompare(String(a.clickId)));
+    .sort((a, b) => (b.at || '').localeCompare(a.at || '') || String(b.clickId).localeCompare(String(a.clickId))
+      || (a.tid < b.tid ? 1 : a.tid > b.tid ? -1 : 0));
   return rows.slice(query.offset, query.offset + query.limit + 1);
 }
 
@@ -138,11 +149,11 @@ async function fromPostgres(kind, query, db) {
   params.push(query.limit + 1, query.offset);
   const fields = kind === 'clicks'
     ? 'c.click_id, c.campaign, c.offer_id, c.stream, c.path, c.referrer, c.user_agent, c.subid, c.country, c.ip, c.params, c.cost, c.landing_id, c.device, c.os, c.browser, c.language, c.isp, c.connection, c.is_unique_campaign, c.is_unique_stream, c.is_unique_global, c.created_at'
-    : 'cv.click_id, c.campaign, c.offer_id, c.stream, cv.revenue, cv.currency, cv.status, cv.tid, cv.created_at';
+    : 'cv.click_id, c.campaign, c.offer_id, c.stream, cv.revenue, cv.currency, cv.status, cv.tid, cv.revenue_ignored, cv.created_at, COALESCE(cv.updated_at, cv.created_at) AS updated_at';
   const source = kind === 'clicks' ? 'clicks c' : 'conversions cv JOIN clicks c USING (click_id)';
   const { rows } = await db.query(`SELECT ${fields} FROM ${source}
     ${conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''}
-    ORDER BY ${timestamp} DESC, c.click_id DESC LIMIT $${params.length - 1} OFFSET $${params.length}`, params);
+    ORDER BY ${timestamp} DESC, c.click_id DESC${kind === 'clicks' ? '' : ', cv.tid COLLATE "C" DESC'} LIMIT $${params.length - 1} OFFSET $${params.length}`, params);
   return rows.map((row) => kind === 'clicks' ? normalizeClick(row) : normalizeConversion(row));
 }
 
