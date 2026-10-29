@@ -205,7 +205,6 @@ try {
   await fetch(server.url + '/r/d11', { redirect: 'manual' });
   await fetch(`${server.url}/postback?secret=conversion-test-secret&click_id=${d11cid}&revenue=10&currency=USD`);
   const d11Stats = await (await fetch(server.url + '/stats?campaign=d11', { headers: { authorization: 'Bearer ' + TOKEN } })).json();
-  await page.setViewportSize({ width: 1280, height: 900 }); // earlier checks leave a phone-width viewport (headers hidden)
   await page.goto(server.url + '/admin#/campaigns');
   await page.locator('table.grid tbody tr', { hasText: 'D11 Test' }).waitFor();
   await page.locator('button[aria-label="Колонки"]').click();
@@ -232,6 +231,34 @@ try {
     });
     assert.match(approvePct || '', /100/, `Approve % should show 100% for 1 sale, got: ${approvePct}`);
   }
+
+  // D12: expandable rows in report
+  await api('/api/campaigns', { id: 'd12-camp', name: 'D12 Camp', streams: [{ name: 'S1', offers: [{ offerId: 'offer-1', weight: 1 }] }] });
+  await fetch(server.url + '/r/d12-camp', { redirect: 'manual' });
+  await page.goto(server.url + '/admin#/reports?group=campaign');
+  await page.getByRole('heading', { name: 'Отчёт' }).waitFor();
+  await page.locator('table.grid tbody tr', { hasText: 'D12 Camp' }).waitFor();
+  const d12Row = page.locator('table.grid tbody tr', { hasText: 'D12 Camp' });
+  const expandBtn = d12Row.locator('button[aria-label="Развернуть"]');
+  await expandBtn.waitFor();
+  await expandBtn.click();
+  const subRow = page.locator('tr.sub-row');
+  await subRow.waitFor();
+  assert.ok(await subRow.isVisible(), 'sub-row visible after expand');
+  await expandBtn.click();
+  await subRow.waitFor({ state: 'detached' });
+  assert.ok(true, 'sub-row removed on second click');
+
+  // D13: attention block on dashboard
+  await api('/api/campaigns', { id: 'd13-bad', name: 'D13 Bad ROI', streams: [{ name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] }], costModel: 'cpc', cpc: 1.0 });
+  await Promise.all(Array.from({ length: 100 }, () => fetch(server.url + '/r/d13-bad', { redirect: 'manual' })));
+  await page.goto(server.url + '/admin#/');
+  await page.getByRole('heading', { name: 'Дашборд' }).waitFor();
+  const attentionCard = page.locator('.card', { hasText: 'Требуют внимания' });
+  await attentionCard.waitFor({ timeout: 10000 });
+  assert.ok(await attentionCard.isVisible(), 'attention block appears with bad-ROI campaign');
+  const attentionText = await attentionCard.innerText();
+  assert.ok(attentionText.includes('D13 Bad ROI') || attentionText.includes('кл.'), `attention block has campaign info, got: ${attentionText.slice(0, 100)}`);
 
   assert.deepEqual(errors, []);
 
