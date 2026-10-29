@@ -133,3 +133,35 @@ test('buyer share setting: owner only, validated, audited', { timeout: 20000 }, 
   const log = (await call('/api/audit?entity=settings', { cookie: owner })).json.entries;
   assert.deepEqual(log[0].changes.buyerSharePct, [35, 40]);
 });
+
+test('buyers see and edit only their own campaigns; owner sees all and can reassign', { timeout: 20000 }, async (t) => {
+  const { call } = await boot(t);
+  const owner = (await call('/api/auth/setup', { method: 'POST', body: { email: 'o@example.com', password: 'owner-password' } })).cookie;
+  const ann = (await call('/api/users', { method: 'POST', cookie: owner, body: { email: 'ann@example.com', password: 'buyer-password' } })).json.user;
+  await call('/api/users', { method: 'POST', cookie: owner, body: { email: 'bob@example.com', password: 'buyer-password' } });
+  const annC = (await call('/api/auth/login', { method: 'POST', body: { email: 'ann@example.com', password: 'buyer-password' } })).cookie;
+  const bobC = (await call('/api/auth/login', { method: 'POST', body: { email: 'bob@example.com', password: 'buyer-password' } })).cookie;
+
+  assert.equal((await call('/api/campaigns', { method: 'POST', cookie: annC, body: { id: 'ann-camp', name: 'Ann', ownerId: 'ffffffff-ffff-4fff-8fff-ffffffffffff' } })).json.ownerId, ann.id, 'a buyer cannot create on behalf of someone else');
+  await call('/api/campaigns', { method: 'POST', cookie: bobC, body: { id: 'bob-camp', name: 'Bob' } });
+  await call('/r/ann-camp/offer-1'); await call('/r/bob-camp/offer-1'); await call('/r/bob-camp/offer-1');
+
+  assert.deepEqual(Object.keys((await call('/api/campaigns', { cookie: annC })).json.campaigns), ['ann-camp']);
+  const annStats = (await call('/stats', { cookie: annC })).json;
+  assert.equal(annStats.clicks, 1, 'stats without a campaign filter only count own campaigns');
+  assert.deepEqual(Object.keys(annStats.byCampaign), ['ann-camp']);
+  assert.equal((await call('/stats?campaign=bob-camp', { cookie: annC })).status, 403);
+  assert.equal((await call('/api/clicks?campaign=bob-camp', { cookie: annC })).status, 403);
+  assert.ok((await call('/api/clicks', { cookie: annC })).json.clicks.every((c) => c.campaign === 'ann-camp'));
+  assert.equal((await call('/stats/timeseries', { cookie: annC })).json.series.reduce((n, p) => n + p.clicks, 0), 1);
+  assert.equal((await call('/stats/referrers', { cookie: annC })).json.referrers.reduce((n, r) => n + r.clicks, 0), 1);
+  assert.equal((await call('/api/campaigns/bob-camp', { method: 'PATCH', cookie: annC, body: { name: 'hijack' } })).status, 403);
+  assert.equal((await call('/api/campaigns/bob-camp/streams', { method: 'PUT', cookie: annC, body: { streams: [] } })).status, 403);
+  assert.equal((await call('/api/campaigns', { method: 'POST', cookie: annC, body: { id: 'bob-camp', name: 'overwrite' } })).status, 403, 'POST with an existing id of another buyer is rejected');
+  assert.equal((await call('/api/campaigns/ann-camp', { method: 'PATCH', cookie: annC, body: { ownerId: 'ffffffff-ffff-4fff-8fff-ffffffffffff' } })).json.ownerId, ann.id, 'buyers cannot hand campaigns over');
+
+  assert.equal((await call('/stats', { cookie: owner })).json.clicks, 3, 'owner sees everything');
+  await call('/api/campaigns/bob-camp', { method: 'PATCH', cookie: owner, body: { ownerId: ann.id } });
+  assert.deepEqual(Object.keys((await call('/api/campaigns', { cookie: annC })).json.campaigns).sort(), ['ann-camp', 'bob-camp'], 'reassigned campaign appears for the new buyer');
+  assert.deepEqual(Object.keys((await call('/api/campaigns', { cookie: bobC })).json.campaigns), []);
+});

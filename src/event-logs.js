@@ -68,6 +68,7 @@ function normalizeConversion(item, click = item) {
 
 function matches(item, query) {
   if (query.campaign && item.campaign !== query.campaign) return false;
+  if (query.allowed && !query.allowed.includes(item.campaign)) return false;
   if (query.offer && item.offerId !== query.offer) return false;
   if (query.stream && item.stream !== query.stream) return false;
   const at = item.at ? Date.parse(item.at) : NaN;
@@ -109,6 +110,7 @@ async function fromPostgres(kind, query, db) {
   const conditions = [], params = [];
   const add = (sql, value) => { params.push(value); conditions.push(`${sql} $${params.length}`); };
   if (query.campaign) add('c.campaign =', query.campaign);
+  if (query.allowed) { params.push(query.allowed); conditions.push(`c.campaign = ANY($${params.length}::text[])`); }
   if (query.offer) add('c.offer_id =', query.offer);
   if (query.stream) add("COALESCE(NULLIF(c.stream, ''), 'default') =", query.stream);
   const timestamp = kind === 'clicks' ? 'c.created_at' : 'cv.created_at';
@@ -125,9 +127,10 @@ async function fromPostgres(kind, query, db) {
   return rows.map((row) => kind === 'clicks' ? normalizeClick(row) : normalizeConversion(row));
 }
 
-export async function readEventLog({ kind, params, eventsFile, db = null, onFallback = () => {} }) {
+export async function readEventLog({ kind, params, eventsFile, db = null, onFallback = () => {}, allowedCampaigns = null }) {
   if (!['clicks', 'conversions'].includes(kind)) throw new Error('unsupported_log_kind');
-  const query = parseLogQuery(params);
+  // allowedCampaigns: a buyer's own campaigns (null = no restriction).
+  const query = { ...parseLogQuery(params), allowed: allowedCampaigns };
   let rows, storage = 'jsonl';
   if (db) {
     try { rows = await fromPostgres(kind, query, db); storage = 'postgres'; }

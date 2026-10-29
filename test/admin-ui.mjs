@@ -138,6 +138,8 @@ try {
     await dlg.locator('input[type=password]').fill('buyer-password-1');
     await dlg.getByRole('button', { name: 'Создать' }).click();
     await p2.locator('table.grid tbody tr', { hasText: 'buyer@example.com' }).waitFor();
+    await p2.locator('[data-nav=dashboard]').click();
+    await p2.getByRole('heading', { name: 'Баеры' }).waitFor();
     await p2.getByRole('button', { name: 'Выйти' }).click();
     await p2.getByRole('heading', { name: 'Вход в Umbrella' }).waitFor();
     await p2.getByLabel('Email').fill('buyer@example.com');
@@ -145,6 +147,9 @@ try {
     await p2.getByRole('button', { name: 'Войти' }).click();
     await p2.locator('#user-box', { hasText: 'buyer@example.com' }).waitFor();
     assert.ok(await p2.locator('[data-nav=users]').isHidden(), 'buyers do not see the users section');
+    await p2.locator('[data-nav=dashboard]').click();
+    await p2.locator('.kpi', { hasText: 'Заработок баера' }).waitFor();
+    assert.equal(await p2.getByRole('heading', { name: 'Баеры' }).count(), 0, 'buyers do not see the per-buyer table');
     await p2.screenshot({ path: join(tmpdir(), 'umbrella-admin-buyer.png') });
   } finally { await locked.stop(); await rm(dir2, { recursive: true, force: true }); }
 

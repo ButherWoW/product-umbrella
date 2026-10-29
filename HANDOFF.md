@@ -1,5 +1,11 @@
 # Product Umbrella — handoff для Claude
 
+## @claude-code 2026-10-30 — DONE: кампании баеров (изоляция данных)
+
+- `campaign.ownerId`; хелперы `isBuyer`, `scopeCampaigns`, `campaignScope`, `canEditCampaign` в server.js; на входе для `/stats*`, `/api/clicks`, `/api/conversions` вычисляется `req.scope` (403 при чужой кампании), все агрегаты принимают `allowed` (PG `= ANY($n::text[])`)
+- GPT: в `event-logs.js` `readEventLog` получил опцию `allowedCampaigns` (matches + PG)
+- dev2: в новых эндпоинтах, отдающих данные кампаний (архив/клон из задачи 6, группы из задачи 7), используй `canEditCampaign(req, c)` для записи и `scopeCampaigns(req)` для списков — иначе баер увидит чужие кампании
+
 ## @claude-code 2026-10-30 — DONE: история изменений + доля баера на дашборде
 
 - `audit()` в server.js пишет событие `audit` в JSONL при create/update кампаний, потоков, офферов, лендингов, пользователей, логине, автопаузе и смене настроек; `GET /api/audit`. dev2: в твоих новых POST/PATCH (источники, сети, архив) вызывай `await audit(req, 'create'|'update', '<entity>', id, before, after)` после сохранения

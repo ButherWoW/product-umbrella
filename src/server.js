@@ -459,6 +459,7 @@ function parseCampaign(id, value) {
     // Revenue cap: stop after earning revenueCap per day
     revenueCap: typeof value.revenueCap === 'number' && value.revenueCap > 0 ? value.revenueCap : null,
     botFilter: value.botFilter === true,
+    ownerId: /^[0-9a-f-]{36}$/i.test(String(value.ownerId || '')) ? String(value.ownerId).toLowerCase() : null,
     redirectMethod: REDIRECT_METHODS.includes(value.redirectMethod) ? value.redirectMethod : 'http',
     blockedIps: parseIpRules(value.blockedIps),
     allowedIps: parseIpRules(value.allowedIps),
@@ -514,7 +515,7 @@ async function event(type, payload) {
   eventMirror?.enqueue(record);
 }
 
-async function stats({ campaign = null, from = null, to = null, subid = null, country = null, offer = null, stream = null, currency = rates.defaultCurrency } = {}) {
+async function stats({ campaign = null, allowed = null, from = null, to = null, subid = null, country = null, offer = null, stream = null, currency = rates.defaultCurrency } = {}) {
   if (from && !/^\d{4}-\d{2}-\d{2}$/.test(from)) throw Object.assign(new Error('invalid_from_date'), { statusCode: 400 });
   if (to && !/^\d{4}-\d{2}-\d{2}$/.test(to)) throw Object.assign(new Error('invalid_to_date'), { statusCode: 400 });
 
@@ -524,6 +525,7 @@ async function stats({ campaign = null, from = null, to = null, subid = null, co
       const conditions = [];
       const params = [];
       if (campaign) { params.push(campaign); conditions.push(`c.campaign = $${params.length}`); }
+      if (allowed) { params.push(allowed); conditions.push(`c.campaign = ANY($${params.length}::text[])`); }
       if (from) { params.push(`${from}T00:00:00Z`); conditions.push(`c.created_at >= $${params.length}`); }
       if (to) { params.push(`${to}T23:59:59Z`); conditions.push(`c.created_at <= $${params.length}`); }
       if (subid) { params.push(subid); conditions.push(`c.subid = $${params.length}`); }
@@ -568,6 +570,7 @@ async function stats({ campaign = null, from = null, to = null, subid = null, co
     const allClicks = lines.filter((item) => item.type === 'click');
     const clicks = allClicks.filter((item) => {
       if (campaign && item.campaign !== campaign) return false;
+      if (allowed && !allowed.includes(item.campaign)) return false;
       if (subid && item.subid !== subid) return false;
       if (country && (item.country || '').toUpperCase() !== country.toUpperCase()) return false;
       if (offer && item.offerId !== offer) return false;
@@ -589,11 +592,12 @@ async function stats({ campaign = null, from = null, to = null, subid = null, co
 }
 
 // Clicks/conversions/revenue/cost grouped by one tracked parameter value ('' = not passed).
-async function paramReport({ field, campaign, from, to, currency = rates.defaultCurrency }) {
+async function paramReport({ field, campaign, allowed = null, from, to, currency = rates.defaultCurrency }) {
   if (db) {
     try {
       const conditions = []; const values = [field];
       if (campaign) { values.push(campaign); conditions.push(`c.campaign = $${values.length}`); }
+      if (allowed) { values.push(allowed); conditions.push(`c.campaign = ANY($${values.length}::text[])`); }
       if (from) { values.push(`${from}T00:00:00Z`); conditions.push(`c.created_at >= $${values.length}`); }
       if (to) { values.push(`${to}T23:59:59Z`); conditions.push(`c.created_at <= $${values.length}`); }
       const fx = sqlFx(values, currency);
@@ -614,7 +618,7 @@ async function paramReport({ field, campaign, from, to, currency = rates.default
   const conv = latestConversions(lines);
   const groups = new Map();
   for (const click of lines) {
-    if (click.type !== 'click' || (campaign && click.campaign !== campaign)) continue;
+    if (click.type !== 'click' || (campaign && click.campaign !== campaign) || (allowed && !allowed.includes(click.campaign))) continue;
     const t = Date.parse(click.at);
     if ((fromMs !== null && t < fromMs) || (toMs !== null && t > toMs)) continue;
     const key = click.params?.[field] ?? '';
@@ -839,6 +843,21 @@ function sendRedirect(res, location, method = 'http') {
   return res.end();
 }
 
+// Buyers see and edit only their own campaigns; owners, the admin token and a fresh dev install see everything.
+const isBuyer = (req) => req.user?.role === 'buyer' && !bearerAuthorized(req);
+function scopeCampaigns(req) {
+  if (!isBuyer(req)) return null;
+  return [...campaigns].filter(([, c]) => c.ownerId === req.user.id).map(([id]) => id);
+}
+// Resolves ?campaign= against the caller's scope: { campaign, allowed } or { forbidden: true }.
+function campaignScope(req, requested) {
+  const allowed = scopeCampaigns(req);
+  if (!allowed) return { campaign: requested, allowed: null };
+  if (requested && !allowed.includes(requested)) return { forbidden: true };
+  return { campaign: requested, allowed };
+}
+const canEditCampaign = (req, c) => !isBuyer(req) || c?.ownerId === req.user.id;
+
 // Change history (Keitaro «Лог»): who changed what and when. Kept in the JSONL journal; never stores passwords.
 const PRIMITIVE = (v) => v === null || ['string', 'number', 'boolean'].includes(typeof v);
 async function audit(req, action, entity, id, before = null, after = null) {
@@ -943,6 +962,10 @@ const server = http.createServer(async (req, res) => {
     if (requireLogin && isPrivatePath(url.pathname) && !req.user && !bearerAuthorized(req)) {
       if (url.pathname === '/dashboard') { res.writeHead(302, { location: `${basePath}/admin` }); return res.end(); }
       return json(res, 401, { error: 'login_required' });
+    }
+    if (url.pathname === '/stats' || url.pathname.startsWith('/stats/') || url.pathname === '/api/clicks' || url.pathname === '/api/conversions') {
+      req.scope = campaignScope(req, url.searchParams.get('campaign') || null);
+      if (req.scope.forbidden) return json(res, 403, { error: 'campaign_not_yours' });
     }
     if (url.pathname.startsWith('/api/auth/') || url.pathname === '/api/users' || url.pathname.startsWith('/api/users/')) {
       return await handleAuthRoute(req, res, url);
@@ -1130,6 +1153,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, await stats({
         currency: reportCurrency(url.searchParams.get('currency')),
         campaign: url.searchParams.get('campaign') || null,
+        allowed: req.scope?.allowed || null,
         from: url.searchParams.get('from') || null,
         to: url.searchParams.get('to') || null,
         subid: url.searchParams.get('subid') || null,
@@ -1140,12 +1164,12 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/api/clicks' && req.method === 'GET') {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
-      return json(res, 200, await readEventLog({ kind: 'clicks', params: url.searchParams, eventsFile, db,
+      return json(res, 200, await readEventLog({ kind: 'clicks', params: url.searchParams, eventsFile, db, allowedCampaigns: req.scope?.allowed || null,
         onFallback: (error) => console.warn('[db] click log fallback:', error.message) }));
     }
     if (url.pathname === '/api/conversions' && req.method === 'GET') {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
-      return json(res, 200, await readEventLog({ kind: 'conversions', params: url.searchParams, eventsFile, db,
+      return json(res, 200, await readEventLog({ kind: 'conversions', params: url.searchParams, eventsFile, db, allowedCampaigns: req.scope?.allowed || null,
         onFallback: (error) => console.warn('[db] conversion log fallback:', error.message) }));
     }
     if (url.pathname === '/lp/click' && req.method === 'GET') {
@@ -1180,7 +1204,9 @@ const server = http.createServer(async (req, res) => {
       const entity = url.searchParams.get('entity') || null;
       const entityId = url.searchParams.get('id') || null;
       const limit = Math.min(Math.max(Number.parseInt(url.searchParams.get('limit') || '100', 10) || 100, 1), 500);
-      return json(res, 200, { entries: await readAudit({ entity, id: entityId, limit }) });
+      const mine = scopeCampaigns(req);
+      const entries = await readAudit({ entity, id: entityId, limit: mine ? 2000 : limit });
+      return json(res, 200, { entries: mine ? entries.filter((e) => e.actor === req.user.email || (e.entity === 'campaign' && mine.includes(e.entityId))).slice(0, limit) : entries });
     }
     if (url.pathname === '/api/rates' && req.method === 'GET') return json(res, 200, { defaultCurrency: rates.defaultCurrency, ...rates.info() });
     if (url.pathname === '/api/landings' && req.method === 'GET') return json(res, 200, { landings: Object.fromEntries(landings) });
@@ -1240,12 +1266,18 @@ const server = http.createServer(async (req, res) => {
       await audit(req, 'update', 'offer', id, cur, updated);
       return json(res, 200, { id, ...updated });
     }
-    if (url.pathname === '/api/campaigns' && req.method === 'GET') return json(res, 200, { campaigns: Object.fromEntries(campaigns) });
+    if (url.pathname === '/api/campaigns' && req.method === 'GET') {
+      const allowed = scopeCampaigns(req);
+      return json(res, 200, { campaigns: Object.fromEntries([...campaigns].filter(([id]) => !allowed || allowed.includes(id))) });
+    }
     if (url.pathname === '/api/campaigns' && req.method === 'POST') {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const body = await readJson(req);
       if (!/^[a-z0-9_-]{2,80}$/i.test(String(body.id || ''))) return json(res, 400, { error: 'valid_id_required' });
-      campaigns.set(String(body.id), parseCampaign(String(body.id), body));
+      if (campaigns.has(String(body.id)) && !canEditCampaign(req, campaigns.get(String(body.id)))) return json(res, 403, { error: 'campaign_not_yours' });
+      // A buyer's new campaign is always theirs; the owner may assign it to someone.
+      const ownerId = isBuyer(req) ? req.user.id : (body.ownerId ?? req.user?.id ?? null);
+      campaigns.set(String(body.id), parseCampaign(String(body.id), { ...body, ownerId }));
       await persistCampaign(String(body.id), campaigns.get(String(body.id)));
       await audit(req, 'create', 'campaign', String(body.id), null, campaigns.get(String(body.id)));
       return json(res, 201, { id: body.id, ...campaigns.get(String(body.id)) });
@@ -1255,6 +1287,7 @@ const server = http.createServer(async (req, res) => {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const id = campaignUpdate[1];
       if (!campaigns.has(id)) return json(res, 404, { error: 'campaign_not_found' });
+      if (!canEditCampaign(req, campaigns.get(id))) return json(res, 403, { error: 'campaign_not_yours' });
       const body = await readJson(req);
       const cur = campaigns.get(id);
       campaigns.set(id, parseCampaign(id, {
@@ -1271,6 +1304,7 @@ const server = http.createServer(async (req, res) => {
         dedupeWindow: body.dedupeWindow === undefined ? cur.dedupeWindow : body.dedupeWindow,
         revenueCap: body.revenueCap === undefined ? cur.revenueCap : body.revenueCap,
         botFilter: body.botFilter === undefined ? cur.botFilter : body.botFilter,
+        ownerId: body.ownerId === undefined || req.user?.role === 'buyer' ? cur.ownerId : body.ownerId,
         redirectMethod: body.redirectMethod === undefined ? cur.redirectMethod : body.redirectMethod,
         blockedIps: body.blockedIps === undefined ? cur.blockedIps : body.blockedIps,
         allowedIps: body.allowedIps === undefined ? cur.allowedIps : body.allowedIps,
@@ -1291,6 +1325,7 @@ const server = http.createServer(async (req, res) => {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const id = streamsUpdate[1];
       if (!campaigns.has(id)) return json(res, 404, { error: 'campaign_not_found' });
+      if (!canEditCampaign(req, campaigns.get(id))) return json(res, 403, { error: 'campaign_not_yours' });
       const body = await readJson(req);
       if (!Array.isArray(body.streams)) return json(res, 400, { error: 'streams_array_required' });
       const streams = parseStreams(body.streams);
@@ -1324,6 +1359,7 @@ const server = http.createServer(async (req, res) => {
         try {
           const conds = [], params = [];
           if (tsCampaign) { params.push(tsCampaign); conds.push(`c.campaign = $${params.length}`); }
+          if (req.scope?.allowed) { params.push(req.scope.allowed); conds.push(`c.campaign = ANY($${params.length}::text[])`); }
           if (tsFrom) { params.push(`${tsFrom}T00:00:00Z`); conds.push(`c.created_at >= $${params.length}`); }
           if (tsTo) { params.push(`${tsTo}T23:59:59Z`); conds.push(`c.created_at <= $${params.length}`); }
           const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
@@ -1351,6 +1387,7 @@ const server = http.createServer(async (req, res) => {
         const allClicks = lines.filter((item) => item.type === 'click');
         const clicks = allClicks.filter((item) => {
           if (tsCampaign && item.campaign !== tsCampaign) return false;
+          if (req.scope?.allowed && !req.scope.allowed.includes(item.campaign)) return false;
           const t = item.at ? Date.parse(item.at) : null;
           if (fromMs !== null && (t === null || t < fromMs)) return false;
           if (toMs !== null && (t === null || t > toMs)) return false;
@@ -1387,6 +1424,7 @@ const server = http.createServer(async (req, res) => {
         try {
           const conds = [], params = [];
           if (refCampaign) { params.push(refCampaign); conds.push(`campaign = $${params.length}`); }
+          if (req.scope?.allowed) { params.push(req.scope.allowed); conds.push(`campaign = ANY($${params.length}::text[])`); }
           const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
           params.push(limit);
           const { rows } = await db.query(`SELECT COALESCE(referrer,'direct') AS referrer, COUNT(*)::int AS clicks FROM clicks ${where} GROUP BY referrer ORDER BY clicks DESC LIMIT $${params.length}`, params);
@@ -1395,7 +1433,7 @@ const server = http.createServer(async (req, res) => {
       }
       try {
         const lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map(JSON.parse);
-        const clicks = lines.filter((item) => item.type === 'click' && (!refCampaign || item.campaign === refCampaign));
+        const clicks = lines.filter((item) => item.type === 'click' && (!refCampaign || item.campaign === refCampaign) && (!req.scope?.allowed || req.scope.allowed.includes(item.campaign)));
         const counts = {};
         for (const c of clicks) { const r = c.referrer || 'direct'; counts[r] = (counts[r] || 0) + 1; }
         const referrers = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, limit).map(([referrer, clicks]) => ({ referrer, clicks }));
@@ -1412,7 +1450,7 @@ const server = http.createServer(async (req, res) => {
       if ((pFrom && !/^\d{4}-\d{2}-\d{2}$/.test(pFrom)) || (pTo && !/^\d{4}-\d{2}-\d{2}$/.test(pTo))) return json(res, 400, { error: 'invalid_date' });
       const pCampaign = url.searchParams.get('campaign') || null;
       const pCurrency = reportCurrency(url.searchParams.get('currency'));
-      return json(res, 200, { field, currency: pCurrency, rows: await paramReport({ field, campaign: pCampaign, from: pFrom, to: pTo, currency: pCurrency }) });
+      return json(res, 200, { field, currency: pCurrency, rows: await paramReport({ field, campaign: pCampaign, allowed: req.scope?.allowed || null, from: pFrom, to: pTo, currency: pCurrency }) });
     }
     if (url.pathname === '/stats/paths' && req.method === 'GET') {
       const pathCampaign = url.searchParams.get('campaign') || null;
@@ -1421,6 +1459,7 @@ const server = http.createServer(async (req, res) => {
         try {
           const conds = [], params = [];
           if (pathCampaign) { params.push(pathCampaign); conds.push(`campaign = $${params.length}`); }
+          if (req.scope?.allowed) { params.push(req.scope.allowed); conds.push(`campaign = ANY($${params.length}::text[])`); }
           const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
           params.push(limit);
           const { rows } = await db.query(`SELECT COALESCE(path,'/') AS path, COUNT(*)::int AS clicks FROM clicks ${where} GROUP BY path ORDER BY clicks DESC LIMIT $${params.length}`, params);
@@ -1429,7 +1468,7 @@ const server = http.createServer(async (req, res) => {
       }
       try {
         const lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map(JSON.parse);
-        const clicks = lines.filter((item) => item.type === 'click' && (!pathCampaign || item.campaign === pathCampaign));
+        const clicks = lines.filter((item) => item.type === 'click' && (!pathCampaign || item.campaign === pathCampaign) && (!req.scope?.allowed || req.scope.allowed.includes(item.campaign)));
         const counts = {};
         for (const c of clicks) { const p = c.path || '/'; counts[p] = (counts[p] || 0) + 1; }
         const paths = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, limit).map(([path, clicks]) => ({ path, clicks }));

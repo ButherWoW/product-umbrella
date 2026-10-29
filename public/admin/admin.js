@@ -1,5 +1,5 @@
 // Umbrella admin UI — layout and workflows modelled on Keitaro, backed by the existing tracker API.
-const state = { token: null, offers: {}, campaigns: {}, landings: {} };
+const state = { token: null, offers: {}, campaigns: {}, landings: {}, users: [] };
 // Set by the server when the tracker runs under a path prefix (BASE_PATH, e.g. /umbrella behind nginx).
 const BASE = typeof window.UMBRELLA_BASE === 'string' ? window.UMBRELLA_BASE : '';
 const view = document.getElementById('view');
@@ -86,7 +86,12 @@ async function loadRefs() {
   state.offers = o.offers || {};
   state.campaigns = c.campaigns || {};
   state.landings = l.landings || {};
+  // Owners see the team list (for assigning campaigns and per-buyer earnings); buyers get 403 and an empty list.
+  state.users = isOwnerView() ? ((await api('/api/users').catch(() => ({ users: [] }))).users || []) : [];
 }
+
+const isOwnerView = () => state.me?.user?.role === 'owner';
+const userEmail = (id) => state.users.find((u) => u.id === id)?.email || (id ? 'удалённый пользователь' : '—');
 
 // ---------- period ----------
 const PERIODS = [['today', 'Сегодня'], ['yesterday', 'Вчера'], ['last_7_days', 'Последние 7 дней'], ['this_month', 'Текущий месяц'], ['prev_month', 'Предыдущий месяц'], ['last_30_days', 'Последние 30 дней'], ['all', 'За всё время'], ['custom', 'Интервал дат']];
@@ -439,6 +444,24 @@ async function pageDashboard() {
           { key: 'conversions', label: 'Конв.', color: '#e0496a', values: series.map((p) => p.conversions) },
           { key: 'revenue', label: 'Доход', color: '#e8913f', right: true, values: series.map((p) => p.revenue) },
         ], series)),
+        isOwnerView() ? h('div', { class: 'card', style: 'margin-bottom:14px' }, h('h2', {}, 'Баеры'), dataTable({
+          id: 'dash-buyers', compact: true, pageSize: 50,
+          rows: Object.values(Object.entries(s.byCampaign || {}).reduce((acc, [cid, v]) => {
+            const owner = state.campaigns[cid]?.ownerId || '';
+            const row = acc[owner] ||= { id: owner || '(без баера)', name: owner ? userEmail(owner) : 'Без баера', campaigns: 0, clicks: 0, conversions: 0, revenue: 0, cost: 0 };
+            row.campaigns += 1; row.clicks += v.clicks || 0; row.conversions += v.conversions || 0; row.revenue += v.revenue || 0; row.cost += v.cost || 0;
+            return acc;
+          }, {})).sort((a, b) => (b.revenue - b.cost) - (a.revenue - a.cost)),
+          columns: [
+            { key: 'name', label: 'Баер', fixed: true },
+            { key: 'campaigns', label: 'Кампании', num: true },
+            ...metricCols().filter((c) => ['clicks', 'conversions', 'revenue'].includes(c.key)),
+            { key: 'cost', label: 'Расход', num: true, render: (r) => money(r.cost), total: (rs) => money(sum(rs, 'cost')) },
+            { key: 'profit', label: 'Прибыль', num: true, value: (r) => r.revenue - r.cost, render: (r) => h('span', { class: r.revenue - r.cost >= 0 ? 'pos' : 'neg' }, money(r.revenue - r.cost)), total: (rs) => money(sum(rs, 'revenue') - sum(rs, 'cost')) },
+            { key: 'earn', label: `Заработок · ${sharePct}%`, num: true, value: (r) => Math.max(0, r.revenue - r.cost) * sharePct / 100, render: (r) => money(Math.max(0, r.revenue - r.cost) * sharePct / 100),
+              total: (rs) => money(rs.reduce((t, r) => t + Math.max(0, r.revenue - r.cost) * sharePct / 100, 0)) },
+          ],
+        })) : null,
         h('div', { class: 'grid-2' },
           small('Кампания', 'campaigns', groupRows(s.byCampaign), (r) => state.campaigns[r.id]?.name || r.id, (r) => '#/campaigns/' + encodeURIComponent(r.id)),
           small('Оффер', 'offers', groupRows(s.byOffer), (r) => r.id, (r) => '#/reports' + qs({ group: 'country', offer: r.id })),
@@ -492,6 +515,7 @@ async function pageCampaigns() {
         h('a', { href: '#/reports' + qs({ group: 'stream', campaign: r.id }), title: 'Отчёт', 'aria-label': 'Отчёт' }, '▥'),
         h('a', { href: '#/clicks' + qs({ campaign: r.id }), title: 'Лог кликов', 'aria-label': 'Лог кликов' }, '☰'),
         h('button', { title: r.active ? 'Выключить' : 'Включить', 'aria-label': r.active ? 'Выключить' : 'Включить', onclick: () => setActive([r.id], !r.active) }, r.active ? '⏸' : '▶')) },
+      { key: 'owner', label: 'Баер', hidden: !isOwnerView(), value: (r) => (r.ownerId ? userEmail(r.ownerId) : '—') },
       { key: 'streams', label: 'Потоки', num: true, render: (r) => h('a', { href: '#/campaigns/' + encodeURIComponent(r.id) }, r.streams), total: (rs) => num(sum(rs, 'streams')) },
       ...metricCols(),
       { key: 'dailyCap', label: 'Дневной кап', num: true, hidden: true, render: (r) => r.dailyCap ?? '—' },
@@ -678,6 +702,9 @@ async function pageCampaignEditor(id) {
       field('Состояние', h('div', { class: 'radios' },
         h('label', {}, h('input', { type: 'radio', name: 'cstate', checked: d.active, onchange: () => { d.active = true; mark(); } }), 'Включена'),
         h('label', {}, h('input', { type: 'radio', name: 'cstate', checked: !d.active, onchange: () => { d.active = false; mark(); } }), 'Выключена'))),
+      isOwnerView() ? field('Баер', h('select', { class: 'select', onchange: (e) => { d.ownerId = e.target.value || null; mark(); } },
+        h('option', { value: '' }, 'Не назначен'), state.users.map((u) => h('option', { value: u.id, selected: d.ownerId === u.id }, `${u.email}${u.role === 'owner' ? ' (владелец)' : ''}`))),
+        'Баер видит и правит только свои кампании; его заработок считается по ним.') : null,
       field('Срок уникальности, минут', h('input', { class: 'input', type: 'number', min: 0, value: d.dedupeWindow || 0, oninput: bind('dedupeWindow', 'int') }), 'Повторный клик с того же IP в этом окне не считается. 0 — выключено.'),
       field('Фильтр ботов', h('label', { class: 'radios' }, h('input', { type: 'checkbox', checked: d.botFilter, onchange: (e) => { d.botFilter = e.target.checked; mark(); } }), 'Не считать клики ботов'), 'Боты уходят на тот же оффер, но не попадают в статистику.'),
       field('Способ редиректа', h('div', { class: 'radios' }, [['http', 'HTTP 302'], ['meta', 'Meta refresh'], ['js', 'JavaScript']].map(([v, l]) => h('label', {},
@@ -748,7 +775,7 @@ async function pageCampaignEditor(id) {
     if (new Set(names).size !== names.length) { err.textContent = 'Названия потоков должны различаться — по ним строится статистика.'; return; }
     const body = { name: d.name.trim(), active: d.active, streams: d.streams, dailyCap: d.dailyCap, totalCap: d.totalCap, revenueCap: d.revenueCap, capUrl: d.capUrl, geoCapUrl: d.geoCapUrl,
       allowGeos: d.allowGeos, allowDevices: d.allowDevices, allowOS: d.allowOS, allowBrowsers: d.allowBrowsers, blockedIps: d.blockedIps, allowedIps: d.allowedIps,
-      dedupeWindow: d.dedupeWindow || 0, botFilter: d.botFilter, conversionWindowDays: d.conversionWindowDays, redirectMethod: d.redirectMethod || 'http' };
+      dedupeWindow: d.dedupeWindow || 0, botFilter: d.botFilter, conversionWindowDays: d.conversionWindowDays, redirectMethod: d.redirectMethod || 'http', ...(isOwnerView() ? { ownerId: d.ownerId || null } : {}) };
     saveBtn.disabled = true;
     try {
       const saved = isNew ? await api('/api/campaigns', { method: 'POST', body: { id: d.id, ...body } })
