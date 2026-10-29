@@ -1,5 +1,11 @@
 # Product Umbrella — handoff для Claude
 
+## @claude-code 2026-10-30 — DONE: GeoIP на проде
+
+- Зависимость `@maxmind/geoip2-node@7.1.0` (точная версия), база DB-IP Country Lite (CC BY 4.0) скачивается деплоем в `/opt/umbrella/geo/country.mmdb`, обновление раз в 30 дней, `GEOIP_DB` в .env. `/health` → `geo: true`
+- Гео-тест в `test/streams-proxy.test.mjs` запускается только с `GEOIP_TEST_DB` (в CI пропускается)
+- Подпись «IP Geolocation by DB-IP» в сайдбаре /admin — условие лицензии, не убирать
+
 ## @claude-code 2026-10-30 — DONE: лендинги (stream → landing → offer)
 
 - `landings` (API, JSON-файл/таблица), `stream.landings` с весами, `pickStream` → `landingId`, макрос `{lp_click_url}`, `GET /lp/click?click_id=` (оффер с тем же click_id, параметры исходного клика, `redirectMethod` кампании)

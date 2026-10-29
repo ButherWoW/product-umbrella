@@ -109,6 +109,10 @@ Tracking URL принимает `utm_source`, `utm_medium`, `utm_campaign`, `utm
 
 GitHub Actions (`.github/workflows/deploy.yml`): тесты → отдельный systemd-сервис `umbrella` (порт 4110, пользователь `umbrella`) → своя база PostgreSQL `umbrella` со своей ролью (`deploy/setup-db.sh`) → `location /umbrella` в nginx (бэкап конфига, `nginx -t`, откат при ошибке) → демо-данные один раз. Секреты репозитория: `SSH_PRIVATE_KEY`, `UMBRELLA_ADMIN_TOKEN`, `UMBRELLA_POSTBACK_SECRET`.
 
+## GeoIP
+
+Страна посетителя определяется по базе DB-IP Country Lite (`GEOIP_DB=/путь/к/файлу.mmdb`, читается через `@maxmind/geoip2-node`). Деплой скачивает базу на сервер в `/opt/umbrella/geo/country.mmdb` и обновляет раз в 30 дней; при сбое загрузки остаётся прежняя. Без базы страна неизвестна: гео-фильтры кампаний пропускают всех, потоки с условием по стране не срабатывают. `/health` показывает `geo: true|false`. Лицензия CC BY 4.0 — ссылка «IP Geolocation by DB-IP» в панели обязательна. Тест с настоящей базой: `GEOIP_TEST_DB=/путь/dbip.mmdb npm test`.
+
 ## TRUST_PROXY
 
 По умолчанию IP посетителя — адрес TCP-соединения, а `X-Forwarded-For` игнорируется: его может прислать любой клиент и обойти списки IP, уникальность и rate limit. Если перед трекером стоит свой прокси (nginx, Caddy, балансировщик), задайте `TRUST_PROXY=1` (или число своих прокси в цепочке). Тогда IP берётся из `X-Forwarded-For` справа — адрес, который дописал ваш прокси, а не тот, что прислал клиент. Без этой настройки за прокси у всех кликов будет IP прокси, и уникальность с rate limit начнут резать нормальный трафик.

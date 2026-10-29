@@ -1195,7 +1195,7 @@ const server = http.createServer(async (req, res) => {
       return res.end(String(body).replaceAll('"/admin/', `"${basePath}/admin/`).replace('<head>', `<head>\n<script>window.UMBRELLA_BASE=${JSON.stringify(basePath)}</script>`));
     }
     if (url.pathname === '/' && req.method === 'GET') { res.writeHead(302, { location: `${basePath}/admin` }); return res.end(); }
-    if (url.pathname === '/health') return json(res, 200, { ok: true, storage: db ? 'postgres' : 'jsonl', now: new Date().toISOString(), uptime: Math.round(process.uptime()) });
+    if (url.pathname === '/health') return json(res, 200, { ok: true, storage: db ? 'postgres' : 'jsonl', geo: Boolean(geoReader), now: new Date().toISOString(), uptime: Math.round(process.uptime()) });
     // Time-series: GET /stats/timeseries?campaign=X&from=YYYY-MM-DD&to=YYYY-MM-DD&granularity=day|hour
     if (url.pathname === '/stats/timeseries' && req.method === 'GET') {
       const tsFrom = url.searchParams.get('from') || null;

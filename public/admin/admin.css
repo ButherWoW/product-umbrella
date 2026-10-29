@@ -157,3 +157,5 @@ body.auth-mode .view { margin-left: 0; display: grid; place-items: start center;
 .auth-card h1 { margin-bottom: 6px; }
 @media (max-width: 520px) { .user-box .muted { display: none; } }
 [hidden] { display: none !important; }
+.attribution { margin: 24px 12px 0; font-size: 11px; }
+.attribution a { color: var(--fg-3); }

@@ -78,6 +78,7 @@ jobs:
             echo "DATA_DIR=/opt/umbrella/data"
             echo "CLICK_RATE_LIMIT=120"
             echo "REQUIRE_LOGIN=1"
+            echo "GEOIP_DB=/opt/umbrella/geo/country.mmdb"
             echo "ADMIN_TOKEN=$ADMIN_TOKEN"
             echo "POSTBACK_SECRET=$POSTBACK_SECRET"
           } > umbrella.env
@@ -99,6 +100,20 @@ jobs:
             else
               echo "storage: JSONL in /opt/umbrella/data"
             fi'
+
+      - name: GeoIP database (DB-IP Country Lite, CC BY 4.0) — refresh monthly
+        run: |
+          ssh root@$HOST 'set -e
+            mkdir -p /opt/umbrella/geo && cd /opt/umbrella/geo
+            if [ -s country.mmdb ] && [ -z "$(find country.mmdb -mtime +30)" ]; then echo "GeoIP database is fresh"; exit 0; fi
+            for month in $(date -u +%Y-%m) $(date -u -d "-1 month" +%Y-%m); do
+              if curl -sfL --max-time 120 -o new.mmdb.gz "https://download.db-ip.com/free/dbip-country-lite-${month}.mmdb.gz"; then
+                gunzip -f new.mmdb.gz
+                if [ "$(stat -c %s new.mmdb)" -gt 1000000 ]; then chmod 644 new.mmdb; mv new.mmdb country.mmdb; echo "GeoIP database updated (${month})"; exit 0; fi
+              fi
+            done
+            rm -f new.mmdb new.mmdb.gz
+            echo "::warning::GeoIP download failed; keeping the previous database if any"'
 
       - name: Install deps and restart service
         run: |

@@ -192,3 +192,24 @@ test('landing flow: stream → landing → /lp/click → offer, with landing sta
     assert.equal(log[0].landingId, 'lp-a');
   });
 });
+
+// Runs only with a real country database: GEOIP_TEST_DB=/path/to/dbip-country-lite.mmdb npm test
+test('GeoIP: country streams, campaign geo filter and country stats', { timeout: 15000, skip: !process.env.GEOIP_TEST_DB && 'set GEOIP_TEST_DB to run' }, async (t) => {
+  await withServer(t, { GEOIP_DB: process.env.GEOIP_TEST_DB, TRUST_PROXY: '1' }, async ({ url, post, hit }) => {
+    assert.equal((await (await fetch(url + '/health')).json()).geo, true);
+    const FR = { 'x-forwarded-for': '90.84.10.1' }; const US = { 'x-forwarded-for': '8.8.8.8' };
+    await post('/api/offers', { id: 'fr-offer', url: 'https://fr.example.net/' });
+    await post('/api/campaigns', { id: 'geo-flow', name: 'Geo', streams: [
+      { name: 'fr', conditions: { countries: ['FR'] }, offers: [{ offerId: 'fr-offer' }] },
+      { name: 'rest', type: 'fallback', offers: [{ offerId: 'offer-1' }] },
+    ] });
+    assert.equal(new URL((await hit('/r/geo-flow', FR)).headers.get('location')).host, 'fr.example.net');
+    assert.equal(new URL((await hit('/r/geo-flow', US)).headers.get('location')).host, 'example.com');
+    await post('/api/campaigns', { id: 'fr-only', name: 'FR only', allowGeos: ['FR'] });
+    assert.equal((await hit('/r/fr-only/offer-1', FR)).status, 302);
+    assert.equal((await hit('/r/fr-only/offer-1', US)).status, 403);
+    const s = await (await fetch(url + '/stats?campaign=geo-flow')).json();
+    assert.equal(s.byCountry.FR.clicks, 1);
+    assert.equal(s.byCountry.US.clicks, 1);
+  });
+});

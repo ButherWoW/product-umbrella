@@ -2,7 +2,16 @@
   "name": "product-umbrella-tracker",
   "private": true,
   "type": "module",
-  "scripts": { "start": "node src/server.js", "migrate": "node src/migrate.js", "test": "node --test test/*.test.mjs && node test/smoke.mjs" },
-  "dependencies": { "pg": "^8.12.0" },
-  "engines": { "node": ">=20" }
+  "scripts": {
+    "start": "node src/server.js",
+    "migrate": "node src/migrate.js",
+    "test": "node --test test/*.test.mjs && node test/smoke.mjs"
+  },
+  "dependencies": {
+    "@maxmind/geoip2-node": "7.1.0",
+    "pg": "^8.12.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
 }
