@@ -109,6 +109,12 @@ await db.query(`
 `);
 await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'sale'`);
 await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ`);
+await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS tid TEXT NOT NULL DEFAULT ''`);
+await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS params JSONB`);
+// Upsells (G6): one row per (click_id, tid); tid '' is the main conversion. The new unique index is created
+// before the old primary key on click_id is dropped, so uniqueness never lapses.
+await db.query(`CREATE UNIQUE INDEX IF NOT EXISTS conversions_click_tid_idx ON conversions(click_id, tid)`);
+await db.query(`ALTER TABLE conversions DROP CONSTRAINT IF EXISTS conversions_pkey`);
 
 await db.query(`
   CREATE TABLE IF NOT EXISTS users (

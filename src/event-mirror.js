@@ -28,11 +28,17 @@ export function createEventMirror({ query, onError = () => {} }) {
         // First landing click wins; repeats keep the original time.
         await query('UPDATE clicks SET lp_clicked_at = COALESCE(lp_clicked_at, $2) WHERE click_id = $1', [payload.clickId, at]);
       } else {
-        // Status updates (lead → sale → rejected) overwrite the row; the keyed lock keeps journal order.
-        await query(`INSERT INTO conversions (click_id, revenue, currency, status, created_at)
-          VALUES ($1,$2,$3,$4,$5) ON CONFLICT (click_id) DO UPDATE
-          SET revenue = EXCLUDED.revenue, currency = EXCLUDED.currency, status = EXCLUDED.status, updated_at = now()`,
-        [payload.clickId, payload.revenue ?? null, payload.currency ?? null, payload.status || 'sale', at]);
+        // One row per (click, tid): a new tid is an upsell, the same tid a status update (lead → sale → rejected)
+        // that overwrites the row; the keyed lock keeps journal order.
+        await query(`INSERT INTO conversions (click_id, tid, revenue, currency, status, params, created_at)
+          VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7) ON CONFLICT (click_id, tid) DO UPDATE
+          SET revenue = EXCLUDED.revenue, currency = EXCLUDED.currency, status = EXCLUDED.status,
+            params = COALESCE(EXCLUDED.params, conversions.params), updated_at = now()`,
+        [payload.clickId, payload.tid ?? '', payload.revenue ?? null, payload.currency ?? null, payload.status || 'sale',
+          payload.params ? JSON.stringify(payload.params) : null, at]);
+        // sub_id_N from the postback overwrite the click's parameters, so reports by sub_id show the network's values.
+        if (payload.params && Object.keys(payload.params).length)
+          await query(`UPDATE clicks SET params = COALESCE(params, '{}'::jsonb) || $2::jsonb WHERE click_id = $1`, [payload.clickId, JSON.stringify(payload.params)]);
       }
     }).catch((error) => { onError(type, error); });
     // A logging callback must not cause an unhandled rejected mirror promise.

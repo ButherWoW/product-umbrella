@@ -116,3 +116,18 @@ test('an empty PostgreSQL mirror result cannot hide a conversion already in JSON
   assert.equal(await hasRecordedConversion({ clickId: ID, eventsFile: `${eventsFile}.missing`,
     db: { query: async () => ({ rows: [{}] }) } }), true);
 });
+
+test('tid: a new tid of the same click is another conversion, the same tid is a duplicate or a status update', async () => {
+  const rows = new Map();
+  const recorder = createConversionRecorder({ findClick: async () => click, hasConversion: async () => false,
+    currentConversion: async (id, tid) => rows.get(`${id}|${tid}`) || null,
+    record: async (payload) => { rows.set(`${payload.clickId}|${payload.tid || ''}`, { status: payload.status || 'sale', revenue: payload.revenue, currency: payload.currency }); return payload; } });
+  assert.deepEqual(await recorder({ clickId: ID, revenue: '10' }), { ok: true });
+  assert.deepEqual(await recorder({ clickId: ID, tid: 'up-1', revenue: '5' }), { ok: true, tid: 'up-1' });
+  await assert.rejects(recorder({ clickId: ID, tid: 'up-1', revenue: '5' }), { statusCode: 409 });
+  await assert.rejects(recorder({ clickId: ID, revenue: '10' }), { statusCode: 409 }, 'no tid = the main conversion, as before');
+  assert.deepEqual(await recorder({ clickId: ID, tid: 'up-1', status: 'rejected' }), { ok: true, status: 'rejected', updated: true, tid: 'up-1' });
+  assert.equal(rows.size, 2);
+  assert.equal(rows.get(`${ID}|up-1`).revenue, 5, 'status update keeps the amount of that tid');
+  assert.equal(rows.get(`${ID}|`).status, 'sale');
+});

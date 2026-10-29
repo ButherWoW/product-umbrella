@@ -42,18 +42,29 @@ export function reportFromRows(rows) {
 }
 
 // Every dimension uses the originating click, including conversions arriving later.
+// A click can have several conversions (main + upsells by tid); each tid counts, the click counts once.
 export function reportFromEvents(clicks, conversions) {
   const report = emptyReport();
-  const revenueByClick = new Map(conversions.map((item) => [item.clickId, item]));
+  // Latest event per (click, tid) wins.
+  const latest = new Map();
+  for (const item of conversions) latest.set(`${item.clickId}|${item.tid || ''}`, item);
+  const byClick = new Map();
+  for (const item of latest.values()) { const list = byClick.get(item.clickId); if (list) list.push(item); else byClick.set(item.clickId, [item]); }
   for (const click of clicks) {
-    const conversion = revenueByClick.get(click.clickId);
-    // Latest status wins; conversions without a status (written before statuses existed) are sales.
-    const status = conversion ? conversion.status || 'sale' : null;
-    const amount = Number(conversion?.revenue) || 0;
+    const counts = { clicks: 1, conversions: 0, revenue: Number(click.revenue) || 0, pendingRevenue: 0, cost: click.cost ?? 0, lpClicks: click.lpClicked ? 1 : 0,
+      uniqueClicks: click.uniqueCampaign === false ? 0 : 1, leads: 0, sales: 0, rejected: 0, trash: 0 };
+    for (const conversion of byClick.get(click.clickId) || []) {
+      // Latest status wins; conversions without a status (written before statuses existed) are sales.
+      const status = conversion.status || 'sale';
+      const amount = Number(conversion.revenue) || 0;
+      if (status === 'lead' || status === 'sale') counts.conversions += 1;
+      if (status === 'sale') { counts.revenue += amount; counts.sales += 1; }
+      if (status === 'lead') { counts.pendingRevenue += amount; counts.leads += 1; }
+      if (status === 'rejected') counts.rejected += 1;
+      if (status === 'trash') counts.trash += 1;
+    }
     add(report, [click.campaign, click.country || 'unknown', click.offerId || 'unknown',
-      click.stream || 'default', click.landingId || 'none'], { clicks: 1, conversions: status === 'lead' || status === 'sale' ? 1 : 0,
-      revenue: (status === 'sale' ? amount : 0) + (Number(click.revenue) || 0), pendingRevenue: status === 'lead' ? amount : 0, cost: click.cost ?? 0, lpClicks: click.lpClicked ? 1 : 0, uniqueClicks: click.uniqueCampaign === false ? 0 : 1,
-      leads: status === 'lead' ? 1 : 0, sales: status === 'sale' ? 1 : 0, rejected: status === 'rejected' ? 1 : 0, trash: status === 'trash' ? 1 : 0 });
+      click.stream || 'default', click.landingId || 'none'], counts);
   }
   return finish(report);
 }

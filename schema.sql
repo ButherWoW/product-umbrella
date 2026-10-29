@@ -76,13 +76,16 @@ CREATE TABLE IF NOT EXISTS clicks (
 );
 
 CREATE TABLE IF NOT EXISTS conversions (
-  click_id uuid PRIMARY KEY REFERENCES clicks(click_id),
+  click_id uuid NOT NULL REFERENCES clicks(click_id),
+  tid text NOT NULL DEFAULT '',  -- '' = main conversion; other values = upsells (postback tid)
   revenue numeric(12,4),
   currency text,
   status text NOT NULL DEFAULT 'sale' CHECK (status IN ('lead', 'sale', 'rejected', 'trash')),
+  params jsonb,                  -- sub_id_N sent with the postback
   updated_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE UNIQUE INDEX IF NOT EXISTS conversions_click_tid_idx ON conversions(click_id, tid);
 CREATE TABLE IF NOT EXISTS bots (
   id BIGSERIAL PRIMARY KEY, campaign TEXT NOT NULL, offer_id TEXT, stream TEXT,
   user_agent TEXT, ip TEXT, reason TEXT, isp TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now()

@@ -453,6 +453,8 @@
           { "name": "click_id", "in": "query", "required": true, "schema": { "type": "string", "format": "uuid" } },
           { "name": "revenue", "in": "query", "schema": { "type": "number" }, "description": "Without revenue (or payout) a CPA offer's payout is recorded" },
           { "name": "payout", "in": "query", "schema": { "type": "number" }, "description": "Alias of revenue" },
+          { "name": "tid", "in": "query", "schema": { "type": "string", "maxLength": 200 }, "description": "Transaction id: another tid of the same click is a separate conversion (upsell); the same tid again is a duplicate or a status update" },
+          { "name": "sub_id_1", "in": "query", "schema": { "type": "string" }, "description": "sub_id_1..sub_id_30: overwrite the click's parameters (reports by sub_id show the postback value)" },
           { "name": "currency", "in": "query", "schema": { "type": "string" } },
           {
             "name": "status",

@@ -9,7 +9,7 @@ import { reportFromRows, reportFromEvents, metrics } from './stats-report.js';
 import { createUserStore, readCookie, SESSION_TTL_MS, API_KEY_PREFIX } from './auth.js';
 import { createRates, normalizeCurrency } from './currency.js';
 import { readEventLog } from './event-logs.js';
-import { createConversionRecorder, hasRecordedConversion, findRecordedConversion } from './conversion-recorder.js';
+import { createConversionRecorder, hasRecordedConversion, findRecordedConversion, conversionKey } from './conversion-recorder.js';
 import { createEventMirror } from './event-mirror.js';
 import { createConversionCapCounter, resolveOffer } from './conversion-cap.js';
 import { createJournalGate, filterJournal, campaignPlan, retentionPlan, clearCampaignRows, retentionRows } from './retention.js';
@@ -50,6 +50,16 @@ function sqlFx(params, currency) {
     cost: `COALESCE(SUM(c.cost), 0) * $${n}::float`,
     // CPC offer payout booked on the click itself (stored in DEFAULT_CURRENCY, like cost).
     clickRevenue: `COALESCE(SUM(c.revenue), 0) * $${n}::float`,
+    // Per-click reports: a click can have several conversions (upsells, one per tid), so they are summed per click
+    // first (alias cvs) and the click row is never duplicated — clicks and cost stay exact.
+    join: `LEFT JOIN LATERAL (SELECT
+        COUNT(*) FILTER (WHERE x.status IN ('lead', 'sale')) AS conversions,
+        COUNT(*) FILTER (WHERE x.status = 'lead') AS leads, COUNT(*) FILTER (WHERE x.status = 'sale') AS sales,
+        COUNT(*) FILTER (WHERE x.status = 'rejected') AS rejected, COUNT(*) FILTER (WHERE x.status = 'trash') AS trash,
+        COALESCE(SUM(${amount.replaceAll('cv.', 'x.')}) FILTER (WHERE x.status = 'sale'), 0) AS revenue,
+        COALESCE(SUM(${amount.replaceAll('cv.', 'x.')}) FILTER (WHERE x.status = 'lead'), 0) AS pending
+      FROM conversions x WHERE x.click_id = c.click_id) cvs ON true`,
+    sum: (column) => `COALESCE(SUM(cvs.${column}), 0)`,
   };
 }
 // JSONL equivalents.
@@ -467,6 +477,13 @@ function visitorProfile(req) {
 // Traffic-source parameters recorded per click (Keitaro "Параметры" tab). paramMap renames the query key per campaign.
 const TRACK_FIELDS = ['keyword', 'source', 'external_id', 'creative_id', 'ad_campaign_id', ...Array.from({ length: 30 }, (_, i) => `sub_id_${i + 1}`)];
 const MAPPABLE_FIELDS = [...TRACK_FIELDS, 'cost'];
+// sub_id_1..30 sent with a postback (G6): they overwrite the click's parameters. Empty values are ignored.
+const SUB_ID_FIELDS = TRACK_FIELDS.filter((field) => field.startsWith('sub_id_'));
+function postbackClickParams(query) {
+  const params = {};
+  for (const field of SUB_ID_FIELDS) { const v = query.get(field); if (v) params[field] = v.slice(0, 255); }
+  return params;
+}
 function trackedParams(query, paramMap) {
   const params = {};
   for (const field of TRACK_FIELDS) { const v = query.get(paramMap?.[field] || field); if (v) params[field] = v.slice(0, 255); }
@@ -649,15 +666,27 @@ async function isDuplicateClick(campaign, ip, windowMinutes) {
 // Sum revenue from conversions today for a campaign. Non-fatal — returns 0 on error.
 // Conversions with statuses: a click's latest conversion event wins. Events written before statuses existed are sales.
 // "Conversions" = lead + sale; revenue counts only sales (lead amounts are pending revenue).
+// Keyed by click and tid: upsells (other tids) are separate conversions of the same click.
 function latestConversions(lines) {
   const latest = new Map();
-  for (const item of lines) if (item?.type === 'conversion') latest.set(item.clickId, item);
+  for (const item of lines) if (item?.type === 'conversion') latest.set(conversionKey(item), item);
   return latest;
+}
+// clickId → [conversions] (main conversion and upsells).
+function conversionsByClick(conversions) {
+  const byClick = new Map();
+  for (const cv of conversions) { const list = byClick.get(cv.clickId); if (list) list.push(cv); else byClick.set(cv.clickId, [cv]); }
+  return byClick;
+}
+// sub_id_N sent with postbacks overwrite the click's parameters (journal order; PostgreSQL does the same in the mirror).
+function withPostbackParams(lines) {
+  const updates = new Map();
+  for (const item of lines) if (item?.type === 'conversion' && item.params) updates.set(item.clickId, { ...(updates.get(item.clickId) || {}), ...item.params });
+  if (!updates.size) return lines;
+  return lines.map((item) => (item?.type === 'click' && updates.has(item.clickId) ? { ...item, params: { ...(item.params || {}), ...updates.get(item.clickId) } } : item));
 }
 const conversionCounts = (cv) => ['lead', 'sale'].includes(cv?.status || 'sale');
 const saleRevenue = (cv) => ((cv?.status || 'sale') === 'sale' ? Number(cv.revenue) || 0 : 0);
-const SQL_CONVERSIONS = "COUNT(cv.click_id) FILTER (WHERE cv.status IN ('lead', 'sale'))";
-const SQL_REVENUE = "COALESCE(SUM(cv.revenue) FILTER (WHERE cv.status = 'sale'), 0)";
 
 async function todayRevenue(campaign) {
   const today = new Date().toISOString().slice(0, 10);
@@ -968,16 +997,16 @@ async function stats({ campaign = null, allowed = null, from = null, to = null, 
           COUNT(c.lp_clicked_at)::int             AS lp_clicks,
           COUNT(c.click_id)::int                  AS clicks,
           COUNT(c.click_id) FILTER (WHERE c.is_unique_campaign)::int AS unique_clicks,
-          ${SQL_CONVERSIONS}::int                 AS conversions,
-          (${fx.revenue} + ${fx.clickRevenue})::float AS revenue,
-          COUNT(cv.click_id) FILTER (WHERE cv.status = 'lead')::int     AS leads,
-          COUNT(cv.click_id) FILTER (WHERE cv.status = 'sale')::int     AS sales,
-          COUNT(cv.click_id) FILTER (WHERE cv.status = 'rejected')::int AS rejected,
-          COUNT(cv.click_id) FILTER (WHERE cv.status = 'trash')::int    AS trash,
-          ${fx.pending}::float AS pending_revenue,
+          ${fx.sum('conversions')}::int           AS conversions,
+          (${fx.sum('revenue')} + ${fx.clickRevenue})::float AS revenue,
+          ${fx.sum('leads')}::int                 AS leads,
+          ${fx.sum('sales')}::int                 AS sales,
+          ${fx.sum('rejected')}::int              AS rejected,
+          ${fx.sum('trash')}::int                 AS trash,
+          ${fx.sum('pending')}::float AS pending_revenue,
           ${fx.cost}::float                       AS cost
         FROM clicks c
-        LEFT JOIN conversions cv USING (click_id)
+        ${fx.join}
         ${where}
         GROUP BY c.campaign, c.country, c.offer_id, c.stream, c.landing_id
       `, params);
@@ -1017,11 +1046,11 @@ async function stats({ campaign = null, allowed = null, from = null, to = null, 
     });
     const visibleClickIds = new Set(clicks.map((c) => c.clickId));
     const conversions = [...latestConversions(lines).values()].filter((item) => visibleClickIds.has(item.clickId));
-    const conversionByClick = new Map(conversions.map((item) => [item.clickId, item]));
+    const conversionByClick = conversionsByClick(conversions);
     const lpClicked = new Set(lines.filter((item) => item.type === 'lp_click').map((item) => item.clickId));
     const report = { ...reportFromEvents(clicks.map((c) => convertClickCost(lpClicked.has(c.clickId) ? { ...c, lpClicked: true } : c, currency)), conversions.map((cv) => convertConversion(cv, currency))), currency };
     report.bySource = Object.create(null); report.byNetwork = Object.create(null);
-    for (const click of clicks) { const source = campaigns.get(click.campaign)?.sourceId || 'none'; const network = offers.get(click.offerId)?.networkId || 'none'; const cv = conversionByClick.get(click.clickId); const one = reportFromEvents([click], cv ? [cv] : []); for (const [key,id] of [['bySource',source],['byNetwork',network]]) { report[key][id] ||= { clicks:0, conversions:0, revenue:0, cost:0, uniqueClicks:0 }; for (const f of ['clicks','conversions','revenue','cost','uniqueClicks','leads','sales','rejected','trash','pendingRevenue']) report[key][id][f] = (report[key][id][f] || 0) + (one[f] || 0); } }
+    for (const click of clicks) { const source = campaigns.get(click.campaign)?.sourceId || 'none'; const network = offers.get(click.offerId)?.networkId || 'none'; const one = reportFromEvents([click], conversionByClick.get(click.clickId) || []); for (const [key,id] of [['bySource',source],['byNetwork',network]]) { report[key][id] ||= { clicks:0, conversions:0, revenue:0, cost:0, uniqueClicks:0 }; for (const f of ['clicks','conversions','revenue','cost','uniqueClicks','leads','sales','rejected','trash','pendingRevenue']) report[key][id][f] = (report[key][id][f] || 0) + (one[f] || 0); } }
     report.bySource = Object.fromEntries(Object.entries(report.bySource).map(([k,v]) => [k, metrics(v)])); report.byNetwork = Object.fromEntries(Object.entries(report.byNetwork).map(([k,v]) => [k, metrics(v)]));
     return report;
   } catch (error) {
@@ -1044,9 +1073,9 @@ async function paramReport({ field, campaign, allowed = null, from, to, currency
       if (to) { values.push(`${to}T23:59:59Z`); conditions.push(`c.created_at <= $${values.length}`); }
       const fx = sqlFx(values, currency);
       const { rows } = await db.query(`
-        SELECT ${isColumn ? `COALESCE(c.${field}, '')` : "COALESCE(c.params->>$1, '')"} AS value, COUNT(c.click_id)::int AS clicks, COUNT(c.click_id) FILTER (WHERE c.is_unique_campaign IS DISTINCT FROM false)::int AS unique_clicks, ${SQL_CONVERSIONS}::int AS conversions,
-          (${fx.revenue} + ${fx.clickRevenue})::float AS revenue, ${fx.cost}::float AS cost
-        FROM clicks c LEFT JOIN conversions cv USING (click_id)
+        SELECT ${isColumn ? `COALESCE(c.${field}, '')` : "COALESCE(c.params->>$1, '')"} AS value, COUNT(c.click_id)::int AS clicks, COUNT(c.click_id) FILTER (WHERE c.is_unique_campaign IS DISTINCT FROM false)::int AS unique_clicks, ${fx.sum('conversions')}::int AS conversions,
+          (${fx.sum('revenue')} + ${fx.clickRevenue})::float AS revenue, ${fx.cost}::float AS cost
+        FROM clicks c ${fx.join}
         ${conditions.length ? 'WHERE ' + conditions.join(' AND ') : ''}
         GROUP BY 1 ORDER BY clicks DESC LIMIT 500`, values);
       return rows.map(metrics);
@@ -1057,7 +1086,8 @@ async function paramReport({ field, campaign, allowed = null, from, to, currency
   catch (error) { if (error.code !== 'ENOENT') throw error; }
   const fromMs = from ? Date.parse(`${from}T00:00:00Z`) : null;
   const toMs = to ? Date.parse(`${to}T23:59:59Z`) : null;
-  const conv = latestConversions(lines);
+  lines = withPostbackParams(lines);
+  const conv = conversionsByClick(latestConversions(lines).values());
   const groups = new Map();
   for (const click of lines) {
     if (click.type !== 'click' || (campaign && click.campaign !== campaign) || (allowed && !allowed.includes(click.campaign))) continue;
@@ -1065,10 +1095,9 @@ async function paramReport({ field, campaign, allowed = null, from, to, currency
     if ((fromMs !== null && t < fromMs) || (toMs !== null && t > toMs)) continue;
     const key = (isColumn ? click[field] : click.params?.[field]) ?? '';
     const g = groups.get(key) || { value: key, clicks: 0, uniqueClicks: 0, conversions: 0, revenue: 0, cost: 0 };
-    const cv = conv.get(click.clickId);
     g.clicks += 1; if (click.uniqueCampaign !== false) g.uniqueClicks += 1; g.cost += (Number(click.cost) || 0) * rates.factor(rates.defaultCurrency, currency);
     g.revenue += (Number(click.revenue) || 0) * rates.factor(rates.defaultCurrency, currency);
-    if (cv && conversionCounts(cv)) { g.conversions += 1; g.revenue += saleRevenue(cv) * rates.factor(cv.currency, currency); }
+    for (const cv of conv.get(click.clickId) || []) if (conversionCounts(cv)) { g.conversions += 1; g.revenue += saleRevenue(cv) * rates.factor(cv.currency, currency); }
     groups.set(key, g);
   }
   return [...groups.values()].sort((a, b) => b.clicks - a.clicks).slice(0, 500).map(metrics);
@@ -1198,9 +1227,9 @@ const sourcePostbacks = createSourcePostbacks({
 
 const recordPostback = createConversionRecorder({
   findClick: getClickData,
-  hasConversion: (clickId) => hasRecordedConversion({ clickId, eventsFile, db,
+  hasConversion: (clickId, tid) => hasRecordedConversion({ clickId, tid, eventsFile, db,
     onFallback: (error) => console.warn('[db] hasConversion fallback:', error.message) }),
-  currentConversion: (clickId) => findRecordedConversion({ clickId, eventsFile, db,
+  currentConversion: (clickId, tid) => findRecordedConversion({ clickId, tid, eventsFile, db,
     onFallback: (error) => console.warn('[db] currentConversion fallback:', error.message) }),
   windowDaysForClick: (click) => campaigns.get(click.campaign)?.conversionWindowDays,
   // A postback without revenue earns the CPA offer's payout (CPC offers are paid per click, not here).
@@ -1792,6 +1821,7 @@ const server = http.createServer(async (req, res) => {
       try {
         // `payout` is an alias of `revenue`; without either, a CPA offer's payout is used (see recordPostback).
         const result = await recordPostback({ clickId: url.searchParams.get('click_id'),
+          tid: url.searchParams.get('tid'), params: postbackClickParams(url.searchParams),
           revenue: url.searchParams.get('revenue') || url.searchParams.get('payout'), currency: url.searchParams.get('currency'), status: url.searchParams.get('status') });
         return json(res, 200, result);
       } catch (error) {
@@ -2256,11 +2286,11 @@ const server = http.createServer(async (req, res) => {
               DATE_TRUNC('${trunc}', c.created_at) AS bucket,
               COUNT(c.click_id)::int                AS clicks,
               COUNT(c.click_id) FILTER (WHERE c.is_unique_campaign)::int AS unique_clicks,
-              ${SQL_CONVERSIONS}::int               AS conversions,
-              (${fx.revenue} + ${fx.clickRevenue})::float AS revenue,
+              ${fx.sum('conversions')}::int         AS conversions,
+              (${fx.sum('revenue')} + ${fx.clickRevenue})::float AS revenue,
               ${fx.cost}::float                     AS cost
             FROM clicks c
-            LEFT JOIN conversions cv USING (click_id)
+            ${fx.join}
             ${where}
             GROUP BY bucket ORDER BY bucket
           `, params);

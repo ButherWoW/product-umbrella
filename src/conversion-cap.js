@@ -59,19 +59,20 @@ export function createConversionCapCounter({ db = null, eventsFile, ttlMs = 3000
     try { text = await readFile(eventsFile, 'utf8'); } catch (error) { if (error.code === 'ENOENT') return 0; throw error; }
     const sinceMs = since.getTime();
     const clicks = new Set();
-    const conversions = new Map(); // clickId → { firstAt, status }
+    const conversions = new Map(); // clickId|tid → { clickId, firstAt, status } (upsells count like in PostgreSQL)
     for (const line of text.split('\n')) {
       if (!line.includes(offerId) && !line.includes('"conversion"')) continue;
       let item;
       try { item = JSON.parse(line); } catch { continue; }
       if (item?.type === 'click' && item.offerId === offerId) clicks.add(item.clickId);
       else if (item?.type === 'conversion') {
-        const prev = conversions.get(item.clickId);
-        conversions.set(item.clickId, { firstAt: prev?.firstAt ?? item.at, status: item.status || 'sale' });
+        const key = `${item.clickId}|${item.tid || ''}`;
+        const prev = conversions.get(key);
+        conversions.set(key, { clickId: item.clickId, firstAt: prev?.firstAt ?? item.at, status: item.status || 'sale' });
       }
     }
     let n = 0;
-    for (const [clickId, cv] of conversions) if (clicks.has(clickId) && ['lead', 'sale'].includes(cv.status) && Date.parse(cv.firstAt) >= sinceMs) n++;
+    for (const cv of conversions.values()) if (clicks.has(cv.clickId) && ['lead', 'sale'].includes(cv.status) && Date.parse(cv.firstAt) >= sinceMs) n++;
     return n;
   }
 

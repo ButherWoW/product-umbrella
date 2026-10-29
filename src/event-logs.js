@@ -66,7 +66,7 @@ function normalizeConversion(item, click = item) {
   const revenue = item.revenue === null || item.revenue === undefined ? null : Number(item.revenue);
   return { type: 'conversion', clickId, campaign: click.campaign ?? null,
     offerId, at, stream: click.stream || 'default', revenue: Number.isFinite(revenue) ? revenue : null, status: item.status || 'sale',
-    currency: item.currency ?? null, click_id: clickId, offer_id: offerId, created_at: at };
+    currency: item.currency ?? null, tid: item.tid || '', click_id: clickId, offer_id: offerId, created_at: at };
 }
 
 function matches(item, query) {
@@ -86,6 +86,7 @@ async function fromJsonl(kind, query, eventsFile) {
   const lines = createInterface({ input, crlfDelay: Infinity });
   const clicks = new Map();
   const events = [];
+  const postbackParams = new Map(); // sub_id_N from postbacks overwrite click parameters, as in PostgreSQL
   try {
     for await (const line of lines) {
       if (!line.trim()) continue;
@@ -93,9 +94,12 @@ async function fromJsonl(kind, query, eventsFile) {
       try { item = JSON.parse(line); } catch { continue; }
       if (!item || typeof item !== 'object' || typeof item.clickId !== 'string') continue;
       if (item.type === 'click') {
-        if (kind === 'clicks') events.push(normalizeClick(item));
+        if (kind === 'clicks') events.push(item);
         else clicks.set(item.clickId, item);
-      } else if (kind === 'conversions' && item.type === 'conversion') events.push(item);
+      } else if (item.type === 'conversion') {
+        if (kind === 'conversions') events.push(item);
+        else if (item.params) postbackParams.set(item.clickId, { ...(postbackParams.get(item.clickId) || {}), ...item.params });
+      }
     }
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
@@ -103,7 +107,8 @@ async function fromJsonl(kind, query, eventsFile) {
     lines.close();
     input.destroy();
   }
-  const rows = (kind === 'clicks' ? events
+  const rows = (kind === 'clicks'
+    ? events.map((item) => normalizeClick(postbackParams.has(item.clickId) ? { ...item, params: { ...(item.params || {}), ...postbackParams.get(item.clickId) } } : item))
     : events.map((item) => normalizeConversion(item, clicks.get(item.clickId) || {})))
     .filter((item) => matches(item, query))
     .sort((a, b) => (b.at || '').localeCompare(a.at || '') || String(b.clickId).localeCompare(String(a.clickId)));
@@ -124,7 +129,7 @@ async function fromPostgres(kind, query, db) {
   params.push(query.limit + 1, query.offset);
   const fields = kind === 'clicks'
     ? 'c.click_id, c.campaign, c.offer_id, c.stream, c.path, c.referrer, c.user_agent, c.subid, c.country, c.ip, c.params, c.cost, c.landing_id, c.device, c.os, c.browser, c.language, c.isp, c.connection, c.is_unique_campaign, c.is_unique_stream, c.is_unique_global, c.created_at'
-    : 'cv.click_id, c.campaign, c.offer_id, c.stream, cv.revenue, cv.currency, cv.status, cv.created_at';
+    : 'cv.click_id, c.campaign, c.offer_id, c.stream, cv.revenue, cv.currency, cv.status, cv.tid, cv.created_at';
   const source = kind === 'clicks' ? 'clicks c' : 'conversions cv JOIN clicks c USING (click_id)';
   const { rows } = await db.query(`SELECT ${fields} FROM ${source}
     ${conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''}
