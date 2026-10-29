@@ -428,6 +428,7 @@ async function pageDashboard() {
       const [s, series, recent, team] = await Promise.all([api('/stats' + qs({ from, to, campaign })), timeseries({ campaign, from, to }), api('/api/clicks' + qs({ from, to, campaign, limit: 10 })).catch(() => ({ clicks: [] })), api('/api/settings').catch(() => ({ buyerSharePct: 35 }))]);
       const sharePct = Number(team.buyerSharePct) || 0;
       const profit = (s.revenue || 0) - (s.cost || 0);
+      const top5 = (id, title, rows, nameOf, link) => h('div', { class: 'card' }, h('h2', {}, title), dataTable({ id: 'dash-t5-' + id, pageSize: 5, compact: true, totals: false, rows: [...rows].sort((a, b) => b.revenue - a.revenue).slice(0, 5), columns: [{ key: 'id', label: 'Название', fixed: true, cls: 'name', render: (r) => h('a', { href: link(r) }, nameOf(r)) }, ...metricCols().filter((c) => ['clicks', 'conversions', 'revenue', 'roi'].includes(c.key))] }));
       // The buyer earns a share of positive net profit; a loss means 0, not a negative payout.
       const buyerEarnings = Math.max(0, profit) * sharePct / 100;
       const isOwner = state.me?.user?.role === 'owner' || !state.me?.loginRequired;
@@ -450,6 +451,10 @@ async function pageDashboard() {
           { key: 'conversions', label: 'Конв.', color: '#e0496a', values: series.map((p) => p.conversions) },
           { key: 'revenue', label: 'Доход', color: '#e8913f', right: true, values: series.map((p) => p.revenue) },
         ], series)),
+        h('div', { class: 'grid-2', style: 'margin-bottom:14px' },
+          top5('camp', 'Топ кампаний', groupRows(s.byCampaign), (r) => state.campaigns[r.id]?.name || r.id, (r) => '#/reports' + qs({ group: 'stream', campaign: r.id })),
+          top5('offer', 'Топ офферов', groupRows(s.byOffer), (r) => r.id, (r) => '#/reports' + qs({ group: 'country', offer: r.id })),
+          top5('geo', 'Топ стран', groupRows(s.byCountry), (r) => r.id, (r) => '#/reports' + qs({ group: 'campaign', country: r.id }))),
         isOwnerView() ? h('div', { class: 'card', style: 'margin-bottom:14px' }, h('h2', {}, 'Баеры'), dataTable({
           id: 'dash-buyers', compact: true, pageSize: 50,
           rows: Object.values(Object.entries(s.byCampaign || {}).reduce((acc, [cid, v]) => {
