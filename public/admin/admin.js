@@ -1018,6 +1018,7 @@ async function pageNetworks() {
 }
 
 async function pageOffers() {
+  const stateFilter = h('select', { class: 'select', 'aria-label': 'Состояние', onchange: () => load() }, [['', 'Все состояния'], ['active', 'Неархивные'], ['archived', 'Архив']].map(([v, l]) => h('option', { value: v }, l)));
   const table = dataTable({
     id: 'offers', pageSize: 250,
     columns: [
@@ -1038,7 +1039,7 @@ async function pageOffers() {
   });
   put(view, 
     h('div', { class: 'toolbar' }, h('button', { class: 'btn primary', onclick: () => offerModal(null, load) }, 'Создать')),
-    h('div', { class: 'toolbar' }, periodControl(() => load()), currencyControl(() => load()),
+    h('div', { class: 'toolbar' }, stateFilter, periodControl(() => load()), currencyControl(() => load()),
       h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'),
       h('button', { class: 'btn square', title: 'Колонки', 'aria-label': 'Колонки', onclick: () => table.chooser() }, '⚙')),
     table);
@@ -1046,7 +1047,10 @@ async function pageOffers() {
     try {
       await loadRefs();
       const s = await api('/stats' + qs(periodRange()));
-      table.setRows(Object.entries(state.offers).map(([id, o]) => ({ id, ...o, clicks: s.byOffer[id]?.clicks || 0, uniqueClicks: s.byOffer[id]?.uniqueClicks || 0, cost: s.byOffer[id]?.cost || 0, conversions: s.byOffer[id]?.conversions || 0, revenue: s.byOffer[id]?.revenue || 0 })));
+      let rows = Object.entries(state.offers).map(([id, o]) => ({ id, ...o, clicks: s.byOffer[id]?.clicks || 0, uniqueClicks: s.byOffer[id]?.uniqueClicks || 0, cost: s.byOffer[id]?.cost || 0, conversions: s.byOffer[id]?.conversions || 0, revenue: s.byOffer[id]?.revenue || 0 }));
+      if (stateFilter.value === 'archived') rows = rows.filter((r) => r.archived);
+      else if (!stateFilter.value) rows = rows.filter((r) => !r.archived);
+      table.setRows(rows);
     } catch (e) { toast('Ошибка загрузки офферов: ' + e.message, true); }
   }
   load();
