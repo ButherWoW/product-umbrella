@@ -333,3 +333,20 @@ test('device/os/browser/language reports and day-parting streams', { timeout: 15
     for (let i = 0; i < 5; i++) assert.equal(new URL((await hit('/r/sched')).headers.get('location')).host, 'example.com');
   });
 });
+
+test('CSV export: groups, currency, formula-injection safe', { timeout: 15000 }, async (t) => {
+  await withServer(t, {}, async ({ url, post, hit }) => {
+    await post('/api/campaigns', { id: 'exp', name: 'Export' });
+    await hit('/r/exp/offer-1?sub_id_1=%3DHYPERLINK(%22x%22)');
+    const res = await fetch(url + '/stats/export?group=campaign');
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type'), /text\/csv/);
+    const text = (await res.text()).replace(/^﻿/, '');
+    const [header, ...lines] = text.trim().split('\n');
+    assert.ok(header.startsWith('group,clicks,conversions,revenue,cost,cr,epc,rpm,uniqueClicks'));
+    assert.ok(lines.some((l) => l.startsWith('exp,1,0,0,0')));
+    const byParam = (await (await fetch(url + '/stats/export?group=sub_id_1')).text()).replace(/^﻿/, '');
+    assert.ok(byParam.includes(`"'=HYPERLINK(""x"")"`), 'a value starting with = is neutralised for spreadsheets');
+    assert.equal((await fetch(url + '/stats/export?group=nope')).status, 400);
+  });
+});

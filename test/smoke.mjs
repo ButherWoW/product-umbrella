@@ -66,6 +66,9 @@ try {
   assert.equal(report.byCampaign['paid-test'].conversions, 1);
   assert.equal(report.byCampaign['camp-b'].clicks, 1);
   assert.equal(report.byCampaign['camp-b'].conversions, 1);
+  const exportResponse = await fetch('http://127.0.0.1:4199/stats/export?group=country');
+  assert.equal(exportResponse.status, 200);
+  assert.match(await exportResponse.text(), /group,clicks,conversions,revenue/);
   const clickLog = await (await fetch('http://127.0.0.1:4199/api/clicks?campaign=paid-test&limit=10')).json();
   assert.ok(Array.isArray(clickLog.clicks));
   assert.ok(clickLog.clicks.length >= 1);

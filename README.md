@@ -76,6 +76,10 @@ Tracking URL принимает `utm_source`, `utm_medium`, `utm_campaign`, `utm
 - `conditions.mode: "or"` — поток подходит, если сработал любой из заданных фильтров (по умолчанию все — «И»).
 - Кампания: `redirectMethod` — `http` (302, по умолчанию), `meta` (страница с meta refresh) или `js` (location.replace + meta в noscript). URL в странице экранируется.
 
+## Выгрузка CSV
+
+`GET /stats/export?group=campaign|offer|stream|landing|country|sub_id_N|keyword|source|…|device|os|browser|language&from&to&campaign&currency&subid&country&offer&stream` — CSV (UTF-8 с BOM для Excel): `group,clicks,conversions,revenue,cost,cr,epc,rpm,uniqueClicks,leads,sales,rejected,pendingRevenue,profit,roi`. Суммы в выбранной валюте, баер получает только свои кампании, значения, начинающиеся с `=`, `+`, `-`, `@`, экранируются от выполнения как формулы.
+
 ## Устройства, ОС, браузеры, языки
 
 Клик хранит `device`, `os`, `browser`, `language`. `GET /stats/params?field=device|os|browser|language` группирует по ним так же, как по sub_id (в /admin — пресеты отчёта «Устройство», «ОС», «Браузер», «Язык»).

@@ -1232,6 +1232,31 @@ const server = http.createServer(async (req, res) => {
         stream: url.searchParams.get('stream') || null,
       }));
     }
+    // CSV export for spreadsheets and scripts: GET /stats/export?group=campaign|offer|stream|landing|country|day|hour|<param>&from&to&campaign&currency
+    if (url.pathname === '/stats/export' && req.method === 'GET') {
+      const group = url.searchParams.get('group') || 'campaign';
+      const currency = reportCurrency(url.searchParams.get('currency'));
+      const from = url.searchParams.get('from') || null;
+      const to = url.searchParams.get('to') || null;
+      if ((from && !/^\d{4}-\d{2}-\d{2}$/.test(from)) || (to && !/^\d{4}-\d{2}-\d{2}$/.test(to))) return json(res, 400, { error: 'invalid_date' });
+      const campaign = req.scope?.campaign || null;
+      const allowed = req.scope?.allowed || null;
+      const GROUP_PROP = { campaign: 'byCampaign', offer: 'byOffer', stream: 'byStream', landing: 'byLanding', country: 'byCountry' };
+      let rows;
+      if (GROUP_PROP[group]) {
+        const report = await stats({ campaign, allowed, from, to, currency, subid: url.searchParams.get('subid') || null,
+          country: url.searchParams.get('country') || null, offer: url.searchParams.get('offer') || null, stream: url.searchParams.get('stream') || null });
+        rows = Object.entries(report[GROUP_PROP[group]]).map(([key, v]) => ({ key, ...v }));
+      } else if (TRACK_FIELDS.includes(group) || DIMENSION_FIELDS.includes(group)) {
+        rows = (await paramReport({ field: group, campaign, allowed, from, to, currency })).map((r) => ({ key: r.value, ...r }));
+      } else return json(res, 400, { error: 'invalid_group' });
+      const columns = ['key', 'clicks', 'conversions', 'revenue', 'cost', 'cr', 'epc', 'rpm', 'uniqueClicks', 'leads', 'sales', 'rejected', 'pendingRevenue', 'profit', 'roi'];
+      // Cells starting with = + - @ are prefixed so spreadsheets do not run them as formulas.
+      const cell = (v) => { let text = v === null || v === undefined ? '' : typeof v === 'number' ? String(Math.round(v * 10000) / 10000) : String(v); if (/^[=+\-@]/.test(text) && typeof v !== 'number') text = `'${text}`; return /[",\n;]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text; };
+      const csv = [['group', ...columns.slice(1)].join(','), ...rows.map((r) => columns.map((c) => cell(r[c])).join(','))].join('\n') + '\n';
+      res.writeHead(200, { 'content-type': 'text/csv; charset=utf-8', 'content-disposition': `attachment; filename="umbrella-${group}-${currency}.csv"`, 'cache-control': 'no-store' });
+      return res.end('\ufeff' + csv);
+    }
     if (url.pathname === '/api/clicks' && req.method === 'GET') {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       return json(res, 200, await readEventLog({ kind: 'clicks', params: url.searchParams, eventsFile, db, allowedCampaigns: req.scope?.allowed || null,
