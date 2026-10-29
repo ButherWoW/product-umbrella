@@ -154,6 +154,34 @@ try {
   await page.locator('.chip-btn.on', { hasText: 'Оффер' }).waitFor();
   assert.equal(await page.getByLabel('Период').inputValue(), 'last_7_days', 'Rep-2 period restored');
 
+  // D10: black/white lists for parameter reports
+  await api('/api/campaigns', { id: 'd10-bw', name: 'D10 BW', streams: [{ name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] }], costModel: 'cpc', cpc: 1.0 });
+  const d10ra = await fetch(server.url + '/r/d10-bw?sub_id_1=value-a', { redirect: 'manual' });
+  const d10cid = new URL(d10ra.headers.get('location')).searchParams.get('click_id');
+  await fetch(`${server.url}/postback?secret=conversion-test-secret&click_id=${d10cid}&revenue=10&currency=USD`);
+  await fetch(server.url + '/r/d10-bw?sub_id_1=value-b', { redirect: 'manual' });
+  await fetch(server.url + '/r/d10-bw?sub_id_1=value-b', { redirect: 'manual' });
+  await page.goto(server.url + '/admin#/reports?field=sub_id_1&campaign=d10-bw');
+  await page.getByRole('heading', { name: 'Отчёт' }).waitFor();
+  await page.locator('table.grid tbody tr').first().waitFor();
+  assert.ok(await page.getByRole('button', { name: 'Списки' }).isVisible(), 'lists button visible when list-type parameter field selected');
+  await page.getByRole('button', { name: 'Списки' }).click();
+  const listsDialog = page.getByRole('dialog', { name: 'Списки' });
+  await listsDialog.waitFor();
+  await listsDialog.getByLabel('Минимум кликов').fill('1');
+  await listsDialog.getByLabel('Минимум кликов').dispatchEvent('input');
+  await page.waitForTimeout(150);
+  const listOrder = await listsDialog.evaluate((el) => {
+    const headings = [...el.querySelectorAll('h3')].map((h) => h.textContent.trim());
+    const texts = [...el.querySelectorAll('h3 + div')].map((d) => d.textContent.replace('Копировать', '').trim());
+    return headings.map((h, i) => ({ list: h, values: texts[i] || '' }));
+  });
+  const blackEntry = listOrder.find((e) => e.list === 'Чёрный список');
+  const whiteEntry = listOrder.find((e) => e.list === 'Белый список');
+  assert.ok(blackEntry?.values.includes('value-b'), `black list should contain value-b, got: ${blackEntry?.values}`);
+  assert.ok(whiteEntry?.values.includes('value-a'), `white list should contain value-a, got: ${whiteEntry?.values}`);
+  await page.keyboard.press('Escape');
+
   assert.deepEqual(errors, []);
 
   // Accounts: a REQUIRE_LOGIN install starts with the setup screen; owner creates a buyer; logout returns to login.
