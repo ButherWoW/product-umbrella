@@ -287,11 +287,14 @@ const metricCols = (opts = {}) => [
   { key: 'conversions', label: 'Конв.', title: 'Конверсии', num: true, render: (r) => num(r.conversions), total: (rs) => num(sum(rs, 'conversions')) },
   { key: 'cr', label: 'CR', title: 'CR — коэффициент конверсии', num: true, value: (r) => ratio(r.conversions, r.clicks), render: (r) => pct(ratio(r.conversions, r.clicks)), total: (rs) => pct(ratio(sum(rs, 'conversions'), sum(rs, 'clicks'))) },
   { key: 'revenue', label: 'Доход', num: true, render: (r) => money(r.revenue), total: (rs) => money(sum(rs, 'revenue')) },
+  { key: 'cost', label: 'Расход', num: true, render: (r) => money(r.cost), total: (rs) => money(sum(rs, 'cost')) },
+  { key: 'profit', label: 'Прибыль', num: true, value: (r) => (r.profit || 0), render: (r) => h('span', { class: (r.profit || 0) >= 0 ? 'pos' : 'neg' }, money(r.profit)), total: (rs) => { const p = sum(rs, 'revenue') - sum(rs, 'cost'); return h('span', { class: p >= 0 ? 'pos' : 'neg' }, money(p)); } },
+  { key: 'roi', label: 'ROI', num: true, value: (r) => ratio(r.revenue - r.cost, r.cost), render: (r) => pct(ratio(r.revenue - r.cost, r.cost)), total: (rs) => pct(ratio(sum(rs, 'revenue') - sum(rs, 'cost'), sum(rs, 'cost'))) },
   { key: 'epc', label: 'EPC', title: 'EPC — доход с клика', num: true, value: (r) => ratio(r.revenue, r.clicks), render: (r) => money4(ratio(r.revenue, r.clicks)), total: (rs) => money4(ratio(sum(rs, 'revenue'), sum(rs, 'clicks'))) },
   { key: 'rpm', label: 'RPM', title: 'RPM — доход на 1000 кликов', num: true, hidden: !opts.rpm, value: (r) => ratio(r.revenue * 1000, r.clicks), render: (r) => money(ratio(r.revenue * 1000, r.clicks)), total: (rs) => money(ratio(sum(rs, 'revenue') * 1000, sum(rs, 'clicks'))) },
 ];
 const sum = (rows, key) => rows.reduce((s, r) => s + (Number(r[key]) || 0), 0);
-const groupRows = (obj) => Object.entries(obj || {}).map(([id, v]) => ({ id, clicks: v.clicks || 0, conversions: v.conversions || 0, revenue: v.revenue || 0 }));
+const groupRows = (obj) => Object.entries(obj || {}).map(([id, v]) => ({ id, clicks: v.clicks || 0, conversions: v.conversions || 0, revenue: v.revenue || 0, cost: v.cost || 0, profit: v.profit || 0, roi: v.roi || 0 }));
 const trackingUrl = (id) => `${location.origin}${BASE}/r/${encodeURIComponent(id)}`;
 const typeLabel = { regular: 'Обычный', fallback: 'Замыкающий', forced: 'Перехватывающий' };
 
@@ -368,7 +371,8 @@ async function pageDashboard() {
       }));
       put(body, 
         h('div', { class: 'kpis' }, kpi('Клики', num(s.clicks), 'var(--k1)'), kpi('Конверсии', num(s.conversions), 'var(--k3)'), kpi('CR', pct(ratio(s.conversions, s.clicks)), 'var(--k2)'),
-          kpi('Доход', money(s.revenue), 'var(--k5)'), kpi('EPC', money4(ratio(s.revenue, s.clicks)), 'var(--k6)'), kpi('RPM', money(ratio(s.revenue * 1000, s.clicks)), 'var(--k7)')),
+          kpi('Доход', money(s.revenue), 'var(--k5)'), kpi('Расход', money(s.cost), 'var(--k4)'), kpi('Прибыль', money(s.profit), 'var(--k8)'), kpi('ROI', pct(ratio(s.revenue - s.cost, s.cost)), 'var(--k9)'),
+          kpi('EPC', money4(ratio(s.revenue, s.clicks)), 'var(--k6)'), kpi('RPM', money(ratio(s.revenue * 1000, s.clicks)), 'var(--k7)')),
         h('div', { class: 'card', style: 'margin-bottom:14px' }, lineChart([
           { key: 'clicks', label: 'Клики', color: '#4d86f0', values: series.map((p) => p.clicks) },
           { key: 'conversions', label: 'Конв.', color: '#e0496a', values: series.map((p) => p.conversions) },
