@@ -305,10 +305,12 @@ function dataTable({ id, columns, rows = [], selectable = false, pageSize = 50, 
   function exportMenu(cols, all) {
     const wrap = h('span', { class: 'dropdown' });
     const plain = (c, r) => { const v = valueOf(c, r); return v === null || v === undefined ? '' : String(v); };
+    // Text cells starting with = + - @ tab or CR get a leading ' so spreadsheets do not run them as formulas (numbers stay as they are).
+    const cellText = (c, r) => { const v = valueOf(c, r), text = plain(c, r); return typeof v !== 'number' && /^[=+\-@\t\r]/.test(text) ? "'" + text : text; };
     const close = () => wrap.querySelector('.menu')?.remove();
     const csv = () => {
-      const esc = (v) => (/[",\n;]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v);
-      download(id + '.csv', 'text/csv;charset=utf-8', '﻿' + [cols.map((c) => esc(c.label)).join(','), ...all.map((r) => cols.map((c) => esc(plain(c, r))).join(','))].join('\n'));
+      const esc = (v) => (/[",\n\r;]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v);
+      download(id + '.csv', 'text/csv;charset=utf-8', '﻿' + [cols.map((c) => esc(c.label)).join(','), ...all.map((r) => cols.map((c) => esc(cellText(c, r))).join(','))].join('\n'));
       close();
     };
     const html = () => {
@@ -1964,7 +1966,7 @@ async function pageReports(params) {
       h('button', { class: 'btn', title: 'Скачать CSV', 'aria-label': 'CSV', onclick: () => {
         const tbl = holder.querySelector('table.grid');
         if (!tbl) { toast('Нет данных для экспорта', true); return; }
-        const esc = (v) => { const s = String(v ?? '').trim().replace(/\r/g, ''); const fc = s[0]; if (fc === '=' || fc === '+' || fc === '-' || fc === '@') return `"'${s.replace(/"/g, '""')}"`;  if (s.includes(',') || s.includes('"') || s.includes('\n')) return `"${s.replace(/"/g, '""')}"`;  return s; };
+        const esc = (v) => { const s = String(v ?? '').trim().replace(/\r/g, ''); const fc = s[0]; if (fc === '=' || fc === '+' || fc === '-' || fc === '@' || fc === '\t' || fc === '\r') return `"'${s.replace(/"/g, '""')}"`;  if (s.includes(',') || s.includes('"') || s.includes('\n')) return `"${s.replace(/"/g, '""')}"`;  return s; };
         const hdr = [...tbl.querySelectorAll('thead tr:first-child th')].map((th) => esc(th.textContent.trim()));
         const dataRows = [...tbl.querySelectorAll('tbody tr, tfoot tr')].filter((tr) => !tr.classList.contains('sub-row')).map((tr) => [...tr.querySelectorAll('td')].map((td) => esc(td.textContent.trim())).join(','));
         const csv = '﻿' + [hdr.join(','), ...dataRows].join('\r\n');
