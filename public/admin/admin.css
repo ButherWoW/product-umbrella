@@ -199,3 +199,7 @@ body.auth-mode .view { margin-left: 0; display: grid; place-items: start center;
 .ip-allowlist code { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
 .danger-zone { margin-top: 20px; padding: 14px; border: 1px solid var(--bad); border-radius: var(--radius); }
 .danger-zone h3 { margin: 0 0 6px; color: var(--bad); font-size: 14px; }
+/* User permissions: checkbox rows in the user dialogs; viewers get no write controls. */
+.check-line { display: flex; align-items: center; gap: 6px; margin: 4px 0; font-size: 13px; }
+.check-line[hidden] { display: none; }
+body.read-only:not(.auth-mode) .btn.primary, body.read-only:not(.auth-mode) .row-actions { display: none !important; }

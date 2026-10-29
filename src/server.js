@@ -12,6 +12,7 @@ import { createConversionRecorder, hasRecordedConversion, findRecordedConversion
 import { createEventMirror } from './event-mirror.js';
 import { createConversionCapCounter, resolveOffer } from './conversion-cap.js';
 import { createJournalGate, filterJournal, campaignPlan, retentionPlan, clearCampaignRows, retentionRows } from './retention.js';
+import { createBindingStore, bindingKey, boundChoice, streamRef, parseBindMode, parseBindTtl } from './visitor-binding.js';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const dataDir = process.env.DATA_DIR || join(root, 'data');
@@ -355,8 +356,18 @@ async function simulateClick(input, canSee) {
     const typeOf = (st) => st.type || 'regular';
     const forced = matching.find((st) => typeOf(st) === 'forced');
     const regular = matching.filter((st) => typeOf(st) === 'regular');
+    // Visitor binding is only known for a concrete visitor: IP + User-Agent, as on a live click.
+    let bound = null;
+    if (c.bindVisitors !== 'off' && ip && input.userAgent) {
+      const binding = visitorBindings.get(bindingKey(campaignId, ip, ua), c.bindTtlHours * 3600 * 1000, at.getTime());
+      bound = boundChoice({ mode: c.bindVisitors, binding, streams: c.streams || [], matches: (st) => streamMatches(st, visitor), excluded: capped,
+        pickOffer: (list) => list[0], pickLanding: (list) => list[0] });
+      step.binding = bound ? { applies: true, mode: c.bindVisitors, stream: bound.stream.name ?? null, ...(c.bindVisitors === 'stream_offer' ? { offerId: bound.offerId, landingId: bound.landingId } : {}), boundAt: new Date(binding.at).toISOString() }
+        : { applies: false, mode: c.bindVisitors, reason: binding ? 'привязанный поток или оффер больше не подходит — будет обычный выбор и новая привязка' : 'привязки нет или срок истёк' };
+    }
     let candidates;
-    if (forced) candidates = [{ stream: forced, share: 1 }];
+    if (bound) candidates = [{ stream: bound.stream, share: 1 }];
+    else if (forced) candidates = [{ stream: forced, share: 1 }];
     else if (regular.length) {
       if (c.streamRotation === 'position') candidates = [{ stream: regular[0], share: 1 }];
       else { const total = regular.reduce((t, st) => t + (st.weight || 1), 0); candidates = regular.map((st) => ({ stream: st, share: (st.weight || 1) / total })); }
@@ -374,10 +385,11 @@ async function simulateClick(input, canSee) {
     const bot = (c.botFilter && isBot(ua)) || (c.datacenterAsBot && network?.datacenter);
     const params = visitor.params;
     const destinations = top.action === 'url' ? [{ url: top.url, share: 100 }]
-      : (() => { const live = (top.offers || [{ offerId: top.offerId, weight: 1 }]).filter((o) => !capped.has(o.offerId)); const total = live.reduce((t, o) => t + (o.weight || 1), 0);
+      : (() => { const live = (top.offers || [{ offerId: top.offerId, weight: 1 }]).filter((o) => !capped.has(o.offerId) && (!bound || c.bindVisitors !== 'stream_offer' || o.offerId === bound.offerId)); const total = live.reduce((t, o) => t + (o.weight || 1), 0);
         return live.map((o) => { const used = routing.substitutes.get(o.offerId) || o.offerId;
           return { offerId: used, ...(used !== o.offerId ? { insteadOf: o.offerId } : {}), share: Math.round((o.weight || 1) / total * 1000) / 10, url: offers.get(used)?.url || null }; }); })();
-    const landing = top.landings?.length ? top.landings.map((l) => landings.get(l.landingId)?.url).filter(Boolean)[0] : null;
+    const landing = bound?.landingId && c.bindVisitors === 'stream_offer' ? landings.get(bound.landingId)?.url || null
+      : top.landings?.length ? top.landings.map((l) => landings.get(l.landingId)?.url).filter(Boolean)[0] : null;
     const vars = { ...params, click_id: 'SIMULATION', subid: query.get('subid') || '', campaign: campaignId, device: visitor.device, country: visitor.country || '', cost: '' };
     return finish({ outcome: bot ? 'bot' : 'click', status: 302, stream: top.name,
       ...(bot ? { reason: 'User-Agent бота или дата-центр при включённом фильтре' } : {}),
@@ -460,6 +472,7 @@ function detectDevice(ua) {
 // In-memory and bounded; after a restart the first repeat visit of a returning visitor counts as unique again.
 const seenVisitors = new Map();
 const SEEN_LIMIT = 300000;
+const visitorBindings = createBindingStore({ limit: SEEN_LIMIT });
 function firstVisit(key, windowMs, now = Date.now()) {
   const hash = createHash('sha1').update(key).digest('base64');
   const last = seenVisitors.get(hash);
@@ -789,6 +802,8 @@ function parseCampaign(id, value) {
     domain: DOMAIN_RE.test(String(value.domain || '').toLowerCase()) ? String(value.domain).toLowerCase() : null,
     streamRotation: value.streamRotation === 'position' ? 'position' : 'weight',
     uniquenessHours: Number.isInteger(value.uniquenessHours) && value.uniquenessHours >= 1 && value.uniquenessHours <= 720 ? value.uniquenessHours : 24,
+    bindVisitors: parseBindMode(value.bindVisitors),
+    bindTtlHours: parseBindTtl(value.bindTtlHours),
     ownerId: /^[0-9a-f-]{36}$/i.test(String(value.ownerId || '')) ? String(value.ownerId).toLowerCase() : null,
     redirectMethod: REDIRECT_METHODS.includes(value.redirectMethod) ? value.redirectMethod : 'http',
     blockedIps: parseIpRules(value.blockedIps),
@@ -1118,6 +1133,7 @@ function securityHeaders(res, path) {
 }
 
 function json(res, status, body) {
+  if (res.revenueFilter) body = stripRevenue(body, res.revenueFilter.urls);
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(body));
 }
@@ -1281,7 +1297,8 @@ function sendRedirect(res, location, method = 'http') {
 }
 
 // Buyers see and edit only their own campaigns; owners, the admin token and a fresh dev install see everything.
-const isBuyer = (req) => req.user?.role === 'buyer' && !bearerAuthorized(req);
+// A viewer is scoped like a buyer unless the owner gave it viewAll (it never writes anyway).
+const isBuyer = (req) => (req.user?.role === 'buyer' || (req.user?.role === 'viewer' && !req.user.viewAll)) && !bearerAuthorized(req);
 function scopeCampaigns(req) {
   if (!isBuyer(req)) return null;
   return [...campaigns].filter(([, c]) => c.ownerId === req.user.id).map(([id]) => id);
@@ -1294,6 +1311,36 @@ function campaignScope(req, requested) {
   return { campaign: requested, allowed };
 }
 const canEditCampaign = (req, c) => !isBuyer(req) || c?.ownerId === req.user.id;
+
+// Per-user permission flags (Keitaro «Права пользователей»). They never restrict the owner or ADMIN_TOKEN.
+const restrictedUser = (req) => Boolean(req.user) && req.user.role !== 'owner' && !bearerAuthorized(req);
+const hidesRevenue = (req) => restrictedUser(req) && req.user.hideRevenue === true;
+const isViewer = (req) => req.user?.role === 'viewer' && !bearerAuthorized(req);
+// hideRevenue removes these keys (not zeroes them: a zero profit or ROI would be a lie) at any depth of the response.
+const REVENUE_KEY = /revenue|profit|payout|earning|^(roi|epc|uepc|rpm)$/i;
+const URL_KEY = /^(url|postbackUrl)$/;
+function stripRevenue(value, urls) {
+  if (Array.isArray(value)) return value.map((v) => stripRevenue(v, urls));
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value).filter(([k]) => !REVENUE_KEY.test(k) && !(urls && URL_KEY.test(k))).map(([k, v]) => [k, stripRevenue(v, urls)]));
+}
+// Paths whose responses are filtered for a hideRevenue user; urls: also drop offer/postback URLs.
+function revenueFilterFor(path) {
+  if (path === '/stats' || path.startsWith('/stats/') || path === '/api/conversions') return { urls: false };
+  if (path === '/api/offers' || path.startsWith('/api/offers/') || path === '/api/audit' || path === '/api/simulate') return { urls: true };
+  return null;
+}
+// offersAccess 'own': ids of offers used in the streams of campaigns the user can see; null = no restriction.
+function visibleOfferIds(req) {
+  if (!restrictedUser(req) || req.user.offersAccess !== 'own') return null;
+  const allowed = scopeCampaigns(req);
+  const ids = new Set();
+  for (const [id, c] of campaigns) {
+    if (allowed && !allowed.includes(id)) continue;
+    for (const st of c.streams || []) (st.offers ? st.offers.map((o) => o.offerId) : st.offerId ? [st.offerId] : []).forEach((o) => ids.add(o));
+  }
+  return ids;
+}
 
 // Change history (Keitaro «Лог»): who changed what and when. Kept in the JSONL journal; never stores passwords.
 const PRIMITIVE = (v) => v === null || ['string', 'number', 'boolean'].includes(typeof v);
@@ -1372,11 +1419,27 @@ async function handleAuthRoute(req, res, url) {
   }
   if (path === '/api/users' && req.method === 'POST') {
     if (!isOwner) return json(res, 403, { error: 'owner_only' });
-    const created = await users.create({ email: body.email, password: body.password, role: body.role || 'buyer' });
-    await audit(req, 'create', 'user', created.id, null, { email: created.email, role: created.role });
+    const created = await users.create({ email: body.email, password: body.password, role: body.role || 'buyer', hideRevenue: body.hideRevenue, offersAccess: body.offersAccess, viewAll: body.viewAll });
+    await audit(req, 'create', 'user', created.id, null, { email: created.email, role: created.role, hideRevenue: created.hideRevenue, offersAccess: created.offersAccess, viewAll: created.viewAll });
     return json(res, 201, { user: created });
   }
   const userDelete = path.match(/^\/api\/users\/([0-9a-f-]{36})$/);
+  if (userDelete && req.method === 'PATCH') {
+    if (!isOwner) return json(res, 403, { error: 'owner_only' });
+    const id = userDelete[1];
+    const all = await users.list();
+    const target = all.find((u) => u.id === id);
+    if (!target) return json(res, 404, { error: 'user_not_found' });
+    const input = { role: body.role, hideRevenue: body.hideRevenue, offersAccess: body.offersAccess, viewAll: body.viewAll };
+    if (input.role !== undefined && input.role !== target.role) {
+      if (req.user?.id === id) return json(res, 409, { error: 'cannot_change_own_role' });
+      if (target.role === 'owner' && all.filter((u) => u.role === 'owner').length === 1) return json(res, 409, { error: 'last_owner' });
+    }
+    const updated = await users.update(id, input);
+    const view = (u) => ({ role: u.role, hideRevenue: u.hideRevenue, offersAccess: u.offersAccess, viewAll: u.viewAll });
+    await audit(req, 'update', 'user', id, view(target), view(updated));
+    return json(res, 200, { user: updated });
+  }
   if (userDelete && req.method === 'DELETE') {
     if (!isOwner) return json(res, 403, { error: 'owner_only' });
     const id = userDelete[1];
@@ -1442,6 +1505,12 @@ const server = http.createServer(async (req, res) => {
     if (requireLogin && isPrivatePath(url.pathname) && !req.user && !bearerAuthorized(req)) {
       if (url.pathname === '/dashboard') { res.writeHead(302, { location: `${basePath}/admin` }); return res.end(); }
       return json(res, 401, { error: 'login_required' });
+    }
+    // Read-only role: every write to the panel API is refused; signing in and out stays possible.
+    if (isViewer(req) && !['GET', 'HEAD'].includes(req.method) && isPrivatePath(url.pathname)) return json(res, 403, { error: 'read_only' });
+    if (hidesRevenue(req)) {
+      if (url.pathname === '/dashboard') { res.writeHead(302, { location: `${basePath}/admin` }); return res.end(); }
+      res.revenueFilter = revenueFilterFor(url.pathname);
     }
     if (url.pathname === '/stats' || url.pathname.startsWith('/stats/') || url.pathname === '/api/clicks' || url.pathname === '/api/conversions' || url.pathname === '/api/bots') {
       req.scope = campaignScope(req, url.searchParams.get('campaign') || null);
@@ -1597,7 +1666,12 @@ const server = http.createServer(async (req, res) => {
         if (!c.streams?.length) return json(res, 404, { error: 'no_streams_configured' });
         visitor.params = trackedParams(url.searchParams, c.paramMap);
         const routing = await offerRouting(c.streams);
-        const picked = pickStream(c.streams, visitor, routing.excluded, c.streamRotation);
+        // Visitor binding: the stream (and offer/landing) this IP + User-Agent got last time, while still valid.
+        const bindKey = c.bindVisitors !== 'off' ? bindingKey(campaignId, normalizeIp(clientIp(req)), req.headers['user-agent'] || '') : null;
+        const picked = (bindKey && boundChoice({ mode: c.bindVisitors, binding: visitorBindings.get(bindKey, c.bindTtlHours * 3600 * 1000), streams: c.streams,
+          matches: (st) => streamMatches(st, visitor), excluded: routing.excluded, pickOffer: weightedPick, pickLanding: weightedPick }))
+          || pickStream(c.streams, visitor, routing.excluded, c.streamRotation);
+        if (bindKey && picked) visitorBindings.set(bindKey, { stream: streamRef(c.streams, picked.stream), offerId: picked.offerId, landingId: picked.landingId || null });
         // A conversion-capped offer hands the click to its alternative; the click is recorded with the offer actually used.
         if (picked?.offerId && routing.substitutes.has(picked.offerId)) picked.offerId = routing.substitutes.get(picked.offerId);
         if (!picked) return json(res, 404, { error: 'no_matching_stream' });
@@ -1698,7 +1772,8 @@ const server = http.createServer(async (req, res) => {
       } else if (TRACK_FIELDS.includes(group) || DIMENSION_FIELDS.includes(group)) {
         rows = (await paramReport({ field: group, campaign, allowed, from, to, currency })).map((r) => ({ key: r.value, ...r }));
       } else return json(res, 400, { error: 'invalid_group' });
-      const columns = ['key', 'clicks', 'conversions', 'revenue', 'cost', 'cr', 'epc', 'rpm', 'uniqueClicks', 'leads', 'sales', 'rejected', 'pendingRevenue', 'profit', 'roi'];
+      const columns = ['key', 'clicks', 'conversions', 'revenue', 'cost', 'cr', 'epc', 'rpm', 'uniqueClicks', 'leads', 'sales', 'rejected', 'pendingRevenue', 'profit', 'roi']
+        .filter((c) => !hidesRevenue(req) || !REVENUE_KEY.test(c));
       // Cells starting with = + - @ are prefixed so spreadsheets do not run them as formulas.
       const cell = (v) => { let text = v === null || v === undefined ? '' : typeof v === 'number' ? String(Math.round(v * 10000) / 10000) : String(v); if (/^[=+\-@]/.test(text) && typeof v !== 'number') text = `'${text}`; return /[",\n;]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text; };
       const csv = [['group', ...columns.slice(1)].join(','), ...rows.map((r) => columns.map((c) => cell(r[c])).join(','))].join('\n') + '\n';
@@ -1822,12 +1897,15 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { id, ...updated });
     }
     if (url.pathname === '/api/offers' && req.method === 'GET') {
-      return json(res, 200, { offers: Object.fromEntries(offers) });
+      const visible = visibleOfferIds(req);
+      return json(res, 200, { offers: Object.fromEntries([...offers].filter(([id]) => !visible || visible.has(id))) });
     }
     if (url.pathname === '/api/offers' && req.method === 'POST') {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const body = await readJson(req);
       if (!/^[a-z0-9_-]{2,80}$/i.test(String(body.id || '')) || !/^https:\/\//i.test(String(body.url || ''))) return json(res, 400, { error: 'id_and_https_url_required' });
+      // offersAccess 'own' must not overwrite an offer the user cannot see.
+      if (offers.has(String(body.id)) && visibleOfferIds(req) && !visibleOfferIds(req).has(String(body.id))) return json(res, 409, { error: 'offer_id_taken' });
       if (body.networkId !== undefined && body.networkId !== null && !networks.has(String(body.networkId))) return json(res, 400, { error: 'network_not_found' });
       const capError = conversionCapError(String(body.id), body);
       if (capError) return json(res, 400, { error: capError });
@@ -1843,14 +1921,14 @@ const server = http.createServer(async (req, res) => {
     const offerClone = url.pathname.match(/^\/api\/offers\/([A-Za-z0-9_-]{2,80})\/clone$/);
     if (offerClone && req.method === 'POST') {
       if (!(await adminAuthorized(req))) return json(res,401,{error:'admin_authorization_required'});
-      const id=offerClone[1],cur=offers.get(id); if(!cur) return json(res,404,{error:'offer_not_found'});
+      const id=offerClone[1],cur=offers.get(id); if(!cur || (visibleOfferIds(req) && !visibleOfferIds(req).has(id))) return json(res,404,{error:'offer_not_found'});
       let nextId=`${id}-copy`, n=2; while(offers.has(nextId)) nextId=`${id}-copy${n++}`;
       const copy=parseOffer({...cur,name:`${cur.name||id} (копия)`,archived:false}); offers.set(nextId,copy); await persistOffer(nextId,copy); await audit(req,'create','offer',nextId,null,copy); return json(res,201,{id:nextId,...copy});
     }
     if (offerUpdate && req.method === 'PATCH') {
       const id = offerUpdate[1];
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
-      if (!offers.has(id)) return json(res, 404, { error: 'offer_not_found' });
+      if (!offers.has(id) || (visibleOfferIds(req) && !visibleOfferIds(req).has(id))) return json(res, 404, { error: 'offer_not_found' });
       const body = await readJson(req);
       const cur = offers.get(id);
       const newUrl = body.url !== undefined ? String(body.url) : cur.url;
@@ -1960,6 +2038,8 @@ const server = http.createServer(async (req, res) => {
         domain: body.domain === undefined ? cur.domain : body.domain,
         streamRotation: body.streamRotation === undefined ? cur.streamRotation : body.streamRotation,
         uniquenessHours: body.uniquenessHours === undefined ? cur.uniquenessHours : body.uniquenessHours,
+        bindVisitors: body.bindVisitors === undefined ? cur.bindVisitors : body.bindVisitors,
+        bindTtlHours: body.bindTtlHours === undefined ? cur.bindTtlHours : body.bindTtlHours,
         ownerId: body.ownerId === undefined || req.user?.role === 'buyer' ? cur.ownerId : body.ownerId,
         sourceId: body.sourceId === undefined ? cur.sourceId : body.sourceId,
         redirectMethod: body.redirectMethod === undefined ? cur.redirectMethod : body.redirectMethod,
@@ -1980,7 +2060,8 @@ const server = http.createServer(async (req, res) => {
     const clearStats = url.pathname.match(/^\/api\/campaigns\/([A-Za-z0-9_-]{2,80})\/clear-stats$/);
     if (clearStats && req.method === 'POST') {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
-      if (isBuyer(req)) return json(res, 403, { error: 'owner_only' });
+      // Owner only: buyers and viewers (even with viewAll or a personal API key) are refused.
+      if (restrictedUser(req)) return json(res, 403, { error: 'owner_only' });
       const id = clearStats[1];
       if (!campaigns.has(id)) return json(res, 404, { error: 'campaign_not_found' });
       const body = await readJson(req);
