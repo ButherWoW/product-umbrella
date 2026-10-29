@@ -551,8 +551,8 @@ async function pageCampaignEditor(id) {
   const src = isNew ? null : state.campaigns[id];
   if (!isNew && !src) { put(view, h('p', { class: 'err' }, 'Кампания не найдена: ' + id), h('a', { href: '#/campaigns' }, '← К кампаниям')); return; }
   const d = isNew
-    ? { id: Math.random().toString(36).slice(2, 10), name: '', active: true, dailyCap: null, totalCap: null, revenueCap: null, capUrl: null, geoCapUrl: null, allowGeos: [], allowDevices: [], allowOS: [], allowBrowsers: [], blockedIps: [], allowedIps: [], dedupeWindow: 0, botFilter: false, conversionWindowDays: null }
-    : { id, ...structuredClone(src) };
+    ? { id: Math.random().toString(36).slice(2, 10), name: '', active: true, dailyCap: null, totalCap: null, revenueCap: null, capUrl: null, geoCapUrl: null, allowGeos: [], allowDevices: [], allowOS: [], allowBrowsers: [], blockedIps: [], allowedIps: [], dedupeWindow: 0, botFilter: false, conversionWindowDays: null, paramMap: {}, costModel: 'none', cpc: null, costFromParam: false }
+    : { id, paramMap: {}, costModel: 'none', cpc: null, costFromParam: false, ...structuredClone(src) };
   d.streams = editableStreams(src?.streams);
   let dirty = false;
   const mark = () => { dirty = true; saveBtn.textContent = isNew ? 'Создать' : 'Сохранить •'; };
@@ -566,14 +566,23 @@ async function pageCampaignEditor(id) {
   };
 
   const left = tabs([
-    ['Общие', () => h('div', {},
-      field('Идентификатор', h('input', { class: 'input', value: d.id, readonly: !isNew, oninput: (e) => { d.id = e.target.value.trim(); mark(); } }), isNew ? 'Латиница, цифры, - и _. После создания не меняется.' : 'Используется в ссылке кампании.'),
-      field('Состояние', h('div', { class: 'radios' },
-        h('label', {}, h('input', { type: 'radio', name: 'cstate', checked: d.active, onchange: () => { d.active = true; mark(); } }), 'Включена'),
-        h('label', {}, h('input', { type: 'radio', name: 'cstate', checked: !d.active, onchange: () => { d.active = false; mark(); } }), 'Выключена'))),
-      field('Срок уникальности, минут', h('input', { class: 'input', type: 'number', min: 0, value: d.dedupeWindow || 0, oninput: bind('dedupeWindow', 'int') }), 'Повторный клик с того же IP в этом окне не считается. 0 — выключено.'),
-      field('Фильтр ботов', h('label', { class: 'radios' }, h('input', { type: 'checkbox', checked: d.botFilter, onchange: (e) => { d.botFilter = e.target.checked; mark(); } }), 'Не считать клики ботов'), 'Боты уходят на тот же оффер, но не попадают в статистику.'),
-      field('Окно конверсии, дней', h('input', { class: 'input', type: 'number', min: 1, max: 365, value: d.conversionWindowDays ?? '', placeholder: 'без ограничения', oninput: bind('conversionWindowDays', 'int') }), 'Постбэк на клик старше окна отклоняется.'))],
+    ['Общие', () => {
+      const cpcField = field('Стоимость клика', h('input', { class: 'input', type: 'number', min: 0, step: '0.0001', value: d.cpc ?? '', placeholder: '0.0000', oninput: bind('cpc', 'float') }));
+      cpcField.hidden = d.costModel !== 'cpc';
+      return h('div', {},
+        field('Идентификатор', h('input', { class: 'input', value: d.id, readonly: !isNew, oninput: (e) => { d.id = e.target.value.trim(); mark(); } }), isNew ? 'Латиница, цифры, - и _. После создания не меняется.' : 'Используется в ссылке кампании.'),
+        field('Состояние', h('div', { class: 'radios' },
+          h('label', {}, h('input', { type: 'radio', name: 'cstate', checked: d.active, onchange: () => { d.active = true; mark(); } }), 'Включена'),
+          h('label', {}, h('input', { type: 'radio', name: 'cstate', checked: !d.active, onchange: () => { d.active = false; mark(); } }), 'Выключена'))),
+        field('Срок уникальности, минут', h('input', { class: 'input', type: 'number', min: 0, value: d.dedupeWindow || 0, oninput: bind('dedupeWindow', 'int') }), 'Повторный клик с того же IP в этом окне не считается. 0 — выключено.'),
+        field('Фильтр ботов', h('label', { class: 'radios' }, h('input', { type: 'checkbox', checked: d.botFilter, onchange: (e) => { d.botFilter = e.target.checked; mark(); } }), 'Не считать клики ботов'), 'Боты уходят на тот же оффер, но не попадают в статистику.'),
+        field('Окно конверсии, дней', h('input', { class: 'input', type: 'number', min: 1, max: 365, value: d.conversionWindowDays ?? '', placeholder: 'без ограничения', oninput: bind('conversionWindowDays', 'int') }), 'Постбэк на клик старше окна отклоняется.'),
+        field('Модель затрат', h('div', { class: 'radios' },
+          h('label', {}, h('input', { type: 'radio', name: 'costModel', checked: d.costModel !== 'cpc', onchange: () => { d.costModel = 'none'; d.cpc = null; mark(); cpcField.hidden = true; } }), 'Нет'),
+          h('label', {}, h('input', { type: 'radio', name: 'costModel', checked: d.costModel === 'cpc', onchange: () => { d.costModel = 'cpc'; mark(); cpcField.hidden = false; } }), 'CPC')), 'При CPC расход за клик записывается в статистику.'),
+        cpcField,
+        field('Брать из параметра cost', h('label', { class: 'radios' }, h('input', { type: 'checkbox', checked: !!d.costFromParam, onchange: (e) => { d.costFromParam = e.target.checked; mark(); } }), 'Использовать значение параметра cost из ссылки клика')));
+    }],
     ['Таргетинг', () => h('div', {},
       h('p', { class: 'muted' }, 'Фильтры уровня кампании: не подошедший клик не попадает ни в один поток.'),
       field('Страны', h('input', { class: 'input', value: (d.allowGeos || []).join(', '), placeholder: 'все', oninput: (e) => { d.allowGeos = splitList(e.target.value).map((x) => x.toUpperCase()); mark(); } })),
@@ -594,6 +603,21 @@ async function pageCampaignEditor(id) {
       field('Ссылка на конкретный оффер', h('input', { class: 'input', readonly: true, value: trackingUrl(d.id) + '/{offer_id}' })),
       field('S2S постбэк для партнёрки', h('input', { class: 'input', readonly: true, value: `${location.origin}${BASE}/postback?click_id={click_id}&secret=POSTBACK_SECRET&revenue={payout}&currency=EUR` }), 'Замените POSTBACK_SECRET и макросы партнёрки на свои.'),
       h('p', { class: 'muted' }, 'Макросы в URL оффера: {click_id} {subid} {campaign} {offer_id} {device} {country}.'))],
+    ['Параметры', () => {
+      const PARAM_FIELDS = ['keyword', 'source', 'external_id', 'creative_id', 'ad_campaign_id',
+        ...Array.from({ length: 30 }, (_, i) => `sub_id_${i + 1}`), 'cost'];
+      const rows = PARAM_FIELDS.map((name) => {
+        const inp = h('input', { class: 'input', style: 'padding:2px 6px;height:auto', value: d.paramMap?.[name] || '', placeholder: name,
+          oninput: (e) => { const v = e.target.value.trim(); if (!d.paramMap) d.paramMap = {}; if (v && v !== name) d.paramMap[name] = v; else delete d.paramMap[name]; mark(); } });
+        return h('tr', {}, h('td', { style: 'padding:4px 8px;white-space:nowrap' }, name), h('td', { style: 'padding:2px 4px;width:100%' }, inp));
+      });
+      return h('div', {},
+        h('p', { class: 'muted' }, 'Как называется каждое поле в вашей ссылке отслеживания. Пустое поле = имя по умолчанию (совпадает с названием).'),
+        h('div', { class: 'table-wrap', style: 'max-height:480px;overflow-y:auto' },
+          h('table', { class: 'grid' },
+            h('thead', {}, h('tr', {}, h('th', {}, 'Название'), h('th', {}, 'Параметр в ссылке'))),
+            h('tbody', {}, ...rows))));
+    }],
   ]);
 
   const streamsBox = h('div');
@@ -638,16 +662,27 @@ async function pageCampaignEditor(id) {
     if (new Set(names).size !== names.length) { err.textContent = 'Названия потоков должны различаться — по ним строится статистика.'; return; }
     const body = { name: d.name.trim(), active: d.active, streams: d.streams, dailyCap: d.dailyCap, totalCap: d.totalCap, revenueCap: d.revenueCap, capUrl: d.capUrl, geoCapUrl: d.geoCapUrl,
       allowGeos: d.allowGeos, allowDevices: d.allowDevices, allowOS: d.allowOS, allowBrowsers: d.allowBrowsers, blockedIps: d.blockedIps, allowedIps: d.allowedIps,
-      dedupeWindow: d.dedupeWindow || 0, botFilter: d.botFilter, conversionWindowDays: d.conversionWindowDays };
+      dedupeWindow: d.dedupeWindow || 0, botFilter: d.botFilter, conversionWindowDays: d.conversionWindowDays,
+      paramMap: d.paramMap || {}, costModel: d.costModel || 'none', cpc: d.cpc, costFromParam: d.costFromParam || false };
     saveBtn.disabled = true;
     try {
       const saved = isNew ? await api('/api/campaigns', { method: 'POST', body: { id: d.id, ...body } })
         : await api('/api/campaigns/' + encodeURIComponent(d.id), { method: 'PATCH', body });
-      if ((saved.streams || []).length !== d.streams.length) toast('Часть потоков отклонена сервером — проверьте офферы и веса.', true);
-      else toast(isNew ? 'Кампания создана' : 'Сохранено');
       dirty = false;
-      if (isNew) location.hash = '#/campaigns/' + encodeURIComponent(d.id);
-      else { await loadRefs(); saveBtn.textContent = 'Сохранить'; }
+      if (isNew) {
+        toast('Кампания создана');
+        location.hash = '#/campaigns/' + encodeURIComponent(d.id);
+      } else {
+        await loadRefs();
+        saveBtn.textContent = 'Сохранить';
+        const serverCamp = state.campaigns[d.id] || {};
+        const streamsMismatch = (saved.streams || []).length !== d.streams.length;
+        const sentParamKeys = Object.keys(body.paramMap || {});
+        const droppedParams = sentParamKeys.filter((k) => (serverCamp.paramMap || {})[k] !== (body.paramMap || {})[k]);
+        if (streamsMismatch) toast('Часть потоков отклонена сервером — проверьте офферы и веса.', true);
+        else if (droppedParams.length) toast('Параметры отклонены сервером: ' + droppedParams.join(', '), true);
+        else toast('Сохранено');
+      }
     } catch (e) { err.textContent = 'Не сохранено: ' + e.message; }
     finally { saveBtn.disabled = false; }
   }
