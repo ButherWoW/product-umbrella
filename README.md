@@ -251,7 +251,24 @@ Tracking URL принимает `utm_source`, `utm_medium`, `utm_campaign`, `utm
 
 ## Деплой на nespizdili.lol/umbrella
 
-GitHub Actions (`.github/workflows/deploy.yml`): тесты → отдельный systemd-сервис `umbrella` (порт 4110, пользователь `umbrella`) → своя база PostgreSQL `umbrella` со своей ролью (`deploy/setup-db.sh`) → `location /umbrella` в nginx (бэкап конфига, `nginx -t`, откат при ошибке) → демо-данные один раз. Секреты репозитория: `SSH_PRIVATE_KEY`, `UMBRELLA_ADMIN_TOKEN`, `UMBRELLA_POSTBACK_SECRET`.
+GitHub Actions (`.github/workflows/deploy.yml`): тесты → отдельный systemd-сервис `umbrella` (порт 4110, пользователь `umbrella`) → своя база PostgreSQL `umbrella` со своей ролью (`deploy/setup-db.sh`) → `location /umbrella` в nginx (бэкап конфига, `nginx -t`, откат при ошибке). Секреты репозитория: `SSH_PRIVATE_KEY`, `UMBRELLA_ADMIN_TOKEN`, `UMBRELLA_POSTBACK_SECRET`. Демо-данные (`deploy/seed-demo.mjs`) на прод не заливаются: только ручной запуск workflow с галочкой `seed_demo` (по умолчанию выключена) — для пустого тестового сервера.
+
+### Релизы и откат
+
+Код лежит по релизам: `/opt/umbrella/releases/<sha>/` (код + `node_modules`), `/opt/umbrella/app` — симлинк на живой релиз (`deploy/release.sh`). Порядок деплоя:
+
+1. `rsync` коммита в `releases/<sha>`, `npm ci` там же. Живой релиз не трогается.
+2. Первый деплой после перехода на релизы: старый каталог `/opt/umbrella/app` переносится в `releases/initial` (переименование в той же ФС, сервис продолжает работать) и заменяется симлинком. Повторно ничего не делает.
+3. `.env`: при наличии базы дописывается `REQUIRE_POSTGRES=1` — без PostgreSQL сервис не стартует (и перезапускается каждые 3 с), а не пишет молча в JSONL.
+4. `pg_dump -Fc` в `/opt/umbrella/backups/pre-deploy-<sha>.dump` (хранятся последние 5), затем миграции из нового релиза.
+5. Симлинк атомарно переключается на новый релиз, `systemctl restart umbrella`, проверка `/health`: `ok: true` и `storage: postgres` (если задан `DATABASE_URL`) в течение 20 с. Не прошла — симлинк возвращается на предыдущий релиз, сервис перезапускается на нём, job падает.
+6. Остаются 3 последних релиза (живой — всегда).
+
+**Миграции только вперёд.** Откат кода не откатывает схему: старый код запускается на новой схеме (миграции аддитивные — `ADD COLUMN IF NOT EXISTS` и т. п. — поэтому обычно это работает). Если после изменения схемы старый код с ней не работает, откат данных — только из `pre-deploy-<sha>.dump` (порядок как в «Бэкапах»; события между дампом и откатом потеряются).
+
+Ручной откат на сервере: `ls -t /opt/umbrella/releases`, затем `ln -sfn releases/<старый sha> /opt/umbrella/app.next && mv -Tf /opt/umbrella/app.next /opt/umbrella/app && systemctl restart umbrella`.
+
+Сервис (`deploy/umbrella.service`): `Restart=always`, ждёт `postgresql.service` и сеть, `MemoryMax=1G` и `NODE_OPTIONS=--max-old-space-size=768` (утечка памяти перезапускает трекер, а не уводит общий сервер в swap), ограничение частоты логов в journald (`LogRateLimitBurst=5000` за 30 с — глобальные настройки journald на общем сервере не меняются). Проверка переключения релизов без сервера: `docker run --rm -v "$PWD":/w -w /w ubuntu:24.04 bash deploy/test-release-switch.sh` (то же запускает CI).
 
 ## GeoIP
 
@@ -378,12 +395,36 @@ CI поднимает чистый PostgreSQL (job `postgres`): миграции
 1. Задайте `DATABASE_URL`, `REQUIRE_POSTGRES=1`, `REQUIRE_LOGIN=1`, `ADMIN_TOKEN` и `POSTBACK_SECRET` через секрет-хранилище.
 2. Выполните миграцию до запуска приложения: `npm run migrate` или используйте Docker Compose, где миграция запускается автоматически.
 3. Ограничьте доступ к PostgreSQL сетью приложения, а HTTP наружу отдавайте через HTTPS reverse proxy.
-4. Периодически запускайте `DATABASE_URL=... BACKUP_DIR=./backups sh scripts/backup-postgres.sh` и проверяйте восстановление резервной копии на отдельной базе.
+4. Бэкапы: на сервере с systemd — `deploy/backup.sh` по таймеру и ежемесячная проверка восстановления `deploy/restore-test.sh` (см. «Бэкапы»). В Docker Compose: `docker compose exec -T postgres pg_dump -U umbrella -Fc product_umbrella > umbrella-$(date -u +%Y%m%d).dump` (и том `umbrella_data`, если используется JSONL), восстановление — `docker compose exec -T postgres pg_restore -U umbrella -d product_umbrella --clean --if-exists < файл.dump` при остановленном `app`.
 5. Проверьте `/health`, `/stats`, тестовый `/r/<campaign>` и postback после деплоя; не публикуйте `ADMIN_TOKEN` и `POSTBACK_SECRET` в логах.
 
 ## Бэкапы
 
-Каждую ночь (03:30 UTC, systemd timer `umbrella-backup.timer`) `deploy/backup.sh` делает дамп своей базы (`pg_dump -Fc umbrella`) и архив каталога данных (`/opt/umbrella/data`: журнал событий, настройки). Файлы лежат на сервере в `/opt/umbrella/backups` (доступ только root), хранятся 14 дней. Деплой ставит таймер и сразу делает первый бэкап, если за последние сутки его не было. Восстановление: `pg_restore --clean --if-exists -d umbrella файл.dump` и `tar -xzf файл-data.tar.gz -C /opt/umbrella` при остановленном сервисе.
+Каждую ночь (03:30 UTC, systemd timer `umbrella-backup.timer`) `deploy/backup.sh` делает дамп своей базы (`pg_dump -Fc umbrella`) и архив каталога данных (`/opt/umbrella/data`: журнал событий, настройки). Журнал `events.jsonl` в это время дописывается, поэтому архивируется снимок: каталог копируется (`cp --reflink=auto`), недописанная последняя строка журнала отбрасывается, копия сбрасывается на диск (`sync`) и только потом упаковывается в tar. Файлы лежат на сервере в `/opt/umbrella/backups` (доступ только root), хранятся 14 дней; там же `pre-deploy-<sha>.dump` — дампы перед миграциями каждого деплоя (последние 5). Деплой ставит таймер и сразу делает первый бэкап, если за последние сутки его не было.
+
+**Если бэкап упал**, systemd запускает `umbrella-failed@….service` (`deploy/notify-failure.sh`): строка в `/opt/umbrella/backups/LAST_FAILED` и ошибка в journald (`journalctl -p err -t umbrella-failed`). Внешних сервисов нет; деплой показывает предупреждение, пока файл есть. Следующий успешный бэкап убирает свои строки из `LAST_FAILED`.
+
+**Проверка восстановления** — раз в месяц (`umbrella-restore-test.timer`, 2-е число, 04:30 UTC) `deploy/restore-test.sh` восстанавливает последний ночной дамп во временную базу `umbrella_restore_test`, считает строки во всех таблицах (обязательны `campaigns`, `clicks`, `users`) и удаляет базу. Живая база не затрагивается; на время проверки нужно свободное место ещё на одну копию базы. Вручную: `sudo bash /opt/umbrella/app/deploy/restore-test.sh [файл.dump]`. Ошибка — тоже в `LAST_FAILED`.
+
+**Восстановление** (обе части вместе, из одного и того же времени):
+
+```sh
+sudo systemctl stop umbrella
+# база: дамп читает root, pg_restore получает его через stdin
+sudo -u postgres pg_restore -d umbrella --clean --if-exists --no-owner --role=umbrella < /opt/umbrella/backups/umbrella-YYYYMMDD-HHMM.dump
+# журнал и настройки: старый каталог в сторону, архив на место
+sudo mv /opt/umbrella/data /opt/umbrella/data.before-restore
+sudo tar -xzf /opt/umbrella/backups/umbrella-YYYYMMDD-HHMM-data.tar.gz -C /opt/umbrella
+sudo chown -R umbrella:umbrella /opt/umbrella/data
+sudo systemctl start umbrella
+curl -s http://127.0.0.1:4110/health   # ok: true, storage: postgres
+```
+
+После отката кода с изменённой схемой вместо ночного дампа берите `pre-deploy-<sha>.dump` того деплоя (архива данных у него нет — каталог `data` не трогайте).
+
+### Копия вне сервера
+
+Сейчас все бэкапы лежат на том же сервере: от потери диска или сервера они не спасают. Для копии вне сервера нужен выбор владельца — куда: S3-совместимое хранилище (AWS S3, Backblaze B2, Cloudflare R2), другой сервер по `rsync`/`ssh` или что-то ещё, и кто платит/хранит ключи доступа. Когда хранилище выбрано, достаточно отдельного таймера после `umbrella-backup.service`, который выгружает новые `umbrella-*.dump` и `*-data.tar.gz` (лучше с шифрованием, например `age` или `gpg`, — в дампе пароли пользователей и данные кликов). Выгрузка пока не реализована.
 
 ## Очистка статистики и срок хранения
 

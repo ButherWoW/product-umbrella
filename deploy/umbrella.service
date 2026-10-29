@@ -1,16 +1,27 @@
 [Unit]
 Description=Product Umbrella tracker
-After=network.target
+# Local PostgreSQL first: with REQUIRE_POSTGRES=1 the tracker refuses to start without its database.
+# Wants= on a unit that does not exist (host without PostgreSQL) is ignored.
+After=network-online.target postgresql.service
+Wants=network-online.target postgresql.service
 
 [Service]
 Type=simple
 User=umbrella
 Group=umbrella
+# /opt/umbrella/app is a symlink to the live release (deploy/release.sh); it is resolved on every start.
 WorkingDirectory=/opt/umbrella/app
 EnvironmentFile=/opt/umbrella/.env
+Environment=NODE_OPTIONS=--max-old-space-size=768
 ExecStart=/usr/bin/env node src/server.js
-Restart=on-failure
+Restart=always
 RestartSec=3
+# Memory: V8 heap is capped at 768 MB above; the whole process (heap + buffers) is killed and restarted past 1 GB
+# instead of pushing the shared server into swap.
+MemoryMax=1G
+# A crash loop or a log storm must not flood journald for the other services on this server.
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=5000
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
