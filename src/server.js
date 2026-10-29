@@ -1,3 +1,4 @@
+import './log-setup.js';
 import http from 'node:http';
 import { randomUUID, createHash, timingSafeEqual } from 'node:crypto';
 import { mkdir, appendFile, readFile, writeFile } from 'node:fs/promises';
@@ -13,6 +14,7 @@ import { createEventMirror } from './event-mirror.js';
 import { createConversionCapCounter, resolveOffer } from './conversion-cap.js';
 import { createJournalGate, filterJournal, campaignPlan, retentionPlan, clearCampaignRows, retentionRows } from './retention.js';
 import { createSourcePostbacks, resolveSourcePostback, parsePostbackUrl, parsePostbackStatuses, journalHasSourcePostback, sendPostback, fillPostbackMacros, stripQuery, allowPrivateFromEnv, SAMPLE_MACROS } from './source-postback.js';
+import { connectionType, CONNECTION_TYPES } from './connection-type.js';
 import { createBindingStore, bindingKey, boundChoice, streamRef, parseBindMode, parseBindTtl } from './visitor-binding.js';
 import { createMonitor, MONITOR_MODES } from './monitor.js';
 
@@ -91,7 +93,9 @@ function lookupAsn(ip) {
   try {
     const r = asnReader.asn(ip);
     const isp = r.autonomousSystemOrganization || null;
-    return { asn: r.autonomousSystemNumber ?? null, isp, datacenter: Boolean(isp && DATACENTER_RE.test(isp)) };
+    const asn = r.autonomousSystemNumber ?? null;
+    const datacenter = Boolean(isp && DATACENTER_RE.test(isp));
+    return { asn, isp, datacenter, connection: connectionType({ asn, isp, datacenter }) };
   } catch { return null; }
 }
 
@@ -162,6 +166,8 @@ function parseConditions(raw = {}) {
   // Newer conditions are stored only when set, so existing streams keep their exact shape.
   for (const key of ['referrers', 'keywords', 'userAgents']) { const list = parseList(raw[key], text, (v) => v.length > 0); if (list.length) out[key] = list; }
   if (typeof raw.emptyReferrer === 'boolean') out.emptyReferrer = raw.emptyReferrer;
+  const connections = [...new Set(parseList(raw.connections, lower, (x) => CONNECTION_TYPES.includes(x)))];
+  if (connections.length) out.connections = connections;
   const ips = parseIpRules(raw.ips).slice(0, 50);
   if (ips.length) out.ips = ips;
   if (raw.params && typeof raw.params === 'object' && !Array.isArray(raw.params)) {
@@ -266,6 +272,8 @@ const CONDITIONS = {
   browsers: ['браузер', (c, v) => [v.browser, c.browsers.includes(v.browser)]],
   languages: ['язык', (c, v) => [v.language, c.languages.includes(v.language)]],
   isps: ['провайдер', (c, v) => [v.isp, includesAny(v.isp, c.isps)]],
+  // Unknown connection type (no GEOIP_ASN_DB) never matches either; with «НЕ» it does.
+  connections: ['тип соединения', (c, v) => [v.connection, c.connections.includes(v.connection)]],
   days: ['день недели', (c, v, t) => [t.day, c.days.includes(t.day)]],
   hours: ['час', (c, v, t) => [t.hour, c.hours.includes(t.hour)]],
   dateFrom: ['дата с', (c, v, t) => [t.date, t.date >= c.dateFrom], '≥'],
@@ -337,6 +345,9 @@ async function simulateClick(input, canSee) {
   const visitor = { device: detectDevice(ua), os: detectOS(ua), browser: detectBrowser(ua), language: /^[a-z]{2}$/.test(lang) ? lang : null,
     country: /^[A-Za-z]{2}$/.test(input.country || '') ? input.country.toUpperCase() : (ip ? lookupCountry(ip) : null),
     isp: input.isp ? String(input.isp).slice(0, 120) : network?.isp || null, now: at,
+    // Explicit connection type, or derived from an explicit ISP name, or from the IP's ASN.
+    connection: CONNECTION_TYPES.includes(input.connection) ? input.connection
+      : input.isp ? connectionType({ isp: String(input.isp), datacenter: DATACENTER_RE.test(String(input.isp)) }) : network?.connection ?? null,
     referrer: input.referrer ? String(input.referrer).trim().slice(0, 2048) : null, userAgent: ua, ip };
   const query = new URLSearchParams(String(input.query || '').replace(/^\?/, ''));
   const steps = [];
@@ -444,8 +455,9 @@ function visitorProfile(req) {
   const ua = req.headers['user-agent'] || '';
   const lang = String(req.headers['accept-language'] || '').trim().slice(0, 2).toLowerCase();
   const ip = normalizeIp(clientIp(req));
+  const network = lookupAsn(ip);
   return { device: detectDevice(ua), os: detectOS(ua), browser: detectBrowser(ua), language: /^[a-z]{2}$/.test(lang) ? lang : null, country: lookupCountry(clientIp(req)),
-    isp: lookupAsn(ip)?.isp || null, referrer: req.headers.referer || null, userAgent: ua, ip: ip || null, params: {} };
+    isp: network?.isp || null, connection: network?.connection ?? null, referrer: req.headers.referer || null, userAgent: ua, ip: ip || null, params: {} };
 }
 
 // Replace known macros in URL templates (offer URLs and S2S postback URLs).
@@ -1006,7 +1018,7 @@ async function stats({ campaign = null, allowed = null, from = null, to = null, 
 
 // Clicks/conversions/revenue/cost grouped by one tracked parameter value ('' = not passed).
 // Click attributes stored as columns (not in params) that reports can group by.
-const DIMENSION_FIELDS = ['device', 'os', 'browser', 'language', 'isp'];
+const DIMENSION_FIELDS = ['device', 'os', 'browser', 'language', 'isp', 'connection'];
 async function paramReport({ field, campaign, allowed = null, from, to, currency = rates.defaultCurrency }) {
   const isColumn = DIMENSION_FIELDS.includes(field);
   if (db) {
@@ -1683,7 +1695,7 @@ const server = http.createServer(async (req, res) => {
         const lang = String(req.headers['accept-language'] || '').trim().slice(0, 2).toLowerCase();
         await event('click', { clickId, campaign: campaignId, offerId, path: url.pathname, referrer: req.headers.referer || null, userAgent: req.headers['user-agent'] || null, subid, country, ip,
           device, os, browser, language: /^[a-z]{2}$/.test(lang) ? lang : null,
-          ...(network ? { asn: network.asn, isp: network.isp, datacenter: network.datacenter } : {}), stream: streamName, ...extra, ...(Object.keys(params).length ? { params } : {}), ...(cost ? { cost } : {}) });
+          ...(network ? { asn: network.asn, isp: network.isp, datacenter: network.datacenter, connection: network.connection } : {}), stream: streamName, ...extra, ...(Object.keys(params).length ? { params } : {}), ...(cost ? { cost } : {}) });
         if (totalCount !== null && totalCount + 1 >= c.totalCap) await pauseCampaign(campaignId, 'total_cap_reached');
       }
       return sendRedirect(res, destination.toString(), c.redirectMethod);

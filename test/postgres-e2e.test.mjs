@@ -134,3 +134,33 @@ test('PostgreSQL: RETENTION_DAYS deletes old unconverted clicks and bots, conver
     assert.equal((await pool.query('SELECT 1 FROM bots WHERE campaign = $1', [campaign])).rowCount, 1, 'old bot removed, recent kept');
   } finally { await server.stop(); }
 });
+
+test('PostgreSQL: click connection type persists in its column and groups the report', { skip: !databaseUrl && 'set TEST_DATABASE_URL to run', timeout: 30000 }, async (t) => {
+  const { default: pg } = await import('pg');
+  const { createEventMirror } = await import('../src/event-mirror.js');
+  const pool = new pg.Pool({ connectionString: databaseUrl, max: 2 });
+  const dir = await mkdtemp(join(tmpdir(), 'umbrella-pg-'));
+  t.after(async () => { await pool.end(); await rm(dir, { recursive: true, force: true }); });
+  const run = Date.now().toString(36);
+  const campaign = `pg-conn-${run}`;
+  // The mirror writes exactly what a live click with an ASN lookup writes (CI has no ASN database).
+  const mirror = createEventMirror({ query: (sql, values) => pool.query(sql, values), onError: (type, error) => { throw error; } });
+  const ids = [];
+  for (const connection of ['mobile', 'mobile', 'broadband', null]) {
+    const clickId = crypto.randomUUID(); ids.push(clickId);
+    await mirror.enqueue({ type: 'click', at: new Date().toISOString(), clickId, campaign, offerId: 'offer-1', asn: connection === 'mobile' ? 21928 : null,
+      isp: connection === 'mobile' ? 'T-Mobile USA, Inc.' : null, datacenter: connection ? false : null, connection });
+  }
+  await mirror.drain();
+  const { rows } = await pool.query('SELECT connection, COUNT(*)::int AS n FROM clicks WHERE campaign = $1 GROUP BY 1 ORDER BY 1', [campaign]);
+  assert.deepEqual(rows, [{ connection: 'broadband', n: 1 }, { connection: 'mobile', n: 2 }, { connection: null, n: 1 }]);
+
+  const server = await startTestServer(dir, { DATABASE_URL: databaseUrl, REQUIRE_POSTGRES: '1', ADMIN_TOKEN: TOKEN });
+  try {
+    const call = (path) => fetch(server.url + path, { headers: { authorization: `Bearer ${TOKEN}` } });
+    const report = await (await call(`/stats/params?field=connection&campaign=${campaign}`)).json();
+    assert.deepEqual(Object.fromEntries(report.rows.map((r) => [r.value, r.clicks])), { mobile: 2, broadband: 1, '': 1 }, 'report reads the column');
+    const { clicks } = await (await call(`/api/clicks?campaign=${campaign}`)).json();
+    assert.equal(clicks.find((c) => c.clickId === ids[0])?.connection, 'mobile', 'click log returns the column');
+  } finally { await server.stop(); }
+});
