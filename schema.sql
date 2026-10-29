@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS sources (
   cost_model TEXT NOT NULL DEFAULT 'none',
   cpc NUMERIC(12,6),
   cost_from_param BOOLEAN NOT NULL DEFAULT false,
+  postback_url TEXT,
+  postback_statuses JSONB NOT NULL DEFAULT '["sale"]'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

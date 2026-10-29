@@ -852,6 +852,62 @@ try {
   await page.keyboard.press('Enter');
   await t9Card.waitFor();
   await page.keyboard.press('Escape');
+  // Source postback: fields in the source modal and the campaign editor, «Тестовый постбэк» shows the HTTP status.
+  {
+    await page.setViewportSize({ width: 1280, height: 900 });
+    const { createServer } = await import('node:http');
+    const hits = [];
+    const mock = createServer((req, res) => { hits.push(req.url); res.writeHead(204); res.end(); });
+    await new Promise((resolve) => mock.listen(0, '127.0.0.1', resolve));
+    const mockUrl = `http://127.0.0.1:${mock.address().port}`;
+    const pbDir = await mkdtemp(join(tmpdir(), 'umbrella-admin-pb-'));
+    const pbServer = await startTestServer(pbDir, { ADMIN_TOKEN: TOKEN, SOURCE_POSTBACK_ALLOW_PRIVATE: '1' });
+    const pbPage = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+    pbPage.on('pageerror', (error) => errors.push(error.message));
+    try {
+      await pbPage.goto(pbServer.url + '/admin#/sources');
+      await pbPage.getByRole('button', { name: 'Создать', exact: true }).click();
+      const srcDialog = pbPage.getByRole('dialog', { name: 'Создание источника' });
+      await srcDialog.locator('input').nth(0).fill('fb-pb');
+      await srcDialog.locator('input').nth(1).fill('FB postback');
+      await srcDialog.getByRole('tab', { name: 'Постбэк' }).click();
+      await srcDialog.getByLabel('URL постбэка в источник').fill(`${mockUrl}/fb?cid={external_id}&s={status}`);
+      await srcDialog.getByLabel('Лид (lead)').check();
+      await srcDialog.getByRole('button', { name: 'Тестовый постбэк' }).click();
+      const keyDialog2 = pbPage.getByRole('dialog', { name: 'Ключ администратора' });
+      await keyDialog2.waitFor();
+      await keyDialog2.locator('input[type=password]').fill(TOKEN);
+      await keyDialog2.getByRole('button', { name: 'Сохранить' }).click();
+      await srcDialog.getByRole('button', { name: 'Тестовый постбэк' }).click();
+      await srcDialog.getByRole('status', { name: 'Результат тестового постбэка' }).filter({ hasText: 'HTTP 204' }).waitFor();
+      assert.ok(hits.at(-1).startsWith('/fb?cid=test_external_id&s=sale'), 'test postback filled sample macros');
+      await srcDialog.screenshot({ path: join(tmpdir(), 'umbrella-admin-source-postback.png') });
+      await srcDialog.getByRole('button', { name: 'Создать', exact: true }).click();
+      await pbPage.locator('table.grid tbody tr', { hasText: 'fb-pb' }).filter({ hasText: 'lead, sale' }).waitFor();
+      const saved = (await (await fetch(pbServer.url + '/api/sources')).json()).sources['fb-pb'];
+      assert.deepEqual([saved.postbackUrl, saved.postbackStatuses], [`${mockUrl}/fb?cid={external_id}&s={status}`, ['lead', 'sale']]);
+
+      await pbPage.goto(pbServer.url + '/admin#/campaigns/new');
+      await pbPage.getByLabel('Название кампании').fill('PB campaign');
+      await pbPage.getByRole('combobox', { name: 'Источник трафика' }).selectOption('fb-pb');
+      await pbPage.getByLabel('Постбэк в источник').fill(`${mockUrl}/camp?s={status}`);
+      await pbPage.getByLabel('Продажа (sale)').check();
+      await pbPage.getByRole('button', { name: 'Тестовый постбэк' }).click();
+      await pbPage.getByRole('status', { name: 'Результат тестового постбэка' }).filter({ hasText: 'HTTP 204' }).waitFor();
+      assert.ok(hits.at(-1).startsWith('/camp?s=sale'));
+      await pbPage.locator('.editor-head .btn.primary').click();
+      await pbPage.locator('#toast', { hasText: 'Кампания создана' }).waitFor();
+      const camps = (await (await fetch(pbServer.url + '/api/campaigns')).json()).campaigns;
+      const pbCamp = Object.values(camps).find((c) => c.name === 'PB campaign');
+      assert.deepEqual([pbCamp.sourceId, pbCamp.sourcePostbackUrl, pbCamp.sourcePostbackStatuses], ['fb-pb', `${mockUrl}/camp?s={status}`, ['sale']]);
+      await pbPage.screenshot({ path: join(tmpdir(), 'umbrella-admin-campaign-postback.png') });
+    } finally {
+      await pbPage.close();
+      await pbServer.stop();
+      await new Promise((resolve) => mock.close(resolve));
+      await rm(pbDir, { recursive: true, force: true });
+    }
+  }
 
   assert.deepEqual(errors, []);
   console.log('Admin UI browser test passed');

@@ -126,6 +126,8 @@
           "dedupeWindow": { "type": ["integer", "null"] },
           "uniquenessHours": { "type": "integer" },
           "conversionWindowDays": { "type": ["integer", "null"] },
+          "sourcePostbackUrl": { "type": ["string", "null"], "description": "Campaign override of the traffic-source postback URL (https, macros {click_id}, {external_id}, {sub_id_N}, {status}, {revenue}, {payout}, {currency}…); null = use the source's" },
+          "sourcePostbackStatuses": { "type": "array", "items": { "type": "string", "enum": ["lead", "sale", "rejected", "trash"] }, "description": "Statuses that trigger the source postback; empty = use the source's" },
           "botFilter": { "type": "boolean" },
           "datacenterAsBot": { "type": "boolean" },
           "allowDevices": { "type": "array", "items": { "type": "string", "enum": ["mobile", "tablet", "desktop"] } },

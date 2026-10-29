@@ -121,7 +121,7 @@ Tracking URL принимает `utm_source`, `utm_medium`, `utm_campaign`, `utm
 
 ## Источники, партнёрские сети и управление сущностями
 
-- Источники трафика: `GET/POST /api/sources`, `PATCH /api/sources/:id`. Источник содержит `name`, `paramMap`, `costModel`, `cpc`, `costFromParam`; данные сохраняются в JSON fallback или PostgreSQL.
+- Источники трафика: `GET/POST /api/sources`, `PATCH /api/sources/:id`. Источник содержит `name`, `paramMap`, `costModel`, `cpc`, `costFromParam`, `postbackUrl`, `postbackStatuses` (см. «Постбэк в источник трафика»); данные сохраняются в JSON fallback или PostgreSQL.
 - Партнёрские сети: `GET/POST /api/networks`, `PATCH /api/networks/:id`. Оффер связывается через `networkId`; сеть хранит параметры click ID и payout для настройки postback.
 - При создании кампании с `sourceId` его параметры стоимости и `paramMap` подставляются автоматически, если не указаны вручную.
 - Архивирование: `PATCH /api/campaigns/:id` или `/api/offers/:id` с `{ "archived": true }`. Клонирование: `POST /api/campaigns/:id/clone` и `POST /api/offers/:id/clone`.
@@ -143,6 +143,20 @@ Tracking URL принимает `utm_source`, `utm_medium`, `utm_campaign`, `utm
 - Повторный постбэк с другим статусом обновляет конверсию (lead → sale, sale → rejected); тот же статус ещё раз → `409 conversion_already_recorded`. Если в обновлении нет `revenue`, сохраняется сумма из прошлого постбэка. Окно конверсии проверяется только для первой.
 - Отчёты: `conversions` = лиды + продажи, `revenue` = только продажи, `pendingRevenue` = сумма лидов, плюс `leads`, `sales`, `rejected`, `trash`. Кап дохода считает только продажи.
 - S2S-постбэк оффера получает макрос `{status}` и вызывается на каждое изменение статуса.
+
+## Постбэк в источник трафика
+
+Как «Постбэк в источник» в Keitaro: трекер сам сообщает рекламной сети о конверсии (FB/TikTok/push-сети по своему click id).
+
+- Источник: `postbackUrl` (только `https://`) и `postbackStatuses` — подмножество `lead`, `sale`, `rejected`, `trash`, по умолчанию `["sale"]`. Кампания может переопределить: `sourcePostbackUrl`, `sourcePostbackStatuses` (`null` / `[]` — брать из источника; каждое поле отдельно). Без источника кампания может задать свой URL.
+- Макросы (значения URL-кодируются, неизвестные `{…}` остаются как есть): `{click_id}` (наш), `{external_id}` (click id рекламной сети — например, fbclid из ссылки), `{sub_id_1}`…`{sub_id_30}`, `{keyword}`, `{source}`, `{creative_id}`, `{ad_campaign_id}`, `{subid}`, `{campaign}`, `{offer_id}`, `{country}`, `{cost}`, `{status}`, `{revenue}`, `{payout}` (= revenue), `{currency}`.
+- Отправляется `GET` при каждом изменении статуса конверсии, если статус в списке, — **один раз на пару (клик, статус)**: повтор `sale` после `rejected` второй раз не уходит. Ответ `/postback` не ждёт отправки (fire-and-forget). До 3 попыток с паузой 0,5 и 1 с: повторяются сетевые ошибки, 5xx и 429; другой 4xx — окончательный. Редиректы не выполняются, таймаут попытки 10 с. Незавершённые повторы теряются при перезапуске процесса.
+- Итог пишется в журнал событием `source_postback`: `{ clickId, campaign, status, httpStatus, error, attempts, url }`, где `url` — без query string (там токены и данные посетителя).
+- SSRF-защита при каждой отправке: только http(s); хост разрешается через DNS и проверяется адрес, к которому идёт подключение — приватные, loopback, link-local, CGNAT, multicast, IPv4-mapped IPv6 и NAT64 отклоняются (`private_address_refused`). `SOURCE_POSTBACK_ALLOW_PRIVATE=1` (только тесты) разрешает loopback (127.0.0.0/8, ::1) и `http://` в настройках.
+- `POST /api/sources/postback-test { url, status? }` — «Тестовый постбэк»: один запрос на URL с тестовыми значениями макросов, ответ `{ ok, httpStatus, error, url }`. Только владелец (или админ-ключ).
+- Баер видит `postbackUrl` источника без query string (`postbackUrlMasked: true`) и не может его менять; URL своей кампании видит и меняет.
+- В /admin: вкладка «Постбэк» в окне источника и поля «Постбэк в источник» / «Статусы постбэка в источник» в редакторе кампании, кнопка «Тестовый постбэк» показывает HTTP-статус.
+- PostgreSQL: колонки `sources.postback_url`, `sources.postback_statuses` (`npm run migrate`); настройки кампании хранятся в её `config`.
 
 ## Лендинги
 
