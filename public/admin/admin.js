@@ -264,7 +264,7 @@ function dataTable({ id, columns, rows = [], selectable = false, pageSize = 50, 
     const tbody = h('tbody', {}, shown.length ? shown.map((r) => h('tr', { class: rowClass ? rowClass(r) : null },
       selectable ? h('td', {}, h('input', { type: 'checkbox', 'aria-label': 'Выбрать', checked: selected.has(r.id),
         onchange: (e) => { e.target.checked ? selected.add(r.id) : selected.delete(r.id); root.dispatchEvent(new Event('selection')); } })) : null,
-      cols.map((c) => h('td', { class: [c.num ? 'num' : '', c.cls || ''].join(' '), title: c.tip ? c.tip(r) : null }, c.render ? c.render(r) : (valueOf(c, r) ?? '—')))))
+      cols.map((c) => h('td', { class: [c.num ? 'num' : '', c.cls || ''].join(' '), title: c.tip ? c.tip(r) : null, 'data-label': c.label }, c.render ? c.render(r) : (valueOf(c, r) ?? '—')))))
       : h('tr', {}, h('td', { colspan: cols.length + (selectable ? 1 : 0), class: 'empty' }, empty)));
     const tfoot = totals && all.length ? h('tfoot', {}, h('tr', {}, selectable ? h('td') : null,
       cols.map((c) => h('td', { class: c.num ? 'num' : '' }, c.total ? c.total(all) : '')))) : null;

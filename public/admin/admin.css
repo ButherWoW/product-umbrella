@@ -163,3 +163,29 @@ body.auth-mode .view { margin-left: 0; display: grid; place-items: start center;
 .kpi-edit { cursor: pointer; }
 .kpi-edit:hover { outline: 2px solid var(--fg-3); }
 .kpi .v .neg { color: #ffd2d0; }
+
+@media (max-width: 600px) {
+  /* Cards: each table row becomes a block */
+  .table-wrap { border: none; background: transparent; border-radius: 0; overflow-x: visible; }
+  table.grid { display: block; }
+  table.grid thead { display: none; }
+  table.grid tbody, table.grid tfoot { display: block; }
+  table.grid tr { display: block; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); margin-bottom: 8px; }
+  table.grid td { display: flex; justify-content: space-between; align-items: baseline; padding: 6px 12px; border-bottom: 1px solid var(--line); white-space: normal; text-align: right; min-height: 0; }
+  table.grid tr td:last-child { border-bottom: none; }
+  table.grid td[data-label]::before { content: attr(data-label); color: var(--fg-3); font-size: 12px; flex: 0 0 auto; margin-right: 12px; text-align: left; white-space: nowrap; }
+  table.grid td:not([data-label]) { display: none; }
+  table.grid td.bar-profit { display: none; }
+  table.grid td.num { text-align: right; }
+  table.grid td.name { max-width: none; overflow: visible; text-overflow: clip; }
+  table.grid tfoot { display: none; }
+
+  /* Single-column toolbar */
+  .toolbar { gap: 6px; }
+  .toolbar > .input, .toolbar > .select, .toolbar > .btn { flex: 1 1 calc(50% - 3px); min-width: 0; }
+  .toolbar > .input { flex: 1 1 100%; }
+
+  /* Fullscreen modals */
+  .modal-back { padding: 0; align-items: flex-start; }
+  .modal { width: 100%; min-height: 100svh; border-radius: 0; border-left: none; border-right: none; }
+}
