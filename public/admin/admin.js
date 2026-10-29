@@ -494,13 +494,32 @@ async function pageDashboard() {
           ...metricCols().filter((c) => ['clicks', 'conversions', 'cr', 'revenue'].includes(c.key))],
       }));
       const top5 = (id, title, rows, nameOf, link) => h('div', { class: 'card' }, h('h2', {}, title), dataTable({ id: 'dash-t5-' + id, pageSize: 5, compact: true, totals: false, rows: [...rows].sort((a, b) => b.revenue - a.revenue).slice(0, 5), columns: [{ key: 'id', label: 'Название', fixed: true, cls: 'name', render: (r) => h('a', { href: link(r) }, nameOf(r)) }, ...metricCols().filter((c) => ['clicks', 'conversions', 'revenue', 'roi'].includes(c.key))] }));
-      put(body, 
+      const ATTN_CLICKS = 100, ATTN_ROI = -0.5, ATTN_BOTS = 0.30;
+      const botsByCamp = {};
+      (botsData.bots || []).forEach((b) => { botsByCamp[b.campaign] = (botsByCamp[b.campaign] || 0) + 1; });
+      const attnAlerts = [];
+      Object.entries(s.byCampaign || {}).forEach(([id, v]) => {
+        if ((v.clicks || 0) >= ATTN_CLICKS && v.cost > 0 && (v.revenue - v.cost) / v.cost <= ATTN_ROI)
+          attnAlerts.push(h('div', { class: 'attn-row' }, `Кампания «${state.campaigns[id]?.name || id}» — ROI ${pct((v.revenue - v.cost) / v.cost)}`, ' ', h('a', { href: '#/campaigns/' + encodeURIComponent(id) }, 'Открыть')));
+      });
+      Object.entries(s.byOffer || {}).forEach(([id, v]) => {
+        if ((v.clicks || 0) >= ATTN_CLICKS && !(v.conversions || 0))
+          attnAlerts.push(h('div', { class: 'attn-row' }, `Оффер «${id}» — 0 конверсий при ${num(v.clicks)} кликах`, ' ', h('a', { href: '#/reports' + qs({ group: 'country', offer: id }) }, 'Открыть')));
+      });
+      Object.entries(s.byCampaign || {}).forEach(([id, v]) => {
+        const bc = botsByCamp[id] || 0, tot = (v.clicks || 0) + bc;
+        if (tot > 0 && bc / tot > ATTN_BOTS)
+          attnAlerts.push(h('div', { class: 'attn-row' }, `Кампания «${state.campaigns[id]?.name || id}» — боты ${pct(bc / tot)}`, ' ', h('a', { href: '#/botlog' + qs({ campaign: id }) }, 'Открыть')));
+      });
+      const attnBlock = attnAlerts.length ? h('div', { class: 'card attn-block', style: 'margin-bottom:14px;border-left:3px solid var(--bad)' }, h('h2', {}, 'Требуют внимания'), ...attnAlerts) : null;
+      put(body,
         h('div', { class: 'kpis' }, kpi('Клики', num(s.clicks), 'var(--k1)'), kpi('Уник. клики', num(s.uniqueClicks), 'var(--k2)'), kpi('Конверсии', num(s.conversions), 'var(--k3)'), kpi('CR', pct(ratio(s.conversions, s.clicks)), 'var(--k2)'),
           kpi('Доход', money(s.revenue), 'var(--k5)'), kpi('Расход', money(s.cost || 0), 'var(--k4)'), kpi('Прибыль', h('span', { class: profit >= 0 ? '' : 'neg' }, money(profit)), 'var(--k8)'), kpi('ROI', pct(ratio(profit, s.cost || 0)), 'var(--k9)'), earningsTile,
           kpi('EPC', money4(ratio(s.revenue, s.clicks)), 'var(--k6)'), kpi('RPM', money(ratio(s.revenue * 1000, s.clicks)), 'var(--k7)'),
           botsData.bots?.length > 0 ? h('a', { href: '#/botlog' + (campaign ? qs({ campaign }) : ''), style: 'text-decoration:none' },
             h('div', { class: 'kpi', style: 'background:var(--bad)' }, h('div', { class: 'k' }, 'Боты'), h('div', { class: 'v' }, botsData.bots.length >= 1000 ? '1000+' : num(botsData.bots.length)))) : null),
         ratesNote(),
+        attnBlock,
         h('div', { class: 'card', style: 'margin-bottom:14px' }, lineChart([
           { key: 'clicks', label: 'Клики', color: '#4d86f0', values: series.map((p) => p.clicks) },
           { key: 'conversions', label: 'Конв.', color: '#e0496a', values: series.map((p) => p.conversions) },

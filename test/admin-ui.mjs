@@ -232,6 +232,18 @@ try {
     assert.match(approvePct || '', /100/, `Approve % should show 100% for 1 sale, got: ${approvePct}`);
   }
 
+  // D13: "Требуют внимания" block on dashboard
+  await page.goto(server.url + '/admin#/dashboard');
+  await page.locator('.kpis').waitFor();
+  assert.ok(!(await page.locator('.attn-block').isVisible()), 'no attention block without problematic traffic');
+  await api('/api/campaigns', { id: 'd13-attn', name: 'D13 Attention', streams: [{ name: 'Main', offers: [{ offerId: 'offer-d13', weight: 1 }] }] });
+  await Promise.all(Array.from({ length: 100 }, () => fetch(server.url + '/r/d13-attn', { redirect: 'manual' })));
+  await page.reload();
+  await page.locator('.kpis').waitFor();
+  await page.locator('.attn-block').waitFor();
+  const attnText = await page.locator('.attn-block').innerText();
+  assert.ok(attnText.includes('D13 Attention') || attnText.includes('offer-d13'), `attention block should mention campaign or offer, got: ${attnText}`);
+
   assert.deepEqual(errors, []);
 
   // Accounts: a REQUIRE_LOGIN install starts with the setup screen; owner creates a buyer; logout returns to login.
