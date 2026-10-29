@@ -103,15 +103,15 @@ export async function reconcileEvents({ db, events, from = 0, shouldStop = () =>
       const { first, latest, params } = conversions.get(key);
       return { click_id: latest.clickId, tid: conversionTid(latest.tid), revenue: latest.revenue ?? null, currency: latest.currency ?? null,
         status: latest.status || 'sale', params: params || null, created_at: first.at, updated_at: first === latest ? null : latest.at,
-        event_id: UUID.test(latest.id || '') ? latest.id : null };
+        event_id: UUID.test(latest.id || '') ? latest.id : null, revenue_ignored: latest.revenueIgnored === true };
     });
-    const result = await db.query(`INSERT INTO conversions (click_id, tid, revenue, currency, status, params, created_at, updated_at, event_id)
-      SELECT r.click_id, r.tid, r.revenue, r.currency, r.status, r.params, r.created_at, r.updated_at, r.event_id
+    const result = await db.query(`INSERT INTO conversions (click_id, tid, revenue, currency, status, params, created_at, updated_at, event_id, revenue_ignored)
+      SELECT r.click_id, r.tid, r.revenue, r.currency, r.status, r.params, r.created_at, r.updated_at, r.event_id, COALESCE(r.revenue_ignored, false)
       FROM jsonb_to_recordset($1::jsonb) AS r(click_id uuid, tid text, revenue numeric, currency text, status text, params jsonb,
-        created_at timestamptz, updated_at timestamptz, event_id uuid)
+        created_at timestamptz, updated_at timestamptz, event_id uuid, revenue_ignored boolean)
       WHERE EXISTS (SELECT 1 FROM clicks c WHERE c.click_id = r.click_id)
       ON CONFLICT (click_id, tid) DO UPDATE
-      SET revenue = EXCLUDED.revenue, currency = EXCLUDED.currency, status = EXCLUDED.status,
+      SET revenue = EXCLUDED.revenue, currency = EXCLUDED.currency, status = EXCLUDED.status, revenue_ignored = EXCLUDED.revenue_ignored,
         params = COALESCE(EXCLUDED.params, conversions.params), updated_at = COALESCE(EXCLUDED.updated_at, EXCLUDED.created_at), event_id = EXCLUDED.event_id
       WHERE (EXCLUDED.event_id IS NULL OR conversions.event_id IS DISTINCT FROM EXCLUDED.event_id)
         AND COALESCE(conversions.updated_at, conversions.created_at) <= COALESCE(EXCLUDED.updated_at, EXCLUDED.created_at)`, [JSON.stringify(data)]);

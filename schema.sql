@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS conversions (
   currency text,
   status text NOT NULL DEFAULT 'sale' CONSTRAINT conversions_status_check CHECK (status IN ('lead', 'sale', 'rejected', 'trash')),
   params jsonb,                  -- sub_id_N sent with the postback
+  revenue_ignored boolean NOT NULL DEFAULT false, -- CPC offer: amount stored, not counted in revenue
   updated_at timestamptz,        -- time of the latest event (status update); NULL while there is only one
   event_id uuid,                 -- journal id of the latest event (reconciliation)
   created_at timestamptz NOT NULL DEFAULT now()

@@ -151,6 +151,11 @@ Tracking URL принимает `utm_source`, `utm_medium`, `utm_campaign`, `utm
 - Отчёты: `conversions` = лиды + продажи, `revenue` = только продажи, `pendingRevenue` = сумма лидов, плюс `leads`, `sales`, `rejected`, `trash`. Кап дохода считает только продажи.
 - S2S-постбэк оффера получает макрос `{status}` и вызывается на каждое изменение статуса.
 
+### Выплата оффера: CPA и CPC
+
+- `payoutType: "cpa"` (по умолчанию) — доход приносят конверсии: сумма из постбэка (`revenue`/`payout`), а если её нет — `payout` оффера в `payoutCurrency`.
+- `payoutType: "cpc"` — доход приносят **только клики**: каждый засчитанный клик получает `payout` оффера (пересчёт в `DEFAULT_CURRENCY` на момент клика). Постбэки по такому офферу по-прежнему меняют статусы и считаются в `conversions`, `leads`, `sales`, `rejected`, `trash`, но их сумма в `revenue` и `pendingRevenue` **не входит** — иначе доход считался бы дважды. Сумма постбэка сохраняется и видна в `/api/conversions` с пометкой `revenueIgnored: true` (в логе конверсий — «не учит.»). Правило определяется типом оффера в момент постбэка и одинаково в JSONL и PostgreSQL (колонка `conversions.revenue_ignored`). Пример: 2 клика по CPC-офферу с `payout: 0.3 USD` и постбэк `revenue=1.2345` → доход оффера 0.545454 EUR (только клики), 1 продажа.
+
 ## Постбэк в источник трафика
 
 Как «Постбэк в источник» в Keitaro: трекер сам сообщает рекламной сети о конверсии (FB/TikTok/push-сети по своему click id).
@@ -180,7 +185,7 @@ Tracking URL принимает `utm_source`, `utm_medium`, `utm_campaign`, `utm
 Каждый клик сохраняет параметры источника: `keyword`, `source`, `external_id`, `creative_id`, `ad_campaign_id`, `sub_id_1`…`sub_id_30` (поле `params` в журнале) и расход (`cost`).
 
 - `paramMap` кампании переименовывает параметр в ссылке: `{"sub_id_1":"ad_id","cost":"bid"}` → значение `?ad_id=` попадёт в `sub_id_1`. Недопустимые имена отбрасываются.
-- `costModel: "cpc"` + `cpc: 0.12` — фиксированная цена клика; `costFromParam: true` — брать из параметра `cost` (или переименованного), при отсутствии/ошибке — `cpc`.
+- `costModel: "cpc"` + `cpc: 0.12` — фиксированная цена клика; `costFromParam: true` — брать из параметра `cost` (или переименованного), при отсутствии/ошибке — `cpc`. Расход клика округляется до 6 знаков (как `clicks.cost NUMERIC(12,6)`) уже в журнале.
 - Все отчёты отдают `cost`, `profit`, `roi`. `GET /stats/params?field=sub_id_1&campaign=&from=&to=` — отчёт по значениям параметра.
 - Макросы в URL оффера: `{sub_id_N}`, `{keyword}`, `{source}`, `{external_id}`, `{creative_id}`, `{ad_campaign_id}`, `{cost}`. Значения URL-кодируются.
 
@@ -380,11 +385,13 @@ CR в API — доля (`0.25` = 25%), EPC = revenue / clicks, RPM = revenue × 
 
 Журналы смотрятся в `/admin` (разделы кликов и конверсий) или через API `GET /api/clicks` и `GET /api/conversions`.
 
-Оба log API возвращают одинаковые поля в JSONL/PostgreSQL: `clickId`, `campaign`, `offerId`, `stream`, `at` (ISO UTC); для конверсий также `revenue` (число или null), `currency`. Совместимые aliases `click_id`, `offer_id`, `created_at`, `user_agent` сохранены. Пустой поток обозначается `default`. Данные postback URL и неизвестные поля событий в журналы не включаются.
+Оба log API возвращают одинаковые поля в JSONL/PostgreSQL: `clickId`, `campaign`, `offerId`, `stream`, `at` (ISO UTC); для конверсий также `revenue` (число или null), `currency`, `status`, `tid`, `updatedAt`, `revenueIgnored`.
 
-Ответ имеет вид `{ clicks: [...], limit, offset, hasMore, nextOffset, storage }` или `{ conversions: [...] ... }`. `limit` — целое от 1 до 100 (большее значение ограничивается 100), `offset` — неотрицательное целое. Некорректные параметры возвращают 400. Сортировка: время события по убыванию, затем click ID. При добавлении новых событий между запросами страницы с offset могут сдвигаться.
+Журнал конверсий — **одна строка на конверсию** (клик + `tid`; апсейлы с другим `tid` — отдельные строки) в обоих хранилищах: текущий (последний) статус и сумма, `at` — время первого постбэка (момент конверсии), `updatedAt` — время последнего постбэка (смены статуса); без изменений `updatedAt = at`. `revenueIgnored: true` — сумма постбэка CPC-оффера, в доход не входит (см. «Выплата оффера»). Совместимые aliases `click_id`, `offer_id`, `created_at`, `user_agent` сохранены. Пустой поток обозначается `default`. Данные postback URL и неизвестные поля событий в журналы не включаются.
 
-`from`/`to` задаются реальными календарными датами `YYYY-MM-DD`; `to` включает день до последней миллисекунды UTC. В журнале конверсий даты относятся к времени конверсии, а фильтры campaign/offer/stream — к исходному клику. Это отличается от `/stats`, где период относится к выбранным кликам.
+Ответ имеет вид `{ clicks: [...], limit, offset, hasMore, nextOffset, storage }` или `{ conversions: [...] ... }`. `limit` — целое от 1 до 100 (большее значение ограничивается 100), `offset` — неотрицательное целое. Некорректные параметры возвращают 400. Сортировка: `at` по убыванию, затем click ID (и `tid`). При добавлении новых событий между запросами страницы с offset могут сдвигаться.
+
+`from`/`to` задаются реальными календарными датами `YYYY-MM-DD`; `to` включает весь день по UTC (граница — `< следующий день 00:00`), так же во всех отчётах (`/stats*`, `/stats/export`, `/api/bots`, `/api/postbacks`) и в обоих хранилищах. В журнале конверсий даты относятся к `at` (первый постбэк конверсии), а фильтры campaign/offer/stream — к исходному клику. Это отличается от `/stats`, где период относится к выбранным кликам.
 
 `node test/admin-ui.mjs` — браузерный тест `/admin`: правка потока (прямой URL, «Считать клики: нет»), окно ключа при `ADMIN_TOKEN`, сохранение и отсутствие горизонтальной прокрутки на ширине 390px. Требует Playwright или `PLAYWRIGHT_MODULE`.
 
@@ -437,7 +444,7 @@ npm start
 
 ## Проверка на PostgreSQL
 
-CI поднимает чистый PostgreSQL (job `postgres`): миграции с нуля дважды, затем `test/postgres*.test.mjs` — данные, записанные сервером, должны вернуться из базы после перезапуска с пустым каталогом данных. Локально: `docker run -d --name umb-pg -e POSTGRES_USER=umbrella -e POSTGRES_PASSWORD=local -e POSTGRES_DB=umbrella -p 55432:5432 postgres:16-alpine`, затем `DATABASE_URL=postgresql://umbrella:local@127.0.0.1:55432/umbrella node src/migrate.js` и `TEST_DATABASE_URL=… node --test test/postgres-e2e.test.mjs`.
+CI поднимает чистый PostgreSQL (job `postgres`): миграции с нуля дважды, затем `test/postgres*.test.mjs` — данные, записанные сервером, должны вернуться из базы после перезапуска с пустым каталогом данных. `test/postgres-parity.test.mjs` прогоняет один сценарий (потоки, лендинг, CPA/CPC, кап, статусы, апсейлы, валюты, расходы, S2S, баер) на JSONL, на PostgreSQL и на журнале PostgreSQL-прогона без базы: все отчёты должны совпасть (цифры — у JSONL и PostgreSQL, всё до байта — у PostgreSQL и его журнала), в том числе после «Очистки статистики». Локально: `docker run -d --name umb-pg -e POSTGRES_USER=umbrella -e POSTGRES_PASSWORD=local -e POSTGRES_DB=umbrella -p 55432:5432 postgres:16-alpine`, затем `DATABASE_URL=postgresql://umbrella:local@127.0.0.1:55432/umbrella node src/migrate.js` и `TEST_DATABASE_URL=… node --test test/postgres-e2e.test.mjs`.
 Для production задайте `REQUIRE_POSTGRES=1`: тогда приложение не стартует при недоступной базе и не потеряет события, незаметно переключившись на JSONL.
 
 ### Production checklist
@@ -480,7 +487,7 @@ curl -s http://127.0.0.1:4110/health   # ok: true, storage: postgres
 
 Как «Очистка статистики» в Keitaro. **Удаление необратимо: вернуть данные можно только из ночного бэкапа** (`deploy/backup.sh`, см. «Бэкапы»: дамп базы + архив каталога данных с журналом; восстанавливать обе части вместе, при остановленном сервисе).
 
-- `POST /api/campaigns/:id/clear-stats` с `{ "confirm": "<id кампании>", "before": "YYYY-MM-DD" }` — только владелец или `ADMIN_TOKEN` (баер → `403 owner_only`). `confirm` должен совпадать с id кампании, иначе `400 confirm_mismatch`. Без `before` удаляются все клики, конверсии, клики по лендингам и боты кампании; с `before` — клики (и боты), записанные раньше этой даты по UTC, вместе с конверсиями и кликами по лендингам этих кликов (даже если конверсия пришла позже). Ответ — `removed`: число удалённых событий журнала и строк PostgreSQL (`postgres`, `null` без базы). В «Историю» пишется запись `clear_stats` с числами.
+- `POST /api/campaigns/:id/clear-stats` с `{ "confirm": "<id кампании>", "before": "YYYY-MM-DD" }` — только владелец или `ADMIN_TOKEN` (баер → `403 owner_only`). `confirm` должен совпадать с id кампании, иначе `400 confirm_mismatch`. Без `before` удаляются все клики, конверсии, клики по лендингам, боты и журнал постбэков (входящие и S2S) кампании; с `before` — клики, боты и постбэки, записанные раньше этой даты по UTC, вместе с конверсиями и кликами по лендингам этих кликов (даже если конверсия пришла позже). Обновления расходов (`cost_update`), затронувшие только удалённые клики, уходят из журнала, а импорты расходов с такими кликами — из `cost_imports`. Журнал и PostgreSQL очищаются одинаково. Ответ — `removed`: число удалённых событий журнала (`clicks`, `conversions`, `lpClicks`, `bots`, `postbacks`) и строк PostgreSQL (`postgres`, `null` без базы). В «Историю» пишется запись `clear_stats` с числами.
 - В /admin: редактор кампании → блок «Очистить статистику» (виден владельцу и по ключу администратора): «Всё» или «Старше даты», затем ввести id кампании — без этого кнопка не активна.
 - `RETENTION_DAYS=N` — раз в сутки (первый раз через `RETENTION_DELAY_MS`, по умолчанию 60 с после старта) удаляются клики старше N дней **без конверсии**, их клики по лендингам и события ботов старше N дней. Клики с конверсией (любого статуса) и сами конверсии хранятся всегда. Итог — в логе сервиса (`[retention] …`) и записью `retention` в «Истории». Без переменной данные хранятся бессрочно; в тестах выключено, пока не задано явно.
 

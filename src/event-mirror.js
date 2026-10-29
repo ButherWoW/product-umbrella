@@ -14,9 +14,10 @@ export function isTransientDbError(error) {
 // Statements shared by the live mirror and the reconciliation job, so both write the same rows.
 // A conversion row holds the latest event of its (click, tid): event_id is that event, updated_at its time.
 // The WHERE guard never lets an older event overwrite a newer one (mirror and reconciliation may race).
-export const CONVERSION_UPSERT = `INSERT INTO conversions (click_id, tid, revenue, currency, status, params, created_at, updated_at, event_id)
-  VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9) ON CONFLICT (click_id, tid) DO UPDATE
-  SET revenue = EXCLUDED.revenue, currency = EXCLUDED.currency, status = EXCLUDED.status,
+// revenue_ignored: a CPC offer's postback amount — stored, not counted as revenue (README «Выплата оффера»).
+export const CONVERSION_UPSERT = `INSERT INTO conversions (click_id, tid, revenue, currency, status, params, created_at, updated_at, event_id, revenue_ignored)
+  VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10) ON CONFLICT (click_id, tid) DO UPDATE
+  SET revenue = EXCLUDED.revenue, currency = EXCLUDED.currency, status = EXCLUDED.status, revenue_ignored = EXCLUDED.revenue_ignored,
     params = COALESCE(EXCLUDED.params, conversions.params), updated_at = COALESCE(EXCLUDED.updated_at, EXCLUDED.created_at), event_id = EXCLUDED.event_id
   WHERE (EXCLUDED.event_id IS NULL OR conversions.event_id IS DISTINCT FROM EXCLUDED.event_id)
     AND COALESCE(conversions.updated_at, conversions.created_at) <= COALESCE(EXCLUDED.updated_at, EXCLUDED.created_at)`;
@@ -87,7 +88,7 @@ export function createEventMirror({ query, onError = () => {}, retryDelays = [20
     // One row per (click, tid): a new tid is an upsell, the same tid a status update (lead → sale → rejected)
     // that overwrites the row; the keyed lock keeps journal order.
     await q(CONVERSION_UPSERT, [payload.clickId, payload.tid ?? '', payload.revenue ?? null, payload.currency ?? null, payload.status || 'sale',
-      payload.params ? JSON.stringify(payload.params) : null, at, null, id ?? null]);
+      payload.params ? JSON.stringify(payload.params) : null, at, null, id ?? null, payload.revenueIgnored === true]);
     // sub_id_N from the postback overwrite the click's parameters, so reports by sub_id show the network's values.
     if (payload.params && Object.keys(payload.params).length)
       await q(`UPDATE clicks SET params = COALESCE(params, '{}'::jsonb) || $2::jsonb WHERE click_id = $1`, [payload.clickId, JSON.stringify(payload.params)]);

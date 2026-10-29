@@ -113,6 +113,8 @@ await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS status TEXT NOT
 await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ`);
 await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS tid TEXT NOT NULL DEFAULT ''`);
 await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS params JSONB`);
+// CPC offers earn per click: a postback amount on such an offer is stored but not counted in revenue.
+await db.query(`ALTER TABLE conversions ADD COLUMN IF NOT EXISTS revenue_ignored BOOLEAN NOT NULL DEFAULT false`);
 // Upsells (G6): one row per (click_id, tid); tid '' is the main conversion. The new unique index is created
 // before the old primary key on click_id is dropped, so uniqueness never lapses.
 await db.query(`CREATE UNIQUE INDEX IF NOT EXISTS conversions_click_tid_idx ON conversions(click_id, tid)`);

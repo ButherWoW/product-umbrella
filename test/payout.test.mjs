@@ -1,5 +1,5 @@
 // G5: offer payout (CPA/CPC). CPA: a postback without revenue earns offer.payout; `payout` is an alias of `revenue`.
-// CPC: every counted click earns offer.payout.
+// CPC: every counted click earns offer.payout; postbacks set statuses, their amounts are kept but not counted as revenue.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -52,7 +52,7 @@ test('offer payout: CPA fallback, payout alias, CPC revenue per click, validatio
   assert.equal((await call('/api/offers', { id: 'cpc-offer', url: 'https://example.test/cpc', payoutType: 'cpc', payout: 0.25 })).status, 201);
   assert.equal((await call('/api/campaigns', { id: 'cpc-campaign', name: 'CPC', streams: [{ offers: [{ offerId: 'cpc-offer', weight: 1 }] }] })).status, 201);
   const first = await click('cpc-campaign');
-  await click('cpc-campaign');
+  const second = await click('cpc-campaign');
   stats = await (await call('/stats?campaign=cpc-campaign')).json();
   assert.equal(stats.clicks, 2);
   assert.equal(stats.revenue, 0.5);
@@ -61,6 +61,16 @@ test('offer payout: CPA fallback, payout alias, CPC revenue per click, validatio
   assert.equal((await postback(`click_id=${first}`)).status, 200);
   stats = await (await call('/stats?campaign=cpc-campaign')).json();
   assert.equal(stats.revenue, 0.5, 'a CPC offer gets no payout fallback on conversion');
+  // A postback with an amount: counted as a sale (then a lead), its amount stays out of revenue and pendingRevenue.
+  assert.equal((await postback(`click_id=${second}&revenue=3&currency=USD&status=lead`)).status, 200);
+  stats = await (await call('/stats?campaign=cpc-campaign')).json();
+  assert.deepEqual([stats.revenue, stats.pendingRevenue, stats.conversions, stats.sales, stats.leads], [0.5, 0, 2, 1, 1], 'CPC revenue comes only from clicks');
   const series = await (await call('/stats/timeseries?campaign=cpc-campaign')).json();
   assert.equal(series.series.reduce((sum, b) => sum + b.revenue, 0), 0.5);
+  const params = await (await call('/stats/params?field=sub_id_1&campaign=cpc-campaign')).json();
+  assert.equal(params.rows[0].revenue, 0.5);
+  const cpcLog = await (await call('/api/conversions?campaign=cpc-campaign')).json();
+  assert.deepEqual(cpcLog.conversions.map((c) => [c.clickId === second, c.revenue, c.revenueIgnored]).sort(), [[false, null, true], [true, 3, true]], 'amount kept, marked as ignored');
+  const cpa = await (await call('/api/conversions?campaign=cpa-campaign')).json();
+  assert.ok(cpa.conversions.every((c) => c.revenueIgnored === false));
 });
