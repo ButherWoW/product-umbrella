@@ -101,6 +101,7 @@
               "os": { "type": "array", "items": { "type": "string", "enum": ["android", "ios", "windows", "macos", "linux", "other"] } },
               "browsers": { "type": "array", "items": { "type": "string", "enum": ["chrome", "safari", "firefox", "edge", "opera", "samsung", "other"] } },
               "languages": { "type": "array", "items": { "type": "string" } },
+              "connections": { "type": "array", "items": { "type": "string", "enum": ["mobile", "broadband", "datacenter"] }, "description": "Connection type from the ASN (needs GEOIP_ASN_DB)." },
               "mode": { "type": "string", "enum": ["and", "or"] },
               "days": { "type": "array", "items": { "type": "integer", "minimum": 1, "maximum": 7 } },
               "hours": { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 23 } },
@@ -224,6 +225,7 @@
           "params": { "type": "object" },
           "cost": { "type": "number" },
           "isp": { "type": ["string", "null"] },
+          "connection": { "type": ["string", "null"], "enum": ["mobile", "broadband", "datacenter", null], "description": "Heuristic from the ASN; null without GEOIP_ASN_DB." },
           "landingId": { "type": ["string", "null"] }
         }
       },
@@ -676,7 +678,7 @@
             "name": "group",
             "in": "query",
             "description": "Grouping dimension.",
-            "schema": { "type": "string", "default": "campaign", "enum": ["campaign", "offer", "stream", "landing", "country", "day", "hour", "sub_id_1", "sub_id_2", "sub_id_3", "source", "keyword", "device", "os", "browser", "language", "isp"] }
+            "schema": { "type": "string", "default": "campaign", "enum": ["campaign", "offer", "stream", "landing", "country", "day", "hour", "sub_id_1", "sub_id_2", "sub_id_3", "source", "keyword", "device", "os", "browser", "language", "isp", "connection"] }
           },
           { "name": "subid", "in": "query", "schema": { "type": "string" } },
           { "name": "country", "in": "query", "schema": { "type": "string" } },
@@ -772,7 +774,7 @@
     "/stats/params": {
       "get": {
         "summary": "Statistics grouped by parameter value",
-        "description": "Groups clicks/conversions/revenue by values of a traffic-source parameter (sub_id_1..30, keyword, source, etc.) or a dimension field (device, os, browser, language, isp).",
+        "description": "Groups clicks/conversions/revenue by values of a traffic-source parameter (sub_id_1..30, keyword, source, etc.) or a dimension field (device, os, browser, language, isp, connection).",
         "operationId": "getStatsParams",
         "tags": ["stats"],
         "security": [{ "bearerAuth": [] }, { "cookieAuth": [] }, {}],
