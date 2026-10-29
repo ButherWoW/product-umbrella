@@ -674,6 +674,41 @@ try {
   const bindSaved = (await (await api('/api/campaigns', undefined, 'GET')).json()).campaigns['bind-ui'];
   assert.deepEqual([bindSaved.bindVisitors, bindSaved.bindTtlHours], ['stream_offer', 48], 'binding settings saved');
 
+  // Task 9: click card in the click log — all fields, hostile UA stays text, Enter opens the card
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await api('/api/campaigns', { id: 't9-card', name: 'T9 Card', streams: [{ name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] }] });
+  const t9Ua = '<img src=x onerror=alert(1)>';
+  const t9r = await fetch(server.url + '/r/t9-card?sub_id_1=t9-sub-one', { redirect: 'manual', headers: { 'user-agent': t9Ua } });
+  const t9cid = new URL(t9r.headers.get('location')).searchParams.get('click_id');
+  await page.goto(server.url + '/admin#/clicks?campaign=t9-card');
+  await page.getByRole('heading', { name: 'Лог кликов' }).waitFor();
+  // A reload may drop the in-memory key: enter it if the panel asks, then reload the log.
+  const t9Key = page.getByRole('dialog', { name: 'Ключ администратора' });
+  await page.locator('table.grid tbody tr, [role=dialog][aria-label="Ключ администратора"]').first().waitFor();
+  if (await t9Key.isVisible()) {
+    await t9Key.locator('input[type=password]').fill(TOKEN);
+    await t9Key.getByRole('button', { name: 'Сохранить' }).click();
+    await page.getByRole('button', { name: 'Обновить' }).click();
+  }
+  const t9Row = page.locator('table.grid tbody tr', { hasText: t9cid.slice(0, 13) });
+  await t9Row.click();
+  const t9Card = page.getByRole('dialog', { name: 'Клик' });
+  await t9Card.waitFor();
+  const t9Text = await t9Card.innerText();
+  assert.ok(t9Text.includes(t9Ua), 'hostile UA shown as text');
+  assert.equal(await t9Card.locator('img').count(), 0, 'UA must never become HTML');
+  assert.ok(t9Text.includes(t9cid), 'full click id visible');
+  assert.ok(t9Text.includes('sub_id_1') && t9Text.includes('t9-sub-one'), 'sub_id_1 visible');
+  await t9Card.getByRole('link', { name: 'T9 Card' }).waitFor();
+  await t9Card.getByRole('button', { name: 'Копировать' }).click();
+  await page.locator('#toast', { hasText: /скопир/i }).waitFor(); // copied, or fallback: ID selected for Ctrl+C
+  await page.keyboard.press('Escape');
+  await t9Card.waitFor({ state: 'detached' });
+  await t9Row.focus();
+  await page.keyboard.press('Enter');
+  await t9Card.waitFor();
+  await page.keyboard.press('Escape');
+
   assert.deepEqual(errors, []);
   console.log('Admin UI browser test passed');
 } finally {
