@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS sources (
   cost_model TEXT NOT NULL DEFAULT 'none',
   cpc NUMERIC(12,6),
   cost_from_param BOOLEAN NOT NULL DEFAULT false,
+  postback_url TEXT,
+  postback_statuses JSONB NOT NULL DEFAULT '["sale"]'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -96,9 +98,12 @@ CREATE INDEX IF NOT EXISTS conversions_created_idx ON conversions(created_at);
 CREATE TABLE IF NOT EXISTS users (
   id uuid PRIMARY KEY,
   email text NOT NULL UNIQUE,
-  role text NOT NULL CHECK (role IN ('owner', 'buyer')),
+  role text NOT NULL CHECK (role IN ('owner', 'buyer', 'viewer')),
   password_hash text NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now()
+  created_at timestamptz NOT NULL DEFAULT now(),
+  hide_revenue boolean NOT NULL DEFAULT false,
+  offers_access text NOT NULL DEFAULT 'all' CHECK (offers_access IN ('all', 'own')),
+  view_all boolean NOT NULL DEFAULT false
 );
 
 CREATE TABLE IF NOT EXISTS sessions (

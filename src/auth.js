@@ -6,7 +6,9 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 
 const scrypt = promisify(scryptCallback);
-export const ROLES = ['owner', 'buyer'];
+// viewer: read-only, sees its own campaigns (or all of them with viewAll).
+export const ROLES = ['owner', 'buyer', 'viewer'];
+export const OFFERS_ACCESS = ['all', 'own'];
 export const SESSION_TTL_MS = 14 * 24 * 3600 * 1000;
 const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,24}$/;
 const fail = (error, statusCode) => Object.assign(new Error(error), { statusCode });
@@ -30,7 +32,22 @@ const DUMMY_HASH = await hashPassword(randomBytes(12).toString('hex'));
 const tokenHash = (token) => createHash('sha256').update(String(token)).digest('hex');
 export const API_KEY_PREFIX = 'umb_';
 const API_KEY_TOUCH_MS = 60 * 1000;
-const publicUser = (u) => (u ? { id: u.id, email: u.email, role: u.role, createdAt: new Date(u.created_at ?? u.createdAt).toISOString() } : null);
+// Permission flags live next to the role: PG columns hide_revenue / offers_access / view_all, the same snake_case keys in users.json.
+const publicUser = (u) => (u ? { id: u.id, email: u.email, role: u.role, createdAt: new Date(u.created_at ?? u.createdAt).toISOString(),
+  hideRevenue: Boolean(u.hide_revenue), offersAccess: u.offers_access === 'own' ? 'own' : 'all', viewAll: Boolean(u.view_all) } : null);
+
+// Validates the role and permission flags present in input; absent fields are left out of the result.
+export function validatePermissions(input = {}) {
+  const out = {};
+  if (input.role !== undefined) { if (!ROLES.includes(input.role)) throw fail('invalid_role', 400); out.role = input.role; }
+  for (const [key, column] of [['hideRevenue', 'hide_revenue'], ['viewAll', 'view_all']]) {
+    if (input[key] === undefined) continue;
+    if (typeof input[key] !== 'boolean') throw fail(`invalid_${column}`, 400);
+    out[column] = input[key];
+  }
+  if (input.offersAccess !== undefined) { if (!OFFERS_ACCESS.includes(input.offersAccess)) throw fail('invalid_offers_access', 400); out.offers_access = input.offersAccess; }
+  return out;
+}
 
 export function validateCredentials({ email, password, role = 'buyer' }) {
   const normalized = String(email || '').trim().toLowerCase();
@@ -65,7 +82,7 @@ export function createUserStore({ db = null, dataDir }) {
       return (await load(usersFile)).length;
     },
     async list() {
-      if (db) return (await db.query('SELECT id, email, role, created_at FROM users ORDER BY created_at')).rows.map(publicUser);
+      if (db) return (await db.query('SELECT id, email, role, created_at, hide_revenue, offers_access, view_all FROM users ORDER BY created_at')).rows.map(publicUser);
       return (await load(usersFile)).map(publicUser);
     },
     async authenticate(email, password) {
@@ -79,9 +96,10 @@ export function createUserStore({ db = null, dataDir }) {
     },
     async create(input) {
       const { email, password, role } = validateCredentials(input);
-      const record = { id: randomUUID(), email, role, password_hash: await hashPassword(password), created_at: new Date().toISOString() };
+      const flags = { hide_revenue: false, offers_access: 'all', view_all: false, ...validatePermissions({ hideRevenue: input.hideRevenue, offersAccess: input.offersAccess, viewAll: input.viewAll }) };
+      const record = { id: randomUUID(), email, role, password_hash: await hashPassword(password), created_at: new Date().toISOString(), ...flags };
       if (db) {
-        try { await db.query('INSERT INTO users (id, email, role, password_hash, created_at) VALUES ($1,$2,$3,$4,$5)', [record.id, email, role, record.password_hash, record.created_at]); }
+        try { await db.query('INSERT INTO users (id, email, role, password_hash, created_at, hide_revenue, offers_access, view_all) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [record.id, email, role, record.password_hash, record.created_at, flags.hide_revenue, flags.offers_access, flags.view_all]); }
         catch (e) { if (e.code === '23505') throw fail('email_taken', 409); throw e; }
         return publicUser(record);
       }
@@ -91,6 +109,24 @@ export function createUserStore({ db = null, dataDir }) {
         users.push(record);
         await save(usersFile, users);
         return publicUser(record);
+      });
+    },
+    // Changes role and permission flags; returns the updated user or null if there is no such user.
+    async update(id, input) {
+      const patch = validatePermissions(input);
+      const keys = Object.keys(patch);
+      if (db) {
+        if (!keys.length) return publicUser((await db.query('SELECT * FROM users WHERE id = $1', [id])).rows[0]);
+        const { rows } = await db.query(`UPDATE users SET ${keys.map((k, i) => `${k} = $${i + 2}`).join(', ')} WHERE id = $1 RETURNING *`, [id, ...keys.map((k) => patch[k])]);
+        return publicUser(rows[0]);
+      }
+      return locked(async () => {
+        const users = await load(usersFile);
+        const user = users.find((u) => u.id === id);
+        if (!user) return null;
+        Object.assign(user, patch);
+        await save(usersFile, users);
+        return publicUser(user);
       });
     },
     async remove(id) {

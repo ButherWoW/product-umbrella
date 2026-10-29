@@ -11,6 +11,9 @@ import { readEventLog } from './event-logs.js';
 import { createConversionRecorder, hasRecordedConversion, findRecordedConversion, conversionKey } from './conversion-recorder.js';
 import { createEventMirror } from './event-mirror.js';
 import { createConversionCapCounter, resolveOffer } from './conversion-cap.js';
+import { createJournalGate, filterJournal, campaignPlan, retentionPlan, clearCampaignRows, retentionRows } from './retention.js';
+import { createSourcePostbacks, resolveSourcePostback, parsePostbackUrl, parsePostbackStatuses, journalHasSourcePostback, sendPostback, fillPostbackMacros, stripQuery, allowPrivateFromEnv, SAMPLE_MACROS } from './source-postback.js';
+import { createBindingStore, bindingKey, boundChoice, streamRef, parseBindMode, parseBindTtl } from './visitor-binding.js';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const dataDir = process.env.DATA_DIR || join(root, 'data');
@@ -27,6 +30,8 @@ const basePath = /^\/[A-Za-z0-9_-]{1,40}$/.test(process.env.BASE_PATH || '') ? p
 // Umbrella's own accounts (see src/auth.js). REQUIRE_LOGIN=1 closes reports and APIs to anonymous visitors.
 const users = createUserStore({ db, dataDir });
 const requireLogin = /^(1|true|yes)$/i.test(process.env.REQUIRE_LOGIN || '');
+// Source postbacks to loopback (and plain http) only in tests: SOURCE_POSTBACK_ALLOW_PRIVATE=1.
+const sourcePostbackAllowPrivate = allowPrivateFromEnv();
 // Amounts without a currency (and all click costs) are in DEFAULT_CURRENCY; reports convert to any currency at current rates.
 const rates = createRates({ dataDir, defaultCurrency: normalizeCurrency(process.env.DEFAULT_CURRENCY, 'EUR'),
   refreshMs: process.env.FX_REFRESH === '0' ? 0 : 12 * 3600 * 1000 });
@@ -367,8 +372,18 @@ async function simulateClick(input, canSee) {
     const typeOf = (st) => st.type || 'regular';
     const forced = matching.find((st) => typeOf(st) === 'forced');
     const regular = matching.filter((st) => typeOf(st) === 'regular');
+    // Visitor binding is only known for a concrete visitor: IP + User-Agent, as on a live click.
+    let bound = null;
+    if (c.bindVisitors !== 'off' && ip && input.userAgent) {
+      const binding = visitorBindings.get(bindingKey(campaignId, ip, ua), c.bindTtlHours * 3600 * 1000, at.getTime());
+      bound = boundChoice({ mode: c.bindVisitors, binding, streams: c.streams || [], matches: (st) => streamMatches(st, visitor), excluded: capped,
+        pickOffer: (list) => list[0], pickLanding: (list) => list[0] });
+      step.binding = bound ? { applies: true, mode: c.bindVisitors, stream: bound.stream.name ?? null, ...(c.bindVisitors === 'stream_offer' ? { offerId: bound.offerId, landingId: bound.landingId } : {}), boundAt: new Date(binding.at).toISOString() }
+        : { applies: false, mode: c.bindVisitors, reason: binding ? 'привязанный поток или оффер больше не подходит — будет обычный выбор и новая привязка' : 'привязки нет или срок истёк' };
+    }
     let candidates;
-    if (forced) candidates = [{ stream: forced, share: 1 }];
+    if (bound) candidates = [{ stream: bound.stream, share: 1 }];
+    else if (forced) candidates = [{ stream: forced, share: 1 }];
     else if (regular.length) {
       if (c.streamRotation === 'position') candidates = [{ stream: regular[0], share: 1 }];
       else { const total = regular.reduce((t, st) => t + (st.weight || 1), 0); candidates = regular.map((st) => ({ stream: st, share: (st.weight || 1) / total })); }
@@ -386,10 +401,11 @@ async function simulateClick(input, canSee) {
     const bot = (c.botFilter && isBot(ua)) || (c.datacenterAsBot && network?.datacenter);
     const params = visitor.params;
     const destinations = top.action === 'url' ? [{ url: top.url, share: 100 }]
-      : (() => { const live = (top.offers || [{ offerId: top.offerId, weight: 1 }]).filter((o) => !capped.has(o.offerId)); const total = live.reduce((t, o) => t + (o.weight || 1), 0);
+      : (() => { const live = (top.offers || [{ offerId: top.offerId, weight: 1 }]).filter((o) => !capped.has(o.offerId) && (!bound || c.bindVisitors !== 'stream_offer' || o.offerId === bound.offerId)); const total = live.reduce((t, o) => t + (o.weight || 1), 0);
         return live.map((o) => { const used = routing.substitutes.get(o.offerId) || o.offerId;
           return { offerId: used, ...(used !== o.offerId ? { insteadOf: o.offerId } : {}), share: Math.round((o.weight || 1) / total * 1000) / 10, url: offers.get(used)?.url || null }; }); })();
-    const landing = top.landings?.length ? top.landings.map((l) => landings.get(l.landingId)?.url).filter(Boolean)[0] : null;
+    const landing = bound?.landingId && c.bindVisitors === 'stream_offer' ? landings.get(bound.landingId)?.url || null
+      : top.landings?.length ? top.landings.map((l) => landings.get(l.landingId)?.url).filter(Boolean)[0] : null;
     const vars = { ...params, click_id: 'SIMULATION', subid: query.get('subid') || '', campaign: campaignId, device: visitor.device, country: visitor.country || '', cost: '' };
     return finish({ outcome: bot ? 'bot' : 'click', status: 302, stream: top.name,
       ...(bot ? { reason: 'User-Agent бота или дата-центр при включённом фильтре' } : {}),
@@ -479,6 +495,7 @@ function detectDevice(ua) {
 // In-memory and bounded; after a restart the first repeat visit of a returning visitor counts as unique again.
 const seenVisitors = new Map();
 const SEEN_LIMIT = 300000;
+const visitorBindings = createBindingStore({ limit: SEEN_LIMIT });
 function firstVisit(key, windowMs, now = Date.now()) {
   const hash = createHash('sha1').update(key).digest('base64');
   const last = seenVisitors.get(hash);
@@ -757,15 +774,19 @@ function parseSource(raw) {
     costModel: raw.costModel === 'cpc' ? 'cpc' : 'none',
     cpc: Number.isFinite(Number(raw.cpc)) && Number(raw.cpc) >= 0 && Number(raw.cpc) < 1000 ? Number(raw.cpc) : 0,
     costFromParam: raw.costFromParam === true,
+    // Postback to the traffic source: URL with macros and the conversion statuses that trigger it.
+    postbackUrl: parsePostbackUrl(raw.postbackUrl, { allowHttp: sourcePostbackAllowPrivate }),
+    postbackStatuses: parsePostbackStatuses(raw.postbackStatuses),
   };
 }
 
 async function loadSources() {
   if (db) {
     try {
-      const { rows } = await db.query('SELECT id, name, param_map, cost_model, cpc, cost_from_param FROM sources');
+      const { rows } = await db.query('SELECT id, name, param_map, cost_model, cpc, cost_from_param, postback_url, postback_statuses FROM sources');
       for (const row of rows) if (OFFER_ID_RE.test(row.id)) {
-        const s = parseSource({ name: row.name, paramMap: row.param_map, costModel: row.cost_model, cpc: row.cpc, costFromParam: row.cost_from_param });
+        const s = parseSource({ name: row.name, paramMap: row.param_map, costModel: row.cost_model, cpc: row.cpc, costFromParam: row.cost_from_param,
+          postbackUrl: row.postback_url, postbackStatuses: row.postback_statuses });
         if (s) sources.set(row.id, s);
       }
       return;
@@ -787,8 +808,8 @@ async function saveSources() {
 }
 
 async function persistSource(id, value) {
-  if (db) await db.query('INSERT INTO sources (id, name, param_map, cost_model, cpc, cost_from_param) VALUES ($1, $2, $3::jsonb, $4, $5, $6) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, param_map = EXCLUDED.param_map, cost_model = EXCLUDED.cost_model, cpc = EXCLUDED.cpc, cost_from_param = EXCLUDED.cost_from_param',
-    [id, value.name ?? null, JSON.stringify(value.paramMap || {}), value.costModel, value.cpc, value.costFromParam]);
+  if (db) await db.query('INSERT INTO sources (id, name, param_map, cost_model, cpc, cost_from_param, postback_url, postback_statuses) VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8::jsonb) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, param_map = EXCLUDED.param_map, cost_model = EXCLUDED.cost_model, cpc = EXCLUDED.cpc, cost_from_param = EXCLUDED.cost_from_param, postback_url = EXCLUDED.postback_url, postback_statuses = EXCLUDED.postback_statuses',
+    [id, value.name ?? null, JSON.stringify(value.paramMap || {}), value.costModel, value.cpc, value.costFromParam, value.postbackUrl ?? null, JSON.stringify(value.postbackStatuses || ['sale'])]);
   else await saveSources();
 }
 
@@ -831,6 +852,8 @@ function parseCampaign(id, value) {
     domain: DOMAIN_RE.test(String(value.domain || '').toLowerCase()) ? String(value.domain).toLowerCase() : null,
     streamRotation: value.streamRotation === 'position' ? 'position' : 'weight',
     uniquenessHours: Number.isInteger(value.uniquenessHours) && value.uniquenessHours >= 1 && value.uniquenessHours <= 720 ? value.uniquenessHours : 24,
+    bindVisitors: parseBindMode(value.bindVisitors),
+    bindTtlHours: parseBindTtl(value.bindTtlHours),
     ownerId: /^[0-9a-f-]{36}$/i.test(String(value.ownerId || '')) ? String(value.ownerId).toLowerCase() : null,
     redirectMethod: REDIRECT_METHODS.includes(value.redirectMethod) ? value.redirectMethod : 'http',
     blockedIps: parseIpRules(value.blockedIps),
@@ -842,6 +865,9 @@ function parseCampaign(id, value) {
     costFromParam: value.costFromParam === true,
     conversionWindowDays: Number.isInteger(value.conversionWindowDays) && value.conversionWindowDays > 0 && value.conversionWindowDays <= 365 ? value.conversionWindowDays : null,
     sourceId: OFFER_ID_RE.test(String(value.sourceId || '')) ? String(value.sourceId) : null,
+    // Campaign override of the source postback; null / [] = use the source's.
+    sourcePostbackUrl: parsePostbackUrl(value.sourcePostbackUrl, { allowHttp: sourcePostbackAllowPrivate }),
+    sourcePostbackStatuses: parsePostbackStatuses(value.sourcePostbackStatuses, []),
   };
 }
 
@@ -881,12 +907,41 @@ async function pauseCampaign(id, reason) {
   await event('audit', { actor: 'system', action: 'pause', entity: 'campaign', entityId: id, changes: { active: [true, false], reason: [null, reason] } });
 }
 
+// Appends hold the journal gate shared; clearing statistics and retention rewrite it exclusively (src/retention.js).
+const journalGate = createJournalGate();
 async function event(type, payload) {
   await mkdir(dataDir, { recursive: true });
-  const record = { id: randomUUID(), type, at: new Date().toISOString(), ...payload };
-  await appendFile(eventsFile, `${JSON.stringify(record)}\n`);
-  // `mirrored` settles once PostgreSQL has the event (null without a database).
-  return { mirrored: eventMirror?.enqueue(record) ?? null };
+  return journalGate.shared(async () => {
+    const record = { id: randomUUID(), type, at: new Date().toISOString(), ...payload };
+    await appendFile(eventsFile, `${JSON.stringify(record)}\n`);
+    // `mirrored` settles once PostgreSQL has the event (null without a database).
+    return { mirrored: eventMirror?.enqueue(record) ?? null };
+  });
+}
+
+// Removes events from the journal and the matching rows from PostgreSQL. New events wait meanwhile;
+// the mirror is drained first so a queued insert cannot bring a deleted row back.
+async function removeStats(plan, deleteRows) {
+  const result = await journalGate.rewrite(async () => {
+    await eventMirror?.drain();
+    let postgres = null;
+    const counts = await filterJournal(eventsFile, plan, async () => { if (db) postgres = await deleteRows(db); });
+    return { ...counts, postgres };
+  });
+  for (const offerId of offers.keys()) conversionCaps.invalidate(offerId);
+  return result;
+}
+
+// RETENTION_DAYS=N: daily removal of unconverted clicks, their landing clicks and bot events older than N days.
+const retentionDays = Number.parseInt(process.env.RETENTION_DAYS || '', 10);
+async function runRetention() {
+  const cutoff = new Date(Date.now() - retentionDays * 86400000);
+  const removed = await removeStats(retentionPlan(cutoff.getTime()), (pool) => retentionRows(pool, cutoff.toISOString()));
+  console.log(`[retention] older than ${cutoff.toISOString()}: removed ${removed.clicks} clicks, ${removed.lpClicks} lp clicks, ${removed.bots} bots from the journal`
+    + (removed.postgres ? `; PostgreSQL: ${removed.postgres.clicks} clicks, ${removed.postgres.bots} bots` : ''));
+  await event('audit', { actor: 'system', action: 'retention', entity: 'stats', entityId: 'retention',
+    changes: { days: [null, retentionDays], clicks: [null, removed.clicks], lpClicks: [null, removed.lpClicks], bots: [null, removed.bots] } });
+  return removed;
 }
 
 async function stats({ campaign = null, allowed = null, from = null, to = null, subid = null, country = null, offer = null, stream = null, currency = rates.defaultCurrency } = {}) {
@@ -1132,9 +1187,19 @@ function securityHeaders(res, path) {
 }
 
 function json(res, status, body) {
+  if (res.revenueFilter) body = stripRevenue(body, res.revenueFilter.urls);
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(body));
 }
+
+const sourcePostbacks = createSourcePostbacks({
+  targetFor: (click) => { const c = campaigns.get(click.campaign); return resolveSourcePostback(c, c?.sourceId ? sources.get(c.sourceId) : null); },
+  loadClick: getClickRecord,
+  alreadySent: (clickId, status) => journalHasSourcePostback(eventsFile, clickId, status),
+  record: (payload) => event('source_postback', payload),
+  allowPrivate: sourcePostbackAllowPrivate,
+  onError: (error) => console.warn('[source-postback] failed:', error.message),
+});
 
 const recordPostback = createConversionRecorder({
   findClick: getClickData,
@@ -1150,9 +1215,11 @@ const recordPostback = createConversionRecorder({
       ? { revenue: String(offer.payout), currency: offer.payoutCurrency } : null;
   },
   record: (payload) => event('conversion', payload),
-  onRecorded: ({ click, clickId, revenue, currency, status, recorded }) => {
+  onRecorded: ({ click, clickId, revenue, currency, status, previousStatus, recorded }) => {
     // Recount the offer's conversion cap now and again once PostgreSQL has the conversion.
     if (click.offerId) conversionCaps.invalidate(click.offerId, recorded?.mirrored);
+    // Postback to the traffic source: fire-and-forget, never delays the /postback response.
+    sourcePostbacks.dispatch({ clickId, status: status || 'sale', revenue, currency, previousStatus, click });
     const offer = offers.get(click.offerId);
     if (!offer?.postbackUrl) return;
     const s2sUrl = applyMacros(offer.postbackUrl, { click_id: clickId, revenue: revenue ?? '', currency: currency ?? '', status: status || 'sale' });
@@ -1301,7 +1368,8 @@ function sendRedirect(res, location, method = 'http') {
 }
 
 // Buyers see and edit only their own campaigns; owners, the admin token and a fresh dev install see everything.
-const isBuyer = (req) => req.user?.role === 'buyer' && !bearerAuthorized(req);
+// A viewer is scoped like a buyer unless the owner gave it viewAll (it never writes anyway).
+const isBuyer = (req) => (req.user?.role === 'buyer' || (req.user?.role === 'viewer' && !req.user.viewAll)) && !bearerAuthorized(req);
 function scopeCampaigns(req) {
   if (!isBuyer(req)) return null;
   return [...campaigns].filter(([, c]) => c.ownerId === req.user.id).map(([id]) => id);
@@ -1315,6 +1383,36 @@ function campaignScope(req, requested) {
 }
 const canEditCampaign = (req, c) => !isBuyer(req) || c?.ownerId === req.user.id;
 
+// Per-user permission flags (Keitaro «Права пользователей»). They never restrict the owner or ADMIN_TOKEN.
+const restrictedUser = (req) => Boolean(req.user) && req.user.role !== 'owner' && !bearerAuthorized(req);
+const hidesRevenue = (req) => restrictedUser(req) && req.user.hideRevenue === true;
+const isViewer = (req) => req.user?.role === 'viewer' && !bearerAuthorized(req);
+// hideRevenue removes these keys (not zeroes them: a zero profit or ROI would be a lie) at any depth of the response.
+const REVENUE_KEY = /revenue|profit|payout|earning|^(roi|epc|uepc|rpm)$/i;
+const URL_KEY = /^(url|postbackUrl)$/;
+function stripRevenue(value, urls) {
+  if (Array.isArray(value)) return value.map((v) => stripRevenue(v, urls));
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value).filter(([k]) => !REVENUE_KEY.test(k) && !(urls && URL_KEY.test(k))).map(([k, v]) => [k, stripRevenue(v, urls)]));
+}
+// Paths whose responses are filtered for a hideRevenue user; urls: also drop offer/postback URLs.
+function revenueFilterFor(path) {
+  if (path === '/stats' || path.startsWith('/stats/') || path === '/api/conversions') return { urls: false };
+  if (path === '/api/offers' || path.startsWith('/api/offers/') || path === '/api/audit' || path === '/api/simulate') return { urls: true };
+  return null;
+}
+// offersAccess 'own': ids of offers used in the streams of campaigns the user can see; null = no restriction.
+function visibleOfferIds(req) {
+  if (!restrictedUser(req) || req.user.offersAccess !== 'own') return null;
+  const allowed = scopeCampaigns(req);
+  const ids = new Set();
+  for (const [id, c] of campaigns) {
+    if (allowed && !allowed.includes(id)) continue;
+    for (const st of c.streams || []) (st.offers ? st.offers.map((o) => o.offerId) : st.offerId ? [st.offerId] : []).forEach((o) => ids.add(o));
+  }
+  return ids;
+}
+
 // Change history (Keitaro «Лог»): who changed what and when. Kept in the JSONL journal; never stores passwords.
 const PRIMITIVE = (v) => v === null || ['string', 'number', 'boolean'].includes(typeof v);
 async function audit(req, action, entity, id, before = null, after = null) {
@@ -1327,7 +1425,9 @@ async function audit(req, action, entity, id, before = null, after = null) {
 }
 
 // Team settings (owner-editable). buyerSharePct: the buyer's share of net profit shown on the dashboard.
-const SETTINGS_DEFAULTS = { buyerSharePct: 35 };
+// dailyRevenueGoal / dailyProfitGoal: the team's daily plan in the default currency (null = no goal).
+const SETTINGS_DEFAULTS = { buyerSharePct: 35, dailyRevenueGoal: null, dailyProfitGoal: null };
+const GOAL_KEYS = ['dailyRevenueGoal', 'dailyProfitGoal'];
 let settings = { ...SETTINGS_DEFAULTS };
 async function loadSettings() {
   try { settings = { ...SETTINGS_DEFAULTS, ...JSON.parse(await readFile(settingsFile, 'utf8')) }; }
@@ -1392,11 +1492,27 @@ async function handleAuthRoute(req, res, url) {
   }
   if (path === '/api/users' && req.method === 'POST') {
     if (!isOwner) return json(res, 403, { error: 'owner_only' });
-    const created = await users.create({ email: body.email, password: body.password, role: body.role || 'buyer' });
-    await audit(req, 'create', 'user', created.id, null, { email: created.email, role: created.role });
+    const created = await users.create({ email: body.email, password: body.password, role: body.role || 'buyer', hideRevenue: body.hideRevenue, offersAccess: body.offersAccess, viewAll: body.viewAll });
+    await audit(req, 'create', 'user', created.id, null, { email: created.email, role: created.role, hideRevenue: created.hideRevenue, offersAccess: created.offersAccess, viewAll: created.viewAll });
     return json(res, 201, { user: created });
   }
   const userDelete = path.match(/^\/api\/users\/([0-9a-f-]{36})$/);
+  if (userDelete && req.method === 'PATCH') {
+    if (!isOwner) return json(res, 403, { error: 'owner_only' });
+    const id = userDelete[1];
+    const all = await users.list();
+    const target = all.find((u) => u.id === id);
+    if (!target) return json(res, 404, { error: 'user_not_found' });
+    const input = { role: body.role, hideRevenue: body.hideRevenue, offersAccess: body.offersAccess, viewAll: body.viewAll };
+    if (input.role !== undefined && input.role !== target.role) {
+      if (req.user?.id === id) return json(res, 409, { error: 'cannot_change_own_role' });
+      if (target.role === 'owner' && all.filter((u) => u.role === 'owner').length === 1) return json(res, 409, { error: 'last_owner' });
+    }
+    const updated = await users.update(id, input);
+    const view = (u) => ({ role: u.role, hideRevenue: u.hideRevenue, offersAccess: u.offersAccess, viewAll: u.viewAll });
+    await audit(req, 'update', 'user', id, view(target), view(updated));
+    return json(res, 200, { user: updated });
+  }
   if (userDelete && req.method === 'DELETE') {
     if (!isOwner) return json(res, 403, { error: 'owner_only' });
     const id = userDelete[1];
@@ -1462,6 +1578,12 @@ const server = http.createServer(async (req, res) => {
     if (requireLogin && isPrivatePath(url.pathname) && !req.user && !bearerAuthorized(req)) {
       if (url.pathname === '/dashboard') { res.writeHead(302, { location: `${basePath}/admin` }); return res.end(); }
       return json(res, 401, { error: 'login_required' });
+    }
+    // Read-only role: every write to the panel API is refused; signing in and out stays possible.
+    if (isViewer(req) && !['GET', 'HEAD'].includes(req.method) && isPrivatePath(url.pathname)) return json(res, 403, { error: 'read_only' });
+    if (hidesRevenue(req)) {
+      if (url.pathname === '/dashboard') { res.writeHead(302, { location: `${basePath}/admin` }); return res.end(); }
+      res.revenueFilter = revenueFilterFor(url.pathname);
     }
     if (url.pathname === '/stats' || url.pathname.startsWith('/stats/') || url.pathname === '/api/clicks' || url.pathname === '/api/conversions' || url.pathname === '/api/bots') {
       req.scope = campaignScope(req, url.searchParams.get('campaign') || null);
@@ -1621,7 +1743,12 @@ const server = http.createServer(async (req, res) => {
         if (!c.streams?.length) return json(res, 404, { error: 'no_streams_configured' });
         visitor.params = trackedParams(url.searchParams, c.paramMap);
         const routing = await offerRouting(c.streams);
-        const picked = pickStream(c.streams, visitor, routing.excluded, c.streamRotation);
+        // Visitor binding: the stream (and offer/landing) this IP + User-Agent got last time, while still valid.
+        const bindKey = c.bindVisitors !== 'off' ? bindingKey(campaignId, normalizeIp(clientIp(req)), req.headers['user-agent'] || '') : null;
+        const picked = (bindKey && boundChoice({ mode: c.bindVisitors, binding: visitorBindings.get(bindKey, c.bindTtlHours * 3600 * 1000), streams: c.streams,
+          matches: (st) => streamMatches(st, visitor), excluded: routing.excluded, pickOffer: weightedPick, pickLanding: weightedPick }))
+          || pickStream(c.streams, visitor, routing.excluded, c.streamRotation);
+        if (bindKey && picked) visitorBindings.set(bindKey, { stream: streamRef(c.streams, picked.stream), offerId: picked.offerId, landingId: picked.landingId || null });
         // A conversion-capped offer hands the click to its alternative; the click is recorded with the offer actually used.
         if (picked?.offerId && routing.substitutes.has(picked.offerId)) picked.offerId = routing.substitutes.get(picked.offerId);
         if (!picked) return json(res, 404, { error: 'no_matching_stream' });
@@ -1724,7 +1851,8 @@ const server = http.createServer(async (req, res) => {
       } else if (TRACK_FIELDS.includes(group) || DIMENSION_FIELDS.includes(group)) {
         rows = (await paramReport({ field: group, campaign, allowed, from, to, currency })).map((r) => ({ key: r.value, ...r }));
       } else return json(res, 400, { error: 'invalid_group' });
-      const columns = ['key', 'clicks', 'conversions', 'revenue', 'cost', 'cr', 'epc', 'rpm', 'uniqueClicks', 'leads', 'sales', 'rejected', 'pendingRevenue', 'profit', 'roi'];
+      const columns = ['key', 'clicks', 'conversions', 'revenue', 'cost', 'cr', 'epc', 'rpm', 'uniqueClicks', 'leads', 'sales', 'rejected', 'pendingRevenue', 'profit', 'roi']
+        .filter((c) => !hidesRevenue(req) || !REVENUE_KEY.test(c));
       // Cells starting with = + - @ are prefixed so spreadsheets do not run them as formulas.
       const cell = (v) => { let text = v === null || v === undefined ? '' : typeof v === 'number' ? String(Math.round(v * 10000) / 10000) : String(v); if (/^[=+\-@]/.test(text) && typeof v !== 'number') text = `'${text}`; return /[",\n;]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text; };
       const csv = [['group', ...columns.slice(1)].join(','), ...rows.map((r) => columns.map((c) => cell(r[c])).join(','))].join('\n') + '\n';
@@ -1796,10 +1924,21 @@ const server = http.createServer(async (req, res) => {
       const body = await readJson(req);
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       if (req.user && req.user.role !== 'owner') return json(res, 403, { error: 'owner_only' });
-      const pct = Number(body.buyerSharePct);
-      if (!Number.isFinite(pct) || pct < 0 || pct > 100) return json(res, 400, { error: 'invalid_buyer_share' });
+      const patch = {};
+      if ('buyerSharePct' in body || !GOAL_KEYS.some((key) => key in body)) {
+        const pct = Number(body.buyerSharePct);
+        if (!Number.isFinite(pct) || pct < 0 || pct > 100) return json(res, 400, { error: 'invalid_buyer_share' });
+        patch.buyerSharePct = Math.round(pct * 100) / 100;
+      }
+      for (const key of GOAL_KEYS) {
+        if (!(key in body)) continue;
+        if (body[key] === null || body[key] === '') { patch[key] = null; continue; }
+        const goal = typeof body[key] === 'number' || typeof body[key] === 'string' ? Number(body[key]) : NaN;
+        if (!Number.isFinite(goal) || goal < 0) return json(res, 400, { error: 'invalid_goal', field: key });
+        patch[key] = Math.round(goal * 100) / 100;
+      }
       const before = { ...settings };
-      settings = { ...settings, buyerSharePct: Math.round(pct * 100) / 100 };
+      settings = { ...settings, ...patch };
       await mkdir(dataDir, { recursive: true });
       await writeFile(settingsFile, JSON.stringify(settings, null, 2) + '\n');
       await audit(req, 'update', 'settings', 'team', before, settings);
@@ -1848,12 +1987,15 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { id, ...updated });
     }
     if (url.pathname === '/api/offers' && req.method === 'GET') {
-      return json(res, 200, { offers: Object.fromEntries(offers) });
+      const visible = visibleOfferIds(req);
+      return json(res, 200, { offers: Object.fromEntries([...offers].filter(([id]) => !visible || visible.has(id))) });
     }
     if (url.pathname === '/api/offers' && req.method === 'POST') {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const body = await readJson(req);
       if (!/^[a-z0-9_-]{2,80}$/i.test(String(body.id || '')) || !/^https:\/\//i.test(String(body.url || ''))) return json(res, 400, { error: 'id_and_https_url_required' });
+      // offersAccess 'own' must not overwrite an offer the user cannot see.
+      if (offers.has(String(body.id)) && visibleOfferIds(req) && !visibleOfferIds(req).has(String(body.id))) return json(res, 409, { error: 'offer_id_taken' });
       if (body.networkId !== undefined && body.networkId !== null && !networks.has(String(body.networkId))) return json(res, 400, { error: 'network_not_found' });
       const capError = conversionCapError(String(body.id), body) || payoutError(body);
       if (capError) return json(res, 400, { error: capError });
@@ -1869,14 +2011,14 @@ const server = http.createServer(async (req, res) => {
     const offerClone = url.pathname.match(/^\/api\/offers\/([A-Za-z0-9_-]{2,80})\/clone$/);
     if (offerClone && req.method === 'POST') {
       if (!(await adminAuthorized(req))) return json(res,401,{error:'admin_authorization_required'});
-      const id=offerClone[1],cur=offers.get(id); if(!cur) return json(res,404,{error:'offer_not_found'});
+      const id=offerClone[1],cur=offers.get(id); if(!cur || (visibleOfferIds(req) && !visibleOfferIds(req).has(id))) return json(res,404,{error:'offer_not_found'});
       let nextId=`${id}-copy`, n=2; while(offers.has(nextId)) nextId=`${id}-copy${n++}`;
       const copy=parseOffer({...cur,name:`${cur.name||id} (копия)`,archived:false}); offers.set(nextId,copy); await persistOffer(nextId,copy); await audit(req,'create','offer',nextId,null,copy); return json(res,201,{id:nextId,...copy});
     }
     if (offerUpdate && req.method === 'PATCH') {
       const id = offerUpdate[1];
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
-      if (!offers.has(id)) return json(res, 404, { error: 'offer_not_found' });
+      if (!offers.has(id) || (visibleOfferIds(req) && !visibleOfferIds(req).has(id))) return json(res, 404, { error: 'offer_not_found' });
       const body = await readJson(req);
       const cur = offers.get(id);
       const newUrl = body.url !== undefined ? String(body.url) : cur.url;
@@ -1893,16 +2035,32 @@ const server = http.createServer(async (req, res) => {
       await audit(req, 'update', 'offer', id, cur, updated);
       return json(res, 200, { id, ...updated });
     }
-    if (url.pathname === '/api/sources' && req.method === 'GET') return json(res, 200, { sources: Object.fromEntries(sources) });
+    // Source postback URLs often carry tokens: buyers see them without the query string and cannot change them.
+    const canSeeSourcePostback = !restrictedUser(req);
+    const publicSource = (s) => (canSeeSourcePostback || !s.postbackUrl ? s : { ...s, postbackUrl: stripQuery(s.postbackUrl), postbackUrlMasked: true });
+    if (url.pathname === '/api/sources' && req.method === 'GET') return json(res, 200, { sources: Object.fromEntries([...sources].map(([id, s]) => [id, publicSource(s)])) });
+    if (url.pathname === '/api/sources/postback-test' && req.method === 'POST') {
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      if (restrictedUser(req)) return json(res, 403, { error: 'owner_only' });
+      const body = await readJson(req);
+      const template = parsePostbackUrl(body.url, { allowHttp: true });
+      if (!template) return json(res, 400, { error: 'invalid_postback_url' });
+      const status = ['lead', 'sale', 'rejected', 'trash'].includes(body.status) ? body.status : 'sale';
+      const target = fillPostbackMacros(template, { ...SAMPLE_MACROS, status });
+      const result = await sendPostback(target, { allowPrivate: sourcePostbackAllowPrivate, timeoutMs: 10000 });
+      return json(res, 200, { ok: !result.error, httpStatus: result.httpStatus, error: result.error, url: stripQuery(target) });
+    }
     if (url.pathname === '/api/sources' && req.method === 'POST') {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const body = await readJson(req);
       if (!OFFER_ID_RE.test(String(body.id || ''))) return json(res, 400, { error: 'valid_id_required' });
+      if (!canSeeSourcePostback) { delete body.postbackUrl; delete body.postbackStatuses; }
+      if (body.postbackUrl && !parsePostbackUrl(body.postbackUrl, { allowHttp: sourcePostbackAllowPrivate })) return json(res, 400, { error: 'invalid_postback_url' });
       const source = parseSource(body);
       if (!source) return json(res, 400, { error: 'invalid_source' });
       sources.set(String(body.id), source);
       await persistSource(String(body.id), source);
-      return json(res, 201, { id: body.id, ...source });
+      return json(res, 201, { id: body.id, ...publicSource(source) });
     }
     const sourceUpdate = url.pathname.match(/^\/api\/sources\/([A-Za-z0-9_-]{2,80})$/);
     if (sourceUpdate && req.method === 'PATCH') {
@@ -1910,6 +2068,8 @@ const server = http.createServer(async (req, res) => {
       const id = sourceUpdate[1];
       if (!sources.has(id)) return json(res, 404, { error: 'source_not_found' });
       const body = await readJson(req);
+      if (!canSeeSourcePostback) { delete body.postbackUrl; delete body.postbackStatuses; }
+      if (body.postbackUrl && !parsePostbackUrl(body.postbackUrl, { allowHttp: sourcePostbackAllowPrivate })) return json(res, 400, { error: 'invalid_postback_url' });
       const cur = sources.get(id);
       const updated = parseSource({
         name: body.name !== undefined ? body.name : cur.name,
@@ -1917,10 +2077,12 @@ const server = http.createServer(async (req, res) => {
         costModel: body.costModel !== undefined ? body.costModel : cur.costModel,
         cpc: body.cpc !== undefined ? body.cpc : cur.cpc,
         costFromParam: body.costFromParam !== undefined ? body.costFromParam : cur.costFromParam,
+        postbackUrl: body.postbackUrl !== undefined ? body.postbackUrl : cur.postbackUrl,
+        postbackStatuses: body.postbackStatuses !== undefined ? body.postbackStatuses : cur.postbackStatuses,
       });
       sources.set(id, updated);
       await persistSource(id, updated);
-      return json(res, 200, { id, ...updated });
+      return json(res, 200, { id, ...publicSource(updated) });
     }
     if (url.pathname === '/api/networks' && req.method === 'GET') return json(res, 200, { networks: Object.fromEntries(networks) });
     if (url.pathname === '/api/networks' && req.method === 'POST') {
@@ -1940,6 +2102,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readJson(req);
       if (!/^[a-z0-9_-]{2,80}$/i.test(String(body.id || ''))) return json(res, 400, { error: 'valid_id_required' });
       if (OFFER_ID_RE.test(String(body.sourceId ?? '')) && !sources.has(String(body.sourceId))) return json(res, 400, { error: 'source_not_found' });
+      if (body.sourcePostbackUrl && !parsePostbackUrl(body.sourcePostbackUrl, { allowHttp: sourcePostbackAllowPrivate })) return json(res, 400, { error: 'invalid_postback_url' });
       if (campaigns.has(String(body.id)) && !canEditCampaign(req, campaigns.get(String(body.id)))) return json(res, 403, { error: 'campaign_not_yours' });
       // A buyer's new campaign is always theirs; the owner may assign it to someone.
       const ownerId = isBuyer(req) ? req.user.id : (body.ownerId ?? req.user?.id ?? null);
@@ -1965,6 +2128,7 @@ const server = http.createServer(async (req, res) => {
       if (!canEditCampaign(req, campaigns.get(id))) return json(res, 403, { error: 'campaign_not_yours' });
       const body = await readJson(req);
       if (OFFER_ID_RE.test(String(body.sourceId ?? '')) && !sources.has(String(body.sourceId))) return json(res, 400, { error: 'source_not_found' });
+      if (body.sourcePostbackUrl && !parsePostbackUrl(body.sourcePostbackUrl, { allowHttp: sourcePostbackAllowPrivate })) return json(res, 400, { error: 'invalid_postback_url' });
       const cur = campaigns.get(id);
       campaigns.set(id, parseCampaign(id, {
         name: body.name === undefined ? cur.name : body.name,
@@ -1986,6 +2150,8 @@ const server = http.createServer(async (req, res) => {
         domain: body.domain === undefined ? cur.domain : body.domain,
         streamRotation: body.streamRotation === undefined ? cur.streamRotation : body.streamRotation,
         uniquenessHours: body.uniquenessHours === undefined ? cur.uniquenessHours : body.uniquenessHours,
+        bindVisitors: body.bindVisitors === undefined ? cur.bindVisitors : body.bindVisitors,
+        bindTtlHours: body.bindTtlHours === undefined ? cur.bindTtlHours : body.bindTtlHours,
         ownerId: body.ownerId === undefined || req.user?.role === 'buyer' ? cur.ownerId : body.ownerId,
         sourceId: body.sourceId === undefined ? cur.sourceId : body.sourceId,
         redirectMethod: body.redirectMethod === undefined ? cur.redirectMethod : body.redirectMethod,
@@ -1997,10 +2163,30 @@ const server = http.createServer(async (req, res) => {
         costModel: body.costModel === undefined ? cur.costModel : body.costModel,
         cpc: body.cpc === undefined ? cur.cpc : body.cpc,
         costFromParam: body.costFromParam === undefined ? cur.costFromParam : body.costFromParam,
+        sourcePostbackUrl: body.sourcePostbackUrl === undefined ? cur.sourcePostbackUrl : body.sourcePostbackUrl,
+        sourcePostbackStatuses: body.sourcePostbackStatuses === undefined ? cur.sourcePostbackStatuses : body.sourcePostbackStatuses,
       }));
       await persistCampaign(id, campaigns.get(id));
       await audit(req, 'update', 'campaign', id, cur, campaigns.get(id));
       return json(res, 200, { id, ...campaigns.get(id) });
+    }
+    // Keitaro «Очистка статистики»: owner only, the body must repeat the campaign id.
+    const clearStats = url.pathname.match(/^\/api\/campaigns\/([A-Za-z0-9_-]{2,80})\/clear-stats$/);
+    if (clearStats && req.method === 'POST') {
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      // Owner only: buyers and viewers (even with viewAll or a personal API key) are refused.
+      if (restrictedUser(req)) return json(res, 403, { error: 'owner_only' });
+      const id = clearStats[1];
+      if (!campaigns.has(id)) return json(res, 404, { error: 'campaign_not_found' });
+      const body = await readJson(req);
+      if (body.confirm !== id) return json(res, 400, { error: 'confirm_mismatch' });
+      const before = body.before ?? null;
+      if (before !== null && (!/^\d{4}-\d{2}-\d{2}$/.test(String(before)) || Number.isNaN(Date.parse(`${before}T00:00:00Z`)))) return json(res, 400, { error: 'invalid_before_date' });
+      const beforeIso = before ? new Date(`${before}T00:00:00Z`).toISOString() : null;
+      const removed = await removeStats(campaignPlan(id, beforeIso ? Date.parse(beforeIso) : null), (pool) => clearCampaignRows(pool, id, beforeIso));
+      console.log(`[clear-stats] ${id}${before ? ` before ${before}` : ''}: ${JSON.stringify(removed)}`);
+      await audit(req, 'clear_stats', 'campaign', id, null, { before: before || 'all', clicks: removed.clicks, conversions: removed.conversions, lpClicks: removed.lpClicks, bots: removed.bots });
+      return json(res, 200, { ok: true, campaign: id, before, removed });
     }
     // Dedicated streams endpoint: PUT /api/campaigns/:id/streams
     const streamsUpdate = url.pathname.match(/^\/api\/campaigns\/([A-Za-z0-9_-]{2,80})\/streams$/);
@@ -2226,6 +2412,12 @@ if (db) {
 }
 if (requirePostgres && !db) throw new Error('REQUIRE_POSTGRES=1, но PostgreSQL недоступен');
 server.listen(port, '127.0.0.1', () => console.log(`Product Umbrella listening on http://127.0.0.1:${server.address().port}`));
+if (retentionDays > 0) {
+  const retentionTick = () => runRetention().catch((error) => console.warn('[retention] failed:', error.message));
+  const firstRunMs = Math.max(0, Number(process.env.RETENTION_DELAY_MS ?? 60000));
+  setTimeout(() => { retentionTick(); setInterval(retentionTick, 86400000).unref(); }, firstRunMs).unref();
+  console.log(`[retention] enabled: ${retentionDays} days`);
+}
 
 async function shutdown() { await new Promise((resolve) => server.close(resolve)); await eventMirror?.drain(); await closeDb(); process.exit(0); }
 process.on('SIGINT', shutdown);
