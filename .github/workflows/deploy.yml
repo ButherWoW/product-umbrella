@@ -196,6 +196,21 @@ jobs:
             done
             nginx -t && systemctl reload nginx'
 
+      - name: Nightly backup (systemd timer, 14 days kept on the server)
+        run: |
+          ssh root@$HOST 'set -e
+            install -m 644 /opt/umbrella/app/deploy/umbrella-backup.service /etc/systemd/system/umbrella-backup.service
+            install -m 644 /opt/umbrella/app/deploy/umbrella-backup.timer /etc/systemd/system/umbrella-backup.timer
+            systemctl daemon-reload
+            systemctl enable --quiet --now umbrella-backup.timer
+            # First run right away so a broken backup shows up in this deploy, not weeks later.
+            if [ -z "$(find /opt/umbrella/backups -maxdepth 1 -name "umbrella-*" -mtime -1 2>/dev/null)" ]; then
+              systemctl start umbrella-backup.service
+              journalctl -u umbrella-backup -n 3 --no-pager -o cat
+            fi
+            ls -lh /opt/umbrella/backups | tail -4
+            systemctl list-timers umbrella-backup.timer --no-pager | head -2'
+
       - name: Seed demo data (only once)
         run: |
           ssh root@$HOST 'cd /opt/umbrella/app && set -a && . /opt/umbrella/.env && set +a && node deploy/seed-demo.mjs http://127.0.0.1:4110'
