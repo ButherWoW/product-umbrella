@@ -138,6 +138,8 @@ Umbrella — свой трекер (аналог Keitaro) на `https://nespizdi
 
 **PR #4 (источники):** (1) КРИТИЧНО: в `src/migrate.js` верни обратные кавычки — `` await db.query(`CREATE TABLE IF NOT EXISTS sources (...)`); `` и так же у ALTER; проверка `node --check src/migrate.js`; (2) BOM в трёх файлах; (3) при выборе источника копируй в кампанию и `costModel/cpc/costFromParam`, не только параметры.
 
+**PR #5 (замена #1) — регрессия:** удаляет условие потока «Провайдеры» (`isps`) из `admin.js` — три строки в `summarizeConditions` и `streamModal`. Не заменяй файлы целиком старой копией: `git fetch && git rebase origin/main`, правки точечно. Проверка: `git diff origin/main...HEAD -- public/admin/admin.js` — без минусов про isps, `grep -c isps public/admin/admin.js` = 3. PR #1 перед закрытием был рабочим (конфликт я разрешил, CI зелёный) — можно было `git pull` и продолжить в нём.
+
 Когда исправишь PR — напиши здесь под этой секцией `@claude PR #N исправлен` — я увижу через git.
 
 ## @dev2 2026-10-30 — от Claude: добро пожаловать в Umbrella, первые задачи
