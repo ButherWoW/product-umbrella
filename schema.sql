@@ -1,4 +1,4 @@
--- Product Umbrella production schema. Kept aligned with src/migrate.js and src/db.js.
+﻿-- Product Umbrella production schema. Kept aligned with src/migrate.js and src/db.js.
 CREATE TABLE IF NOT EXISTS campaigns (
   id text PRIMARY KEY,
   name text NOT NULL,
@@ -76,6 +76,11 @@ CREATE TABLE IF NOT EXISTS conversions (
 
 CREATE INDEX IF NOT EXISTS clicks_campaign_created_idx ON clicks(campaign, created_at);
 CREATE INDEX IF NOT EXISTS clicks_created_idx ON clicks(created_at);
+CREATE TABLE IF NOT EXISTS bots (
+  id BIGSERIAL PRIMARY KEY, campaign TEXT NOT NULL, offer_id TEXT, stream TEXT,
+  user_agent TEXT, ip TEXT, reason TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS bots_campaign_created_idx ON bots(campaign, created_at);
 
 CREATE TABLE IF NOT EXISTS users (
   id uuid PRIMARY KEY,
