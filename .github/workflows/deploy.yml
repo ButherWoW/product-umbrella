@@ -1,0 +1,128 @@
+name: Deploy to nespizdili.lol/umbrella
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-umbrella
+  cancel-in-progress: false
+
+env:
+  HOST: 148.230.98.232
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm ci --no-audit --no-fund
+      - run: npm test
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check secrets
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          ADMIN_TOKEN: ${{ secrets.UMBRELLA_ADMIN_TOKEN }}
+          POSTBACK_SECRET: ${{ secrets.UMBRELLA_POSTBACK_SECRET }}
+        run: |
+          missing=""
+          [ -n "$SSH_PRIVATE_KEY" ] || missing="$missing SSH_PRIVATE_KEY"
+          [ -n "$ADMIN_TOKEN" ] || missing="$missing UMBRELLA_ADMIN_TOKEN"
+          [ -n "$POSTBACK_SECRET" ] || missing="$missing UMBRELLA_POSTBACK_SECRET"
+          if [ -n "$missing" ]; then echo "::error::Add repository secrets:$missing"; exit 1; fi
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+
+      - name: Prepare user and directories
+        run: |
+          ssh root@$HOST 'set -e
+            id umbrella >/dev/null 2>&1 || useradd --system --home /opt/umbrella --shell /usr/sbin/nologin umbrella
+            mkdir -p /opt/umbrella/app /opt/umbrella/data
+            chown -R umbrella:umbrella /opt/umbrella/data
+            node -v'
+
+      - name: Sync app
+        run: |
+          rsync -az --delete-after --exclude node_modules --exclude data --exclude test --exclude .git --exclude '.env*' \
+            ./ root@$HOST:/opt/umbrella/app/
+
+      - name: Write env file
+        env:
+          ADMIN_TOKEN: ${{ secrets.UMBRELLA_ADMIN_TOKEN }}
+          POSTBACK_SECRET: ${{ secrets.UMBRELLA_POSTBACK_SECRET }}
+        run: |
+          umask 077
+          {
+            echo "PORT=4110"
+            echo "BASE_PATH=/umbrella"
+            echo "TRUST_PROXY=1"
+            echo "DATA_DIR=/opt/umbrella/data"
+            echo "CLICK_RATE_LIMIT=120"
+            echo "ADMIN_TOKEN=$ADMIN_TOKEN"
+            echo "POSTBACK_SECRET=$POSTBACK_SECRET"
+          } > umbrella.env
+          rsync -az umbrella.env root@$HOST:/opt/umbrella/.env
+          rm umbrella.env
+          ssh root@$HOST 'chown root:umbrella /opt/umbrella/.env && chmod 640 /opt/umbrella/.env'
+
+      - name: Install deps and restart service
+        run: |
+          ssh root@$HOST 'set -e
+            cd /opt/umbrella/app
+            npm ci --omit=dev --no-audit --no-fund --loglevel=error
+            chown -R root:root /opt/umbrella/app
+            install -m 644 deploy/umbrella.service /etc/systemd/system/umbrella.service
+            systemctl daemon-reload
+            systemctl enable --quiet umbrella
+            systemctl restart umbrella
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              sleep 1
+              curl -sf http://127.0.0.1:4110/health >/dev/null && { echo "umbrella up (${i}s)"; exit 0; }
+            done
+            journalctl -u umbrella -n 40 --no-pager; exit 1'
+
+      - name: Wire nginx (backup, include once, test, rollback on failure)
+        run: |
+          ssh root@$HOST 'set -e
+            install -m 644 /opt/umbrella/app/deploy/nginx-umbrella.conf /etc/nginx/snippets/umbrella.conf
+            SITE=$(grep -lE "server_name[^;]*nespizdili\.lol" /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf 2>/dev/null | head -1)
+            [ -n "$SITE" ] || { echo "nespizdili.lol server block not found"; exit 1; }
+            SITE=$(readlink -f "$SITE")
+            if ! grep -q "include snippets/umbrella.conf;" "$SITE"; then
+              cp "$SITE" "/root/nginx-before-umbrella-$(date +%Y%m%d%H%M%S).conf"
+              cp "$SITE" /tmp/umbrella-site.bak
+              sed -i -E "/server_name[^;]*nespizdili\.lol/a\    include snippets/umbrella.conf;" "$SITE"
+            fi
+            if nginx -t; then systemctl reload nginx; echo "nginx reloaded"
+            else
+              [ -f /tmp/umbrella-site.bak ] && cp /tmp/umbrella-site.bak "$SITE"
+              nginx -t && systemctl reload nginx
+              echo "nginx config rejected, rolled back"; exit 1
+            fi
+            rm -f /tmp/umbrella-site.bak'
+
+      - name: Seed demo data (only once)
+        run: |
+          ssh root@$HOST 'cd /opt/umbrella/app && set -a && . /opt/umbrella/.env && set +a && node deploy/seed-demo.mjs http://127.0.0.1:4110'
+
+      - name: Public check
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" https://nespizdili.lol/umbrella/admin)
+          echo "https://nespizdili.lol/umbrella/admin -> $code"
+          [ "$code" = 200 ]
+          curl -sf https://nespizdili.lol/ -o /dev/null && echo "main site still ok"

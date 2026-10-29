@@ -1,0 +1,21 @@
+[Unit]
+Description=Product Umbrella tracker
+After=network.target
+
+[Service]
+Type=simple
+User=umbrella
+Group=umbrella
+WorkingDirectory=/opt/umbrella/app
+EnvironmentFile=/opt/umbrella/.env
+ExecStart=/usr/bin/env node src/server.js
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/umbrella/data
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
