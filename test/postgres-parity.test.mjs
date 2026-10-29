@@ -15,6 +15,8 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import pg from 'pg';
 import { startTestServer } from './test-server.mjs';
+import { readJournal } from '../src/journal.js';
+import { reconcileEvents } from '../src/reconcile.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const TOKEN = 'parity-token';
@@ -163,7 +165,7 @@ test('JSONL and PostgreSQL give the same reports', { skip: !databaseUrl && 'set 
   t.after(async () => {
     for (const s of servers) await s.stop();
     for (const dir of dirs) await rm(dir, { recursive: true, force: true });
-    await admin.query(`DROP DATABASE IF EXISTS ${dbName} WITH (FORCE)`).catch(() => {});
+    for (const name of [dbName, `${dbName}_replay`]) await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`).catch(() => {});
     await admin.end();
   });
   await promisify(execFile)(process.execPath, ['src/migrate.js'], { env: { ...process.env, DATABASE_URL: ownUrl } });
@@ -208,6 +210,22 @@ test('JSONL and PostgreSQL give the same reports', { skip: !databaseUrl && 'set 
     assert.deepEqual([cpc.revenue, cpc.revenueIgnored], [1.2345, true]);
     assert.ok(rows.filter((c) => c.offerId !== 'o-cpc').every((c) => c.revenueIgnored === false));
   }
+
+  // The reconciliation job replays the CPC flag too: P's journal into an empty database gives the same conversion rows.
+  const replayDb = `${dbName}_replay`; // dropped with the main database in t.after
+  await admin.query(`CREATE DATABASE ${replayDb}`);
+  const replayUrl = new URL(databaseUrl); replayUrl.pathname = `/${replayDb}`;
+  await promisify(execFile)(process.execPath, ['src/migrate.js'], { env: { ...process.env, DATABASE_URL: replayUrl.toString() } });
+  const conversionRows = async (url) => {
+    const c = new pg.Client({ connectionString: url }); await c.connect();
+    try { return (await c.query(`SELECT click_id::text, tid, revenue::float, currency, status, revenue_ignored, created_at, COALESCE(updated_at, created_at) AS updated_at
+      FROM conversions ORDER BY click_id, tid`)).rows; } finally { await c.end(); }
+  };
+  const replayPool = new pg.Pool({ connectionString: replayUrl.toString() });
+  try { await reconcileEvents({ db: replayPool, events: await readJournal(P.journal) }); } finally { await replayPool.end(); }
+  const replayed = await conversionRows(replayUrl.toString());
+  assert.deepEqual(replayed, await conversionRows(ownUrl), 'reconciliation writes the same conversion rows as the live mirror');
+  assert.equal(replayed.filter((r) => r.revenue_ignored).length, 1);
 
   // 7: `to` covers the whole last second of the day (a click at 23:59:59.5).
   const late = { type: 'click', clickId: '11111111-2222-4333-8444-555555555555', campaign: 'c3', offerId: 'o-cpa1', stream: 'x', at: '2020-01-01T23:59:59.500Z',
