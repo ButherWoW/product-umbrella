@@ -23,10 +23,10 @@ export function normalizeStatus(raw) {
 }
 
 // Latest conversion of a click ({ status, revenue, currency }) or null. Rows written before statuses existed are sales.
-export async function findRecordedConversion({ clickId, eventsFile, db = null, onFallback = () => {} }) {
+export async function findRecordedConversion({ clickId, tid = null, eventsFile, db = null, onFallback = () => {} }) {
   if (db) {
     try {
-      const { rows } = await db.query('SELECT status, revenue, currency FROM conversions WHERE click_id = $1', [clickId]);
+      const { rows } = await db.query('SELECT status, revenue, currency FROM conversions WHERE click_id = $1 AND tid IS NOT DISTINCT FROM $2 ORDER BY created_at DESC LIMIT 1', [clickId, tid]);
       if (rows.length) return { status: rows[0].status || 'sale', revenue: rows[0].revenue === null ? null : Number(rows[0].revenue), currency: rows[0].currency };
     } catch (error) { onFallback(error); }
   }
@@ -34,16 +34,16 @@ export async function findRecordedConversion({ clickId, eventsFile, db = null, o
   try {
     for (const line of (await readFile(eventsFile, 'utf8')).split('\n')) {
       if (!line.includes(clickId)) continue;
-      try { const item = JSON.parse(line); if (item?.type === 'conversion' && item.clickId === clickId) latest = item; } catch { /* skip */ }
+      try { const item = JSON.parse(line); if (item?.type === 'conversion' && item.clickId === clickId && (item.tid ?? null) === (tid ?? null)) latest = item; } catch { /* skip */ }
     }
   } catch (error) { if (error.code !== 'ENOENT') throw error; }
   return latest ? { status: latest.status || 'sale', revenue: latest.revenue ?? null, currency: latest.currency ?? null } : null;
 }
 
-export async function hasRecordedConversion({ clickId, eventsFile, db = null, onFallback = () => {} }) {
+export async function hasRecordedConversion({ clickId, tid = null, eventsFile, db = null, onFallback = () => {} }) {
   if (db) {
     try {
-      const { rows } = await db.query('SELECT 1 FROM conversions WHERE click_id = $1', [clickId]);
+      const { rows } = await db.query('SELECT 1 FROM conversions WHERE click_id = $1 AND tid IS NOT DISTINCT FROM $2', [clickId, tid]);
       if (rows.length) return true;
       // PostgreSQL is an asynchronous mirror: a successful empty result does not
       // prove that the source JSONL journal has no conversion yet.
@@ -52,7 +52,7 @@ export async function hasRecordedConversion({ clickId, eventsFile, db = null, on
   try {
     const lines = (await readFile(eventsFile, 'utf8')).split('\n');
     return lines.some((line) => {
-      try { const item = JSON.parse(line); return item?.type === 'conversion' && item.clickId === clickId; }
+      try { const item = JSON.parse(line); return item?.type === 'conversion' && item.clickId === clickId && (item.tid ?? null) === (tid ?? null); }
       catch { return false; }
     });
   } catch (error) {
@@ -93,15 +93,16 @@ export function conversionValues(rawRevenue, rawCurrency) {
 export function createConversionRecorder({ findClick, hasConversion, currentConversion = null, record, windowDaysForClick = () => null,
   onRecorded = () => {}, onDeliveryError = () => {}, now = Date.now }) {
   const lock = createKeyedLock();
-  return async ({ clickId, revenue: rawRevenue, currency: rawCurrency, status: rawStatus }) => {
+  return async ({ clickId, tid: rawTid = null, revenue: rawRevenue, currency: rawCurrency, status: rawStatus, params = null }) => {
     if (!clickId) throw failure(400, 'click_id_required');
     if (typeof clickId !== 'string' || !CLICK_ID.test(clickId)) throw failure(400, 'invalid_click_id');
     const id = clickId.toLowerCase();
-    return lock(id, async () => {
+    const tid = rawTid === null || rawTid === '' ? null : String(rawTid).slice(0, 200);
+    return lock(`${id}:${tid || ''}`, async () => {
       const click = await findClick(id);
       if (!click) throw failure(404, 'click_not_found');
       const status = normalizeStatus(rawStatus);
-      const existing = currentConversion ? await currentConversion(id) : ((await hasConversion(id)) ? { status: 'sale' } : null);
+      const existing = currentConversion ? await currentConversion(id, tid) : ((await hasConversion(id, tid)) ? { status: 'sale' } : null);
       // Same status again is a duplicate; a different status is an update (lead → sale, sale → rejected, …).
       if (existing && (existing.status || 'sale') === status) throw failure(409, 'conversion_already_recorded');
       const windowDays = existing ? null : windowDaysForClick(click);
@@ -119,7 +120,7 @@ export function createConversionRecorder({ findClick, hasConversion, currentConv
       }
       // Without an explicit status a first conversion is written exactly as before statuses existed (implicitly a sale).
       const explicit = rawStatus !== null && rawStatus !== undefined && rawStatus !== '';
-      const payload = { clickId: id, ...values, ...(explicit || existing ? { status } : {}), ...(existing ? { previousStatus: existing.status || 'sale' } : {}) };
+      const payload = { clickId: id, tid, params, ...values, ...(explicit || existing ? { status } : {}), ...(existing ? { previousStatus: existing.status || 'sale' } : {}) };
       // Duplicate check and successful JSONL append are inside the same lock.
       // Record failures release the lock and leave the click retryable.
       const recorded = await record(payload);

@@ -1022,9 +1022,9 @@ function json(res, status, body) {
 
 const recordPostback = createConversionRecorder({
   findClick: getClickData,
-  hasConversion: (clickId) => hasRecordedConversion({ clickId, eventsFile, db,
+  hasConversion: (clickId, tid) => hasRecordedConversion({ clickId, tid, eventsFile, db,
     onFallback: (error) => console.warn('[db] hasConversion fallback:', error.message) }),
-  currentConversion: (clickId) => findRecordedConversion({ clickId, eventsFile, db,
+  currentConversion: (clickId, tid) => findRecordedConversion({ clickId, tid, eventsFile, db,
     onFallback: (error) => console.warn('[db] currentConversion fallback:', error.message) }),
   windowDaysForClick: (click) => campaigns.get(click.campaign)?.conversionWindowDays,
   record: (payload) => event('conversion', payload),
@@ -1505,7 +1505,7 @@ const server = http.createServer(async (req, res) => {
       if (postbackSecret && !safeEqual(url.searchParams.get('secret'), postbackSecret)) return json(res, 401, { error: 'invalid_postback_secret' });
       try {
         const result = await recordPostback({ clickId: url.searchParams.get('click_id'),
-          revenue: url.searchParams.get('revenue'), currency: url.searchParams.get('currency'), status: url.searchParams.get('status') });
+          tid: url.searchParams.get('tid'), params: Object.fromEntries([...url.searchParams].filter(([k]) => /^sub_id_[1-9]$|^sub_id_[12][0-9]$|^sub_id_30$/.test(k))), revenue: url.searchParams.get('revenue'), currency: url.searchParams.get('currency'), status: url.searchParams.get('status') });
         return json(res, 200, result);
       } catch (error) {
         if (!error.statusCode) throw error;

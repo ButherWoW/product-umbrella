@@ -29,10 +29,17 @@ export function createEventMirror({ query, onError = () => {} }) {
         await query('UPDATE clicks SET lp_clicked_at = COALESCE(lp_clicked_at, $2) WHERE click_id = $1', [payload.clickId, at]);
       } else {
         // Status updates (lead → sale → rejected) overwrite the row; the keyed lock keeps journal order.
-        await query(`INSERT INTO conversions (click_id, revenue, currency, status, created_at)
+        if (payload.tid == null && !payload.params) {
+          await query(`INSERT INTO conversions (click_id, revenue, currency, status, created_at)
           VALUES ($1,$2,$3,$4,$5) ON CONFLICT (click_id) DO UPDATE
           SET revenue = EXCLUDED.revenue, currency = EXCLUDED.currency, status = EXCLUDED.status, updated_at = now()`,
-        [payload.clickId, payload.revenue ?? null, payload.currency ?? null, payload.status || 'sale', at]);
+          [payload.clickId, payload.revenue ?? null, payload.currency ?? null, payload.status || 'sale', at]);
+          return;
+        }
+        await query(`INSERT INTO conversions (click_id, tid, revenue, currency, status, params, created_at)
+          VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7) ON CONFLICT (click_id, tid) DO UPDATE
+          SET revenue = EXCLUDED.revenue, currency = EXCLUDED.currency, status = EXCLUDED.status, params = EXCLUDED.params, updated_at = now()`,
+        [payload.clickId, payload.tid ?? null, payload.revenue ?? null, payload.currency ?? null, payload.status || 'sale', payload.params ? JSON.stringify(payload.params) : null, at]);
       }
     }).catch((error) => { onError(type, error); });
     // A logging callback must not cause an unhandled rejected mirror promise.
