@@ -549,17 +549,20 @@ function parseOffer(raw) {
   const urlStr = typeof raw === 'string' ? raw : String(raw?.url || '');
   if (!/^https:\/\//i.test(urlStr)) return null;
   const postbackUrl = raw?.postbackUrl && /^https:\/\//i.test(String(raw.postbackUrl)) ? String(raw.postbackUrl).slice(0, 2048) : null;
+  const payoutType = raw?.payoutType === 'cpc' ? 'cpc' : 'cpa';
+  const payout = raw?.payout === null || raw?.payout === undefined || raw?.payout === '' ? null : (Number.isFinite(Number(raw.payout)) && Number(raw.payout) >= 0 ? Number(raw.payout) : null);
+  const payoutCurrency = /^[A-Z]{3}$/i.test(String(raw?.payoutCurrency || '')) ? String(raw.payoutCurrency).toUpperCase() : null;
   const dailyCap = Number.isInteger(raw?.dailyCap) && raw.dailyCap > 0 ? raw.dailyCap : null;
   const name = typeof raw?.name === 'string' && raw.name.trim() ? raw.name.trim().slice(0, 200) : null;
   const networkId = OFFER_ID_RE.test(String(raw?.networkId || '')) ? String(raw.networkId) : null;
-  return { url: urlStr, postbackUrl, dailyCap, name, networkId, archived: raw?.archived === true, group: typeof raw?.group === 'string' ? raw.group.trim().slice(0, 60) : '' };
+  return { url: urlStr, postbackUrl, payoutType, payout, payoutCurrency, dailyCap, name, networkId, archived: raw?.archived === true, group: typeof raw?.group === 'string' ? raw.group.trim().slice(0, 60) : '' };
 }
 
 async function loadOffers() {
   if (db) {
     try {
       const { rows } = await db.query('SELECT id, url, postback_url, daily_cap, name, network_id, "group", archived FROM offers');
-      for (const row of rows) if (/^[a-z0-9_-]{2,80}$/i.test(row.id) && /^https:\/\//i.test(row.url)) offers.set(row.id, parseOffer({ url: row.url, postbackUrl: row.postback_url, dailyCap: row.daily_cap, name: row.name, networkId: row.network_id, group: row.group, archived: row.archived === true }));
+      for (const row of rows) if (/^[a-z0-9_-]{2,80}$/i.test(row.id) && /^https:\/\//i.test(row.url)) offers.set(row.id, parseOffer({ url: row.url, postbackUrl: row.postback_url, payoutType: row.payout_type, payout: row.payout, payoutCurrency: row.payout_currency, dailyCap: row.daily_cap, name: row.name, networkId: row.network_id, group: row.group, archived: row.archived === true }));
       return;
     } catch (error) { console.warn('[db] offers load fallback:', error.message); }
   }
@@ -580,7 +583,7 @@ async function saveOffers() {
 
 async function persistOffer(id, value) {
   const offer = typeof value === 'string' ? { url: value, postbackUrl: null } : value;
-  if (db) await db.query('INSERT INTO offers (id, url, postback_url, daily_cap, name, network_id, "group", archived) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (id) DO UPDATE SET url = EXCLUDED.url, postback_url = EXCLUDED.postback_url, daily_cap = EXCLUDED.daily_cap, name = EXCLUDED.name, network_id = EXCLUDED.network_id, "group" = EXCLUDED."group", archived = EXCLUDED.archived', [id, offer.url, offer.postbackUrl, offer.dailyCap ?? null, offer.name ?? null, offer.networkId ?? null, offer.group ?? '', offer.archived === true]);
+  if (db) await db.query('INSERT INTO offers (id, url, postback_url, payout_type, payout, payout_currency, daily_cap, name, network_id, "group", archived) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO UPDATE SET url=EXCLUDED.url, postback_url=EXCLUDED.postback_url, payout_type=EXCLUDED.payout_type, payout=EXCLUDED.payout, payout_currency=EXCLUDED.payout_currency, daily_cap=EXCLUDED.daily_cap, name=EXCLUDED.name, network_id=EXCLUDED.network_id, "group"=EXCLUDED."group", archived=EXCLUDED.archived', [id, offer.url, offer.postbackUrl, offer.payoutType, offer.payout, offer.payoutCurrency, offer.dailyCap ?? null, offer.name ?? null, offer.networkId ?? null, offer.group ?? '', offer.archived === true]);
   else await saveOffers();
 }
 
@@ -984,11 +987,21 @@ const recordPostback = createConversionRecorder({
     const offer = offers.get(click.offerId);
     if (!offer?.postbackUrl) return;
     const s2sUrl = applyMacros(offer.postbackUrl, { click_id: clickId, revenue: revenue ?? '', currency: currency ?? '', status: status || 'sale' });
-    fetch(s2sUrl, { signal: AbortSignal.timeout(10000) })
-      .then(async (response) => {
-        await response.body?.cancel();
-        if (!response.ok) console.warn('[s2s] postback HTTP:', response.status);
-      }).catch((error) => console.warn('[s2s] postback failed:', error.message));
+    const deliver = async () => {
+      let last = null;
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        try {
+          const response = await fetch(s2sUrl, { signal: AbortSignal.timeout(10000) });
+          await response.body?.cancel();
+          await event('postback_out', { clickId, offerId: click.offerId, url: s2sUrl.replace(/([?&]secret=)[^&]+/i, '$1[redacted]'), statusCode: response.status, attempt });
+          if (response.ok) return;
+          last = new Error(`HTTP ${response.status}`);
+        } catch (error) { last = error; await event('postback_out', { clickId, offerId: click.offerId, url: s2sUrl.replace(/([?&]secret=)[^&]+/i, '$1[redacted]'), statusCode: 0, error: error.message, attempt }); }
+        if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
+      }
+      if (last) console.warn('[s2s] postback failed after retries:', last.message);
+    };
+    deliver().catch((error) => console.warn('[s2s] postback failed:', error.message));
   },
   onDeliveryError: (error) => console.warn('[s2s] postback scheduling failed:', error.message),
 });
@@ -1170,6 +1183,21 @@ async function readAudit({ entity, id, limit }) {
       const item = JSON.parse(lines[i]);
       if (item.type !== 'audit' || (entity && item.entity !== entity) || (id && item.entityId !== id)) continue;
       out.push({ at: item.at, actor: item.actor, action: item.action, entity: item.entity, entityId: item.entityId, changes: item.changes || {} });
+    } catch { /* skip */ }
+  }
+  return out;
+}
+
+async function readPostbacks({ direction, campaign, limit = 200 }) {
+  let lines = [];
+  try { lines = (await readFile(eventsFile, 'utf8')).split('\n'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  const out = [];
+  for (let i = lines.length - 1; i >= 0 && out.length < limit; i -= 1) {
+    try {
+      const item = JSON.parse(lines[i]);
+      if (item.type !== `postback_${direction}`) continue;
+      if (campaign && item.campaign !== campaign) continue;
+      out.push(item);
     } catch { /* skip */ }
   }
   return out;
@@ -1439,11 +1467,13 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/postback' && req.method === 'GET') {
       if (postbackSecret && !safeEqual(url.searchParams.get('secret'), postbackSecret)) return json(res, 401, { error: 'invalid_postback_secret' });
+      await event('postback_in', { clickId: url.searchParams.get('click_id') || null, status: url.searchParams.get('status') || 'sale', revenue: url.searchParams.get('revenue') || null, currency: url.searchParams.get('currency') || null });
       try {
         const result = await recordPostback({ clickId: url.searchParams.get('click_id'),
           revenue: url.searchParams.get('revenue'), currency: url.searchParams.get('currency'), status: url.searchParams.get('status') });
         return json(res, 200, result);
       } catch (error) {
+        await event('postback_in', { clickId: url.searchParams.get('click_id') || null, statusCode: error.statusCode || 500, error: error.message });
         if (!error.statusCode) throw error;
         return json(res, error.statusCode, { error: error.message,
           ...(error.conversionWindowDays ? { conversionWindowDays: error.conversionWindowDays } : {}) });
@@ -1589,6 +1619,11 @@ const server = http.createServer(async (req, res) => {
       const entries = await readAudit({ entity, id: entityId, limit: mine ? 2000 : limit });
       return json(res, 200, { entries: mine ? entries.filter((e) => e.actor === req.user.email || (e.entity === 'campaign' && mine.includes(e.entityId))).slice(0, limit) : entries });
     }
+    if (url.pathname === '/api/postbacks' && req.method === 'GET') {
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      const direction = url.searchParams.get('direction') === 'out' ? 'out' : 'in';
+      return json(res, 200, { postbacks: await readPostbacks({ direction, campaign: url.searchParams.get('campaign') || null, limit: Math.min(500, Math.max(1, Number(url.searchParams.get('limit') || 200))) }) });
+    }
     if (url.pathname === '/api/domains' && req.method === 'GET') return json(res, 200, { primary: primaryHost || null, domains: await trackingDomains() });
     if (url.pathname === '/api/rates' && req.method === 'GET') return json(res, 200, { defaultCurrency: rates.defaultCurrency, ...rates.info() });
     if (url.pathname === '/api/landings' && req.method === 'GET') return json(res, 200, { landings: Object.fromEntries(landings) });
@@ -1625,7 +1660,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readJson(req);
       if (!/^[a-z0-9_-]{2,80}$/i.test(String(body.id || '')) || !/^https:\/\//i.test(String(body.url || ''))) return json(res, 400, { error: 'id_and_https_url_required' });
       if (body.networkId !== undefined && body.networkId !== null && !networks.has(String(body.networkId))) return json(res, 400, { error: 'network_not_found' });
-      const offer = parseOffer({ url: String(body.url), postbackUrl: body.postbackUrl, dailyCap: body.dailyCap, name: body.name, networkId: body.networkId, archived: body.archived, group: body.group });
+      const offer = parseOffer({ url: String(body.url), postbackUrl: body.postbackUrl, payoutType: body.payoutType, payout: body.payout, payoutCurrency: body.payoutCurrency, dailyCap: body.dailyCap, name: body.name, networkId: body.networkId, archived: body.archived, group: body.group });
       if (!offer) return json(res, 400, { error: 'id_and_https_url_required' });
       offers.set(String(body.id), offer);
       await persistOffer(String(body.id), offer);
@@ -1650,7 +1685,7 @@ const server = http.createServer(async (req, res) => {
       const newPostbackUrl = body.postbackUrl !== undefined ? body.postbackUrl : cur.postbackUrl;
       const newDailyCap = body.dailyCap !== undefined ? body.dailyCap : cur.dailyCap;
       if (body.networkId !== undefined && body.networkId !== null && !networks.has(String(body.networkId))) return json(res, 400, { error: 'network_not_found' });
-      const updated = parseOffer({ url: newUrl, postbackUrl: newPostbackUrl, dailyCap: newDailyCap, name: body.name !== undefined ? body.name : cur.name, networkId: body.networkId !== undefined ? body.networkId : cur.networkId, archived: body.archived !== undefined ? body.archived : cur.archived, group: body.group !== undefined ? body.group : cur.group });
+      const updated = parseOffer({ url: newUrl, postbackUrl: newPostbackUrl, payoutType: body.payoutType !== undefined ? body.payoutType : cur.payoutType, payout: body.payout !== undefined ? body.payout : cur.payout, payoutCurrency: body.payoutCurrency !== undefined ? body.payoutCurrency : cur.payoutCurrency, dailyCap: newDailyCap, name: body.name !== undefined ? body.name : cur.name, networkId: body.networkId !== undefined ? body.networkId : cur.networkId, archived: body.archived !== undefined ? body.archived : cur.archived, group: body.group !== undefined ? body.group : cur.group });
       if (!updated) return json(res, 400, { error: 'invalid_url' });
       offers.set(id, updated);
       await persistOffer(id, updated);
