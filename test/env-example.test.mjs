@@ -16,7 +16,8 @@ const TEST_ONLY = new Set(['TEST_DATABASE_URL', 'PLAYWRIGHT_MODULE']);
 export function envNames(source, isShell) {
   const names = new Set();
   const patterns = isShell
-    ? [/\$\{([A-Z][A-Z0-9_]*):[-?=]/g] // ${NAME:-default} / ${NAME:?error}: read from the environment
+    // ${NAME:-default}: read from the environment with a default (${NAME:?} is only an empty-variable guard).
+    ? [/\$\{([A-Z][A-Z0-9_]*):[-=]/g]
     : [/\bprocess\.env\.([A-Z][A-Z0-9_]*)/g, /\bprocess\.env\[['"]([A-Z][A-Z0-9_]*)['"]\]/g,
       /\benv\.([A-Z][A-Z0-9_]*)/g, // helpers that take (env = process.env)
       // Helpers that read process.env[name] / env[name] for a literal first argument:
@@ -37,7 +38,7 @@ const example = readFileSync(join(root, '.env.example'), 'utf8');
 const listed = new Set([...example.matchAll(/^#?\s*([A-Z][A-Z0-9_]*)=/gm)].map((m) => m[1]));
 
 test('the scan finds the variables (guards against a broken regex)', () => {
-  for (const name of ['DATABASE_URL', 'ADMIN_TOKEN', 'LOG_FILE', 'SOURCE_POSTBACK_ALLOW_PRIVATE', 'KEITARO_API_KEY', 'BACKUP_DIR', 'LP_CLICK_RATE_LIMIT', 'LOGIN_WINDOW_MS']) {
+  for (const name of ['DATABASE_URL', 'ADMIN_TOKEN', 'LOG_FILE', 'SOURCE_POSTBACK_ALLOW_PRIVATE', 'KEITARO_API_KEY', 'KEEP_DAYS', 'LP_CLICK_RATE_LIMIT', 'LOGIN_WINDOW_MS']) {
     assert.ok(used.has(name), `${name} not found by the scan`);
   }
 });
