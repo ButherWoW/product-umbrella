@@ -71,6 +71,28 @@ try {
   await page.locator('.editor-head .btn.primary').click();
   await page.locator('#toast', { hasText: 'Сохранено' }).waitFor();
 
+  // Partner networks: create/edit UI, copy-safe postback template, and offer binding.
+  await page.goto(server.url + '/admin#/networks');
+  await page.getByRole('button', { name: 'Создать сеть' }).click();
+  const networkDialog = page.getByRole('dialog', { name: 'Новая сеть' });
+  await networkDialog.locator('input').nth(0).fill('net-ui');
+  await networkDialog.locator('input').nth(1).fill('UI Network');
+  await networkDialog.locator('input').nth(3).fill('sub1');
+  await networkDialog.locator('input').nth(4).fill('payout');
+  await networkDialog.getByRole('button', { name: 'Сохранить' }).click();
+  await page.locator('table.grid tbody tr', { hasText: 'UI Network' }).waitFor();
+  await page.locator('table.grid tbody tr', { hasText: 'UI Network' }).getByRole('button', { name: 'Изменить' }).click();
+  const savedNetworkDialog = page.getByRole('dialog', { name: 'Редактирование сети' });
+  assert.match(await savedNetworkDialog.innerText(), /click_id=\{sub1\}/);
+  assert.match(await savedNetworkDialog.innerText(), /POSTBACK_SECRET/);
+  await savedNetworkDialog.getByRole('button', { name: 'Отмена' }).click();
+  await page.goto(server.url + '/admin#/offers');
+  await page.locator('table.grid tbody tr', { hasText: 'offer-1' }).getByRole('button', { name: 'Изменить' }).click();
+  const offerDialog = page.getByRole('dialog', { name: 'Редактирование оффера' });
+  await offerDialog.getByLabel('Партнёрская сеть').selectOption('net-ui');
+  await offerDialog.getByRole('button', { name: 'Сохранить' }).click();
+  assert.equal((await (await fetch(server.url + '/api/offers')).json()).offers['offer-1'].networkId, 'net-ui');
+
 
   // Currency switch on the dashboard: 25 USD = 20 EUR = 2000 RUB at the fixed test rates.
   await page.goto(server.url + '/admin#/dashboard');
