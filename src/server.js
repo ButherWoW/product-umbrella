@@ -495,6 +495,7 @@ function parseCampaign(id, value) {
     // Revenue cap: stop after earning revenueCap per day
     revenueCap: typeof value.revenueCap === 'number' && value.revenueCap > 0 ? value.revenueCap : null,
     botFilter: value.botFilter === true,
+    domain: DOMAIN_RE.test(String(value.domain || '').toLowerCase()) ? String(value.domain).toLowerCase() : null,
     streamRotation: value.streamRotation === 'position' ? 'position' : 'weight',
     uniquenessHours: Number.isInteger(value.uniquenessHours) && value.uniquenessHours >= 1 && value.uniquenessHours <= 720 ? value.uniquenessHours : 24,
     ownerId: /^[0-9a-f-]{36}$/i.test(String(value.ownerId || '')) ? String(value.ownerId).toLowerCase() : null,
@@ -702,9 +703,25 @@ async function persistLanding(id, landing) {
 }
 
 // Public URL of this tracker as the visitor sees it (behind a proxy: scheme from X-Forwarded-Proto, plus BASE_PATH).
+// Tracking domains (Keitaro «Домены»): any host other than PRIMARY_HOST serves only tracking routes at the root,
+// without BASE_PATH. The panel and APIs stay on the primary host.
+const primaryHost = String(process.env.PRIMARY_HOST || '').toLowerCase();
+const requestHost = (req) => String(req.headers.host || '').toLowerCase().replace(/:\d+$/, '');
+// Local calls (deploy checks, seeding) count as the primary host.
+const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
+const onTrackingDomain = (req) => Boolean(primaryHost) && requestHost(req) !== primaryHost && !LOCAL_HOSTS.has(requestHost(req));
+const isTrackingPath = (p) => p.startsWith('/r/') || p === '/lp/click' || p === '/postback' || p === '/health';
+const DOMAIN_RE = /^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
+async function trackingDomains() {
+  try {
+    return (await readFile(join(root, 'deploy', 'domains.txt'), 'utf8')).split('\n').map((l) => l.trim().toLowerCase())
+      .filter((l) => l && !l.startsWith('#') && DOMAIN_RE.test(l));
+  } catch { return []; }
+}
+
 function publicBase(req) {
   const proto = trustProxyHops > 0 && req.headers['x-forwarded-proto'] === 'https' ? 'https' : (req.socket?.encrypted ? 'https' : 'http');
-  return `${proto}://${req.headers.host || 'localhost'}${basePath}`;
+  return `${proto}://${req.headers.host || 'localhost'}${onTrackingDomain(req) ? '' : basePath}`;
 }
 
 // Full click record for /lp/click. PostgreSQL first; JSONL when the mirror has not caught up yet.
@@ -1021,6 +1038,10 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     securityHeaders(res, url.pathname);
+    if (onTrackingDomain(req) && !isTrackingPath(url.pathname)) {
+      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+      return res.end('Not Found');
+    }
     req.user = await sessionUser(req);
     if (requireLogin && isPrivatePath(url.pathname) && !req.user && !bearerAuthorized(req)) {
       if (url.pathname === '/dashboard') { res.writeHead(302, { location: `${basePath}/admin` }); return res.end(); }
@@ -1232,6 +1253,20 @@ const server = http.createServer(async (req, res) => {
         stream: url.searchParams.get('stream') || null,
       }));
     }
+    if (url.pathname === '/stats/compare' && req.method === 'GET') {
+      const from = url.searchParams.get('from');
+      const to = url.searchParams.get('to');
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(from || '') || !/^\d{4}-\d{2}-\d{2}$/.test(to || '')) return json(res, 400, { error: 'from_and_to_dates_required' });
+      const start = Date.parse(`${from}T00:00:00Z`), end = Date.parse(`${to}T00:00:00Z`);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return json(res, 400, { error: 'invalid_date_range' });
+      const span = end - start + 86400000;
+      const previousFrom = new Date(start - span).toISOString().slice(0, 10);
+      const previousTo = new Date(start - 86400000).toISOString().slice(0, 10);
+      const common = { currency: reportCurrency(url.searchParams.get('currency')), campaign: url.searchParams.get('campaign') || null, allowed: req.scope?.allowed || null, subid: url.searchParams.get('subid') || null, country: url.searchParams.get('country') || null, offer: url.searchParams.get('offer') || null, stream: url.searchParams.get('stream') || null };
+      const [current, previous] = await Promise.all([stats({ ...common, from, to }), stats({ ...common, from: previousFrom, to: previousTo })]);
+      const delta = (key) => previous[key] ? (current[key] - previous[key]) / Math.abs(previous[key]) * 100 : (current[key] ? null : 0);
+      return json(res, 200, { current, previous, previousFrom, previousTo, deltaPct: { clicks: delta('clicks'), conversions: delta('conversions'), revenue: delta('revenue') } });
+    }
     // CSV export for spreadsheets and scripts: GET /stats/export?group=campaign|offer|stream|landing|country|day|hour|<param>&from&to&campaign&currency
     if (url.pathname === '/stats/export' && req.method === 'GET') {
       const group = url.searchParams.get('group') || 'campaign';
@@ -1303,6 +1338,7 @@ const server = http.createServer(async (req, res) => {
       const entries = await readAudit({ entity, id: entityId, limit: mine ? 2000 : limit });
       return json(res, 200, { entries: mine ? entries.filter((e) => e.actor === req.user.email || (e.entity === 'campaign' && mine.includes(e.entityId))).slice(0, limit) : entries });
     }
+    if (url.pathname === '/api/domains' && req.method === 'GET') return json(res, 200, { primary: primaryHost || null, domains: await trackingDomains() });
     if (url.pathname === '/api/rates' && req.method === 'GET') return json(res, 200, { defaultCurrency: rates.defaultCurrency, ...rates.info() });
     if (url.pathname === '/api/landings' && req.method === 'GET') return json(res, 200, { landings: Object.fromEntries(landings) });
     if (url.pathname === '/api/landings' && req.method === 'POST') {
@@ -1399,6 +1435,7 @@ const server = http.createServer(async (req, res) => {
         dedupeWindow: body.dedupeWindow === undefined ? cur.dedupeWindow : body.dedupeWindow,
         revenueCap: body.revenueCap === undefined ? cur.revenueCap : body.revenueCap,
         botFilter: body.botFilter === undefined ? cur.botFilter : body.botFilter,
+        domain: body.domain === undefined ? cur.domain : body.domain,
         streamRotation: body.streamRotation === undefined ? cur.streamRotation : body.streamRotation,
         uniquenessHours: body.uniquenessHours === undefined ? cur.uniquenessHours : body.uniquenessHours,
         ownerId: body.ownerId === undefined || req.user?.role === 'buyer' ? cur.ownerId : body.ownerId,

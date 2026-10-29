@@ -86,6 +86,7 @@ async function loadRefs() {
   state.offers = o.offers || {};
   state.campaigns = c.campaigns || {};
   state.landings = l.landings || {};
+  state.domains = (await api('/api/domains').catch(() => ({ domains: [] }))).domains || [];
   // Owners see the team list (for assigning campaigns and per-buyer earnings); buyers get 403 and an empty list.
   state.users = isOwnerView() ? ((await api('/api/users').catch(() => ({ users: [] }))).users || []) : [];
 }
@@ -353,7 +354,8 @@ const metricCols = (opts = {}) => [
 const sum = (rows, key) => rows.reduce((s, r) => s + (Number(r[key]) || 0), 0);
 const groupRows = (obj) => Object.entries(obj || {}).map(([id, v]) => ({ id, clicks: v.clicks || 0, uniqueClicks: v.uniqueClicks || 0, conversions: v.conversions || 0, revenue: v.revenue || 0, cost: v.cost || 0, lpClicks: v.lpClicks || 0,
   leads: v.leads || 0, sales: v.sales || 0, rejected: v.rejected || 0, pendingRevenue: v.pendingRevenue || 0 }));
-const trackingUrl = (id) => `${location.origin}${BASE}/r/${encodeURIComponent(id)}`;
+// Campaigns bound to a tracking domain get links on that domain (served at the root, HTTPS).
+const trackingUrl = (id) => (state.campaigns[id]?.domain ? `https://${state.campaigns[id].domain}/r/${encodeURIComponent(id)}` : `${location.origin}${BASE}/r/${encodeURIComponent(id)}`);
 const typeLabel = { regular: 'Обычный', fallback: 'Замыкающий', forced: 'Перехватывающий' };
 
 // ---------- chart ----------
@@ -765,6 +767,9 @@ async function pageCampaignEditor(id) {
       field(`Дневной кап дохода, ${currency.info?.defaultCurrency || 'EUR'}`, h('input', { class: 'input', type: 'number', min: 0, step: '0.01', value: d.revenueCap ?? '', placeholder: 'нет', oninput: bind('revenueCap', 'float') })),
       field('URL при достижении капа', h('input', { class: 'input', type: 'url', value: d.capUrl || '', placeholder: 'https://… (иначе ответ 429)', oninput: bind('capUrl', 'url') })))],
     ['Tracking', () => isNew ? h('p', { class: 'muted' }, 'Ссылка кампании будет доступна после её сохранения.') : h('div', {},
+      field('Домен трекинга', h('select', { class: 'select', onchange: (e) => { d.domain = e.target.value || null; mark(); } },
+        h('option', { value: '' }, `${location.host}${BASE} (основной)`), (state.domains || []).map((dm) => h('option', { value: dm, selected: d.domain === dm }, dm))),
+        state.domains?.length ? 'Ссылка кампании будет на выбранном домене. Панель на нём недоступна — только трекинг.' : 'Свои домены добавляются в deploy/domains.txt (DNS A-запись на сервер); после деплоя они появятся здесь.'),
       field('Ссылка кампании', h('div', { class: 'link-box' }, h('input', { class: 'input', readonly: true, value: trackingUrl(d.id) }), h('button', { class: 'btn', onclick: () => copyText(trackingUrl(d.id)) }, 'Копировать')), 'Добавьте ?subid=… и utm-метки, они передадутся в оффер.'),
       field('Ссылка на конкретный оффер', h('input', { class: 'input', readonly: true, value: trackingUrl(d.id) + '/{offer_id}' })),
       field('S2S постбэк для партнёрки', h('input', { class: 'input', readonly: true, value: `${location.origin}${BASE}/postback?click_id={click_id}&secret=POSTBACK_SECRET&revenue={payout}&currency=EUR&status={status}` }), 'Замените POSTBACK_SECRET и макросы партнёрки на свои. status: lead / sale / rejected / trash (понимает и approved, pending, declined…); повторный постбэк с другим статусом обновляет конверсию.'),
@@ -813,7 +818,7 @@ async function pageCampaignEditor(id) {
     if (new Set(names).size !== names.length) { err.textContent = 'Названия потоков должны различаться — по ним строится статистика.'; return; }
     const body = { name: d.name.trim(), active: d.active, streams: d.streams, dailyCap: d.dailyCap, totalCap: d.totalCap, revenueCap: d.revenueCap, capUrl: d.capUrl, geoCapUrl: d.geoCapUrl,
       allowGeos: d.allowGeos, allowDevices: d.allowDevices, allowOS: d.allowOS, allowBrowsers: d.allowBrowsers, blockedIps: d.blockedIps, allowedIps: d.allowedIps,
-      dedupeWindow: d.dedupeWindow || 0, botFilter: d.botFilter, conversionWindowDays: d.conversionWindowDays, redirectMethod: d.redirectMethod || 'http', uniquenessHours: d.uniquenessHours ?? 24, streamRotation: d.streamRotation || 'weight', ...(isOwnerView() ? { ownerId: d.ownerId || null } : {}) };
+      dedupeWindow: d.dedupeWindow || 0, botFilter: d.botFilter, conversionWindowDays: d.conversionWindowDays, redirectMethod: d.redirectMethod || 'http', domain: d.domain || null, uniquenessHours: d.uniquenessHours ?? 24, streamRotation: d.streamRotation || 'weight', ...(isOwnerView() ? { ownerId: d.ownerId || null } : {}) };
     saveBtn.disabled = true;
     try {
       const saved = isNew ? await api('/api/campaigns', { method: 'POST', body: { id: d.id, ...body } })

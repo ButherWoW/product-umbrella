@@ -69,6 +69,9 @@ try {
   const exportResponse = await fetch('http://127.0.0.1:4199/stats/export?group=country');
   assert.equal(exportResponse.status, 200);
   assert.match(await exportResponse.text(), /group,clicks,conversions,revenue/);
+  const compareDate = new Date().toISOString().slice(0, 10);
+  const compare = await (await fetch(`http://127.0.0.1:4199/stats/compare?from=${compareDate}&to=${compareDate}`)).json();
+  assert.ok(compare.current && compare.previous && compare.deltaPct);
   const clickLog = await (await fetch('http://127.0.0.1:4199/api/clicks?campaign=paid-test&limit=10')).json();
   assert.ok(Array.isArray(clickLog.clicks));
   assert.ok(clickLog.clicks.length >= 1);

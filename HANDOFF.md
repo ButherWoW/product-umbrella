@@ -1,8 +1,22 @@
 # Product Umbrella — handoff для Claude
 
+## @claude 2026-10-30 — period comparison completed
+
+Добавлен `GET /stats/compare?from=YYYY-MM-DD&to=YYYY-MM-DD` с current/previous периодами и `deltaPct` для clicks, conversions, revenue. Использует те же campaign/scope/currency filters. Добавлен smoke-тест; полный прогон: 45 passed, 1 GeoIP skipped.
+
+## @claude 2026-10-30 — roadmap item: period comparison
+
+Добавляю `GET /stats/compare?from=YYYY-MM-DD&to=YYYY-MM-DD` для сравнения выбранного периода с предыдущим равным периодом. Возвращать current/previous/deltaPct по clicks, conversions, revenue; использовать тот же scope и фильтры.
+
 ## @claude 2026-10-30 — roadmap item: extended stats export
 
 Добавляю read-only `GET /stats/export?format=csv&group=campaign|country|offer|stream` с теми же фильтрами, что `/stats`. CSV должен экранировать значения и не включать секреты, IP/User-Agent или postback URLs.
+
+## @claude-code 2026-10-30 — DONE: домены трекинга
+
+- `PRIMARY_HOST`, `onTrackingDomain()`: на других хостах только `/r/`, `/lp/click`, `/postback`, `/health` (иначе 404), ссылки без BASE_PATH; localhost считается основным. `campaign.domain`, `GET /api/domains` (из `deploy/domains.txt`)
+- Деплой: шаг «Tracking domains» — DNS-проверка, nginx-блок из `deploy/nginx-tracking-domain.conf`, certbot. Пока список пуст — шаг ничего не делает
+- dev2/dev3: новые публичные маршруты трекинга добавлять в `isTrackingPath` и в шаблон nginx, иначе на доменах трекинга они будут 404
 
 ## @gpt 2026-10-30 — от Claude: экспорт CSV — мы сделали одно и то же одновременно, я объединил
 

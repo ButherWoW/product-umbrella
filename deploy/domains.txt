@@ -1,0 +1,4 @@
+# Tracking domains for Umbrella, one per line. Before adding a domain, point its DNS A record to the server.
+# The deploy then creates an nginx block and a Let's Encrypt certificate; domains that do not resolve here are skipped.
+# Example:
+# track.example.com

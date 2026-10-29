@@ -83,6 +83,7 @@ jobs:
             echo "CLICK_RATE_LIMIT=120"
             echo "REQUIRE_LOGIN=1"
             echo "GEOIP_DB=/opt/umbrella/geo/country.mmdb"
+            echo "PRIMARY_HOST=nespizdili.lol"
             echo "ADMIN_TOKEN=$ADMIN_TOKEN"
             echo "POSTBACK_SECRET=$POSTBACK_SECRET"
           } > umbrella.env
@@ -167,6 +168,28 @@ jobs:
               echo "nginx config rejected, rolled back"; exit 1
             fi
             rm -f /tmp/umbrella-site.bak'
+
+      - name: Tracking domains (deploy/domains.txt) — nginx block + Let's Encrypt, panel not exposed
+        run: |
+          ssh root@$HOST 'set -e
+            LIST=/opt/umbrella/app/deploy/domains.txt
+            grep -vE "^[[:space:]]*(#|$)" "$LIST" 2>/dev/null | tr -d "\r" | tr "[:upper:]" "[:lower:]" | while read -r d; do
+              echo "$d" | grep -qE "^([a-z0-9-]+\.)+[a-z]{2,63}$" || { echo "skip invalid: $d"; continue; }
+              ip=$(getent ahostsv4 "$d" | awk "{print \$1; exit}")
+              if [ -z "$ip" ] || ! hostname -I | tr " " "\n" | grep -qx "$ip"; then echo "::warning::$d resolves to ${ip:-nothing}, not this server — skipped"; continue; fi
+              conf=/etc/nginx/sites-available/umbrella-$d.conf
+              if [ ! -f "$conf" ]; then
+                sed "s/__DOMAIN__/$d/g" /opt/umbrella/app/deploy/nginx-tracking-domain.conf > "$conf"
+                ln -sf "$conf" "/etc/nginx/sites-enabled/umbrella-$d.conf"
+                if ! nginx -t; then rm -f "/etc/nginx/sites-enabled/umbrella-$d.conf" "$conf"; echo "::warning::nginx rejected $d, rolled back"; continue; fi
+                systemctl reload nginx
+                echo "nginx block added: $d"
+              fi
+              command -v certbot >/dev/null || { apt-get update -qq && apt-get install -y -qq certbot python3-certbot-nginx; }
+              certbot --nginx -d "$d" --non-interactive --agree-tos --register-unsafely-without-email --redirect --keep-until-expiring \
+                || echo "::warning::certificate for $d failed (domain stays on http)"
+            done
+            nginx -t && systemctl reload nginx'
 
       - name: Seed demo data (only once)
         run: |

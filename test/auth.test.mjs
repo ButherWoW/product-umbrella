@@ -186,3 +186,35 @@ test('security headers: strict CSP and no framing on the panel, tracking redirec
   assert.equal(click.headers.get('referrer-policy'), null, 'tracking redirects keep the default referrer behaviour');
   assert.equal(click.headers.get('content-security-policy'), null);
 });
+
+test('tracking domains: only tracking routes on non-primary hosts, links without the base path', { timeout: 20000 }, async (t) => {
+  const http = await import('node:http');
+  const dataDir = await mkdtemp(join(tmpdir(), 'umbrella-domains-'));
+  const server = await startTestServer(dataDir, { BASE_PATH: '/umbrella', PRIMARY_HOST: 'panel.test', TRUST_PROXY: '1' });
+  t.after(async () => { await server.stop(); await rm(dataDir, { recursive: true, force: true }); });
+  const port = new URL(server.url).port;
+  const get = (path, host, headers = {}) => new Promise((resolve, reject) => {
+    http.get({ host: '127.0.0.1', port, path, headers: { host, ...headers } }, (res) => { res.resume(); resolve({ status: res.statusCode, location: res.headers.location }); }).on('error', reject);
+  });
+  assert.equal((await get('/admin', 'panel.test')).status, 200);
+  assert.equal((await get('/admin', 'track.example.com')).status, 404, 'panel is not served on tracking domains');
+  assert.equal((await get('/api/campaigns', 'track.example.com')).status, 404);
+  assert.equal((await get('/stats', 'track.example.com')).status, 404);
+  assert.equal((await get('/r/demo/offer-1', 'track.example.com')).status, 302, 'tracking works');
+  assert.equal((await get('/health', 'track.example.com')).status, 200);
+
+  const post = (path, body) => new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, path, method: 'POST', headers: { host: 'panel.test', 'content-type': 'application/json' } }, (res) => {
+      let text = ''; res.on('data', (c) => { text += c; }); res.on('end', () => resolve({ status: res.statusCode, json: JSON.parse(text || '{}') }));
+    });
+    req.on('error', reject); req.end(JSON.stringify(body));
+  });
+  assert.equal((await post('/api/landings', { id: 'lp-d', url: 'https://lp.example.net/?go={lp_click_url}' })).status, 201);
+  const created = await post('/api/campaigns', { id: 'dom', name: 'D', domain: 'Track.Example.com', streams: [{ name: 'm', offers: [{ offerId: 'offer-1' }], landings: [{ landingId: 'lp-d' }] }] });
+  assert.equal(created.json.domain, 'track.example.com');
+  const lp = await get('/r/dom', 'track.example.com', { 'x-forwarded-proto': 'https' });
+  const go = new URL(new URL(lp.location).searchParams.get('go'));
+  assert.equal(go.origin + go.pathname, 'https://track.example.com/lp/click', 'landing button URL stays on the tracking domain, no /umbrella');
+  const primary = await get('/r/dom', 'panel.test', { 'x-forwarded-proto': 'https' });
+  assert.equal(new URL(new URL(primary.location).searchParams.get('go')).pathname, '/umbrella/lp/click');
+});
