@@ -1742,6 +1742,18 @@ const server = http.createServer(async (req, res) => {
       const from = url.searchParams.get('from') || null; const to = url.searchParams.get('to') || null;
       if ((from && !/^\d{4}-\d{2}-\d{2}$/.test(from)) || (to && !/^\d{4}-\d{2}-\d{2}$/.test(to))) return json(res, 400, { error: 'invalid_date' });
       const fromMs = from ? Date.parse(`${from}T00:00:00Z`) : -Infinity; const toMs = to ? Date.parse(`${to}T23:59:59Z`) : Infinity;
+      if (db) {
+        try {
+          const values = []; const where = [];
+          if (campaign) { values.push(campaign); where.push(`campaign = $${values.length}`); }
+          if (req.scope?.allowed) { values.push(req.scope.allowed); where.push(`campaign = ANY($${values.length}::text[])`); }
+          if (from) { values.push(`${from}T00:00:00Z`); where.push(`created_at >= $${values.length}`); }
+          if (to) { values.push(`${to}T23:59:59Z`); where.push(`created_at <= $${values.length}`); }
+          const { rows } = await db.query(`SELECT campaign, COUNT(*)::int AS count FROM bots ${where.length ? 'WHERE ' + where.join(' AND ') : ''} GROUP BY campaign`, values);
+          const byCampaign = Object.fromEntries(rows.map((r) => [r.campaign, r.count]));
+          return json(res, 200, { total: rows.reduce((sum, r) => sum + r.count, 0), byCampaign });
+        } catch (error) { console.warn('[db] bots report fallback:', error.message); }
+      }
       try {
         const lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map(JSON.parse);
         const byCampaign = {};
