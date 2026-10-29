@@ -197,3 +197,7 @@ body.auth-mode .view { margin-left: 0; display: grid; place-items: start center;
 .ip-allowlist h2 { margin: 0 0 8px; font-size: 16px; }
 .ip-allowlist p { margin: 6px 0; }
 .ip-allowlist code { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+/* User permissions: checkbox rows in the user dialogs; viewers get no write controls. */
+.check-line { display: flex; align-items: center; gap: 6px; margin: 4px 0; font-size: 13px; }
+.check-line[hidden] { display: none; }
+body.read-only:not(.auth-mode) .btn.primary, body.read-only:not(.auth-mode) .row-actions { display: none !important; }
