@@ -460,7 +460,7 @@ CR в API — доля (`0.25` = 25%), EPC = revenue / clicks, RPM = revenue × 
 
 `from`/`to` задаются реальными календарными датами `YYYY-MM-DD`; `to` включает день до последней миллисекунды UTC. В журнале конверсий даты относятся к времени конверсии, а фильтры campaign/offer/stream — к исходному клику. Это отличается от `/stats`, где период относится к выбранным кликам.
 
-`node test/admin-ui.mjs` — браузерный тест `/admin`: правка потока (прямой URL, «Считать клики: нет»), окно ключа при `ADMIN_TOKEN`, сохранение и отсутствие горизонтальной прокрутки на ширине 390px. Требует Playwright или `PLAYWRIGHT_MODULE`.
+`test/ui/*.mjs` — браузерные проверки `/admin` по разделам (`streams`, `offers`, `dashboard`, `reports`, `report-metrics`, `campaigns-list`, `costs`, `click-log`, `monitor`, `mobile`, `accounts`, `permissions`, `source-postback`), см. «Браузерные тесты панели». Требуют Playwright или `PLAYWRIGHT_MODULE`.
 
 `node test/event-logs-ui.mjs` — дополнительный браузерный тест фильтров, пагинации, прав доступа и мобильной таблицы. Требуется установленный Playwright или `PLAYWRIGHT_MODULE` с путём к существующей установке. Тест работает на отдельном порту 4213 с временными событиями.
 
@@ -489,7 +489,7 @@ npm start
 
 ## Браузерные тесты панели
 
-`test/*-ui.mjs` (Playwright + Chromium) не входят в `npm test`: их гоняет отдельный job `ui` в CI, деплой ждёт его. Локально: `npm install --no-save playwright && npx playwright install chromium`, затем `node test/admin-ui.mjs` (или `PLAYWRIGHT_MODULE=/путь/к/playwright/index.mjs`).
+`test/ui/*.mjs` и `test/*-ui.mjs` (Playwright + Chromium) не входят в `npm test`: их гоняет отдельный job `ui` в CI, деплой ждёт его. Каждый файл `test/ui/*.mjs` поднимает свой сервер с пустым каталогом данных и свой браузер через общий помощник `test/ui/setup.mjs`, поэтому файлы независимы и идут параллельно. Новую проверку панели добавляйте отдельным файлом в `test/ui/` (или блоком в подходящий файл), не опираясь на данные других файлов. Локально: `npm install --no-save playwright && npx playwright install chromium` (или `PLAYWRIGHT_MODULE=/путь/к/playwright/index.mjs`), затем `npm run test:ui` или один файл: `node test/ui/offers.mjs`.
 
 ## Проверка на PostgreSQL
 

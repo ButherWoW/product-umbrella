@@ -62,8 +62,9 @@ jobs:
       - run: npm ci --no-audit --no-fund
       - name: Install Playwright (not a project dependency)
         run: npm install --no-save --no-audit --no-fund playwright@1.64.1 && npx playwright install --with-deps chromium
-      - name: Admin UI, event logs, stream editor
-        run: for t in test/*-ui.mjs; do echo "== $t"; node "$t" || exit 1; done
+      - name: Admin UI (test/ui/*, each file its own server), event logs, stream editor
+        # Independent files, run in parallel by node --test; test/ui/setup.mjs is the shared helper, not a check.
+        run: node --test $(ls test/ui/*.mjs | grep -v '/setup.mjs$') test/*-ui.mjs
 
   deploy:
     needs: [test, postgres, ui]
