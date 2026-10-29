@@ -31,16 +31,22 @@ test('connection type classifier: mobile carriers, data centers, mixed carriers 
 
 const WINDOWS = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 
-test('stream condition connections: stored only when set, НЕ, simulation with an injected connection', { timeout: 15000 }, async (t) => {
+test('stream condition connections: stored only when set, НЕ, no data-center targeting, simulation with an injected connection', { timeout: 15000 }, async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'umbrella-conn-'));
   const server = await startTestServer(dir, { GEOIP_ASN_DB: '' });
   t.after(async () => { await server.stop(); await rm(dir, { recursive: true, force: true }); });
   const post = (path, body) => fetch(server.url + path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
   const simulate = async (body) => (await post('/api/simulate', body)).json();
 
+  // No-cloaking policy: data centers cannot be singled out, neither directly nor with «НЕ» (src/stream-policy.js).
+  for (const conditions of [{ connections: ['datacenter'] }, { connections: ['datacenter'], not: ['connections'] }, { connections: ['mobile', 'broadband'] }]) {
+    const refused = await post('/api/campaigns', { id: 'conn-dc', streams: [{ name: 'dc', conditions, action: 'url', url: 'https://x.example.net/' }] });
+    assert.equal(refused.status, 400, JSON.stringify(conditions));
+    assert.equal((await refused.json()).error, 'cloaking_condition_not_allowed');
+  }
   const created = await post('/api/campaigns', { id: 'conn', name: 'Conn', streams: [
     { name: 'mobile', conditions: { connections: ['MOBILE', 'satellite', 'mobile'] }, action: 'url', url: 'https://mobile.example.net/' },
-    { name: 'not dc', conditions: { connections: ['datacenter'], not: ['connections'] }, action: 'url', url: 'https://home.example.net/' },
+    { name: 'not mobile', conditions: { connections: ['mobile'], not: ['connections'] }, action: 'url', url: 'https://home.example.net/' },
     { name: 'plain', type: 'fallback', action: 'url', url: 'https://rest.example.net/' },
   ], streamRotation: 'position' });
   assert.equal(created.status, 201);
@@ -56,17 +62,17 @@ test('stream condition connections: stored only when set, НЕ, simulation with 
   assert.deepEqual([check.condition, check.actual, check.ok], ['тип соединения', 'mobile', true]);
 
   const home = await simulate({ campaign: 'conn', userAgent: WINDOWS, connection: 'broadband' });
-  assert.equal(home.result.stream, 'not dc', 'НЕ datacenter matches broadband');
+  assert.equal(home.result.stream, 'not mobile', 'НЕ mobile matches broadband');
   const dc = await simulate({ campaign: 'conn', userAgent: WINDOWS, isp: 'Amazon.com, Inc.' });
-  assert.deepEqual([dc.visitor.connection, dc.result.stream], ['datacenter', 'plain'], 'connection derived from an explicit ISP name');
+  assert.deepEqual([dc.visitor.connection, dc.result.stream], ['datacenter', 'not mobile'], 'connection derived from an explicit ISP name');
   const viaName = await simulate({ campaign: 'conn', userAgent: WINDOWS, isp: 'Free Mobile SAS' });
   assert.equal(viaName.result.stream, 'mobile');
 
   // Without GEOIP_ASN_DB the type is unknown: the positive condition does not match, the НЕ one does.
   const unknown = await simulate({ campaign: 'conn', userAgent: WINDOWS, ip: '172.56.0.1' });
-  assert.deepEqual([unknown.visitor.connection, unknown.result.stream], [null, 'not dc']);
+  assert.deepEqual([unknown.visitor.connection, unknown.result.stream], [null, 'not mobile']);
   const live = await fetch(server.url + '/r/conn', { redirect: 'manual', headers: { 'user-agent': WINDOWS } });
-  assert.equal(new URL(live.headers.get('location')).host, 'home.example.net', 'live click: unknown connection, НЕ datacenter matches');
+  assert.equal(new URL(live.headers.get('location')).host, 'home.example.net', 'live click: unknown connection, НЕ mobile matches');
   const report = await (await fetch(server.url + '/stats/params?field=connection&campaign=conn')).json();
   assert.deepEqual(report.rows.map((r) => [r.value, r.clicks]), [['', 1]], 'report groups by connection; unknown is empty');
 });
