@@ -14,6 +14,7 @@ import { createConversionCapCounter, resolveOffer } from './conversion-cap.js';
 import { createJournalGate, filterJournal, campaignPlan, retentionPlan, clearCampaignRows, retentionRows } from './retention.js';
 import { createSourcePostbacks, resolveSourcePostback, parsePostbackUrl, parsePostbackStatuses, journalHasSourcePostback, sendPostback, fillPostbackMacros, stripQuery, allowPrivateFromEnv, SAMPLE_MACROS } from './source-postback.js';
 import { createBindingStore, bindingKey, boundChoice, streamRef, parseBindMode, parseBindTtl } from './visitor-binding.js';
+import { createMonitor, MONITOR_MODES } from './monitor.js';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const dataDir = process.env.DATA_DIR || join(root, 'data');
@@ -126,6 +127,14 @@ const campaigns = new Map([['demo', { name: 'Demo campaign', active: true, strea
 const eventMirror = db ? createEventMirror({ query,
   onError: (type, error) => console.warn(`[db] ${type} insert:`, error.message) }) : null;
 
+// Offer / landing monitoring: MONITOR=0 turns the timer off (POST /api/monitor/check still works).
+// MONITOR_ALLOW_PRIVATE lists private IPs that may be fetched anyway — only for tests against 127.0.0.1.
+const monitorEnabled = process.env.MONITOR !== '0';
+const monitorIntervalMs = Math.max(1000, Number(process.env.MONITOR_INTERVAL_MS) || 600000);
+const monitor = createMonitor({ campaigns, offers, landings: { get: (id) => landings.get(id) },
+  persistCampaign: (id, value) => persistCampaign(id, value), event: (type, payload) => event(type, payload),
+  intervalMs: monitorIntervalMs, allowPrivate: String(process.env.MONITOR_ALLOW_PRIVATE || '').split(',').map((s) => s.trim()).filter(Boolean) });
+
 const OFFER_ID_RE = /^[a-z0-9_-]{2,80}$/i;
 const STREAM_TYPES = ['forced', 'regular', 'fallback'];
 const STREAM_ACTIONS = ['offers', 'url', 'not_found', 'campaign'];
@@ -227,6 +236,8 @@ function parseStreams(raw) {
       }
       // Defaults are omitted so existing stored streams keep their exact shape.
       if (s.enabled === false) stream.enabled = false;
+      // Remembers that the offer monitor (src/monitor.js) switched the stream off, so it may switch it back on.
+      if (s.enabled === false && s.disabledBy === 'monitor') stream.disabledBy = 'monitor';
       if (s.countClicks === false) stream.countClicks = false;
       out.push(stream);
     } else if (OFFER_ID_RE.test(String(s.offerId || '')) && Number(s.weight) > 0) {
@@ -839,6 +850,7 @@ function parseCampaign(id, value) {
     // Campaign override of the source postback; null / [] = use the source's.
     sourcePostbackUrl: parsePostbackUrl(value.sourcePostbackUrl, { allowHttp: sourcePostbackAllowPrivate }),
     sourcePostbackStatuses: parsePostbackStatuses(value.sourcePostbackStatuses, []),
+    monitoring: MONITOR_MODES.includes(value.monitoring) ? value.monitoring : 'notify',
   };
 }
 
@@ -1369,7 +1381,7 @@ function stripRevenue(value, urls) {
 // Paths whose responses are filtered for a hideRevenue user; urls: also drop offer/postback URLs.
 function revenueFilterFor(path) {
   if (path === '/stats' || path.startsWith('/stats/') || path === '/api/conversions') return { urls: false };
-  if (path === '/api/offers' || path.startsWith('/api/offers/') || path === '/api/audit' || path === '/api/simulate') return { urls: true };
+  if (path === '/api/offers' || path.startsWith('/api/offers/') || path === '/api/audit' || path === '/api/simulate' || path === '/api/monitor') return { urls: true };
   return null;
 }
 // offersAccess 'own': ids of offers used in the streams of campaigns the user can see; null = no restriction.
@@ -1848,6 +1860,24 @@ const server = http.createServer(async (req, res) => {
       const limit = Number.isInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 1000) : 100;
       if (botFrom && !/^\d{4}-\d{2}-\d{2}$/.test(botFrom)) return json(res, 400, { error: 'invalid_from_date' });
       if (botTo && !/^\d{4}-\d{2}-\d{2}$/.test(botTo)) return json(res, 400, { error: 'invalid_to_date' });
+      const botRow = (b) => ({ at: b.at ?? null, campaign: b.campaign ?? null, offerId: b.offerId ?? null, stream: b.stream ?? null, reason: b.reason ?? 'user_agent',
+        isp: b.isp ?? null, userAgent: b.userAgent ? String(b.userAgent).slice(0, 200) : null, ip: b.ip ?? null });
+      // PostgreSQL first (the bots table, with isp), the JSONL journal as fallback.
+      if (db) {
+        try {
+          const where = [], values = [];
+          const add = (sql, value) => { values.push(value); where.push(sql.replace('?', `$${values.length}`)); };
+          if (botCampaign) add('campaign = ?', botCampaign);
+          if (req.scope?.allowed) add('campaign = ANY(?::text[])', req.scope.allowed);
+          if (botFrom) add('created_at >= ?', `${botFrom}T00:00:00Z`);
+          if (botTo) add('created_at <= ?', `${botTo}T23:59:59Z`);
+          values.push(limit);
+          const { rows } = await db.query(`SELECT created_at, campaign, offer_id, stream, reason, isp, user_agent, ip FROM bots ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+            ORDER BY created_at DESC, id DESC LIMIT $${values.length}`, values);
+          return json(res, 200, { bots: rows.map((r) => botRow({ at: new Date(r.created_at).toISOString(), campaign: r.campaign, offerId: r.offer_id, stream: r.stream,
+            reason: r.reason, isp: r.isp, userAgent: r.user_agent, ip: r.ip })) });
+        } catch (e) { console.warn('[db] bot log fallback:', e.message); }
+      }
       try {
         const lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
         const fromMs = botFrom ? Date.parse(`${botFrom}T00:00:00Z`) : null;
@@ -1860,16 +1890,7 @@ const server = http.createServer(async (req, res) => {
           if (fromMs !== null && (t === null || t < fromMs)) return false;
           if (toMs !== null && (t === null || t > toMs)) return false;
           return true;
-        }).reverse().slice(0, limit).map((b) => ({
-          at: b.at ?? null,
-          campaign: b.campaign ?? null,
-          offerId: b.offerId ?? null,
-          stream: b.stream ?? null,
-          reason: b.reason ?? 'user_agent',
-          isp: b.isp ?? null,
-          userAgent: b.userAgent ? String(b.userAgent).slice(0, 200) : null,
-          ip: b.ip ?? null,
-        }));
+        }).reverse().slice(0, limit).map(botRow);
         return json(res, 200, { bots });
       } catch (e) {
         if (e.code === 'ENOENT') return json(res, 200, { bots: [] });
@@ -1927,6 +1948,16 @@ const server = http.createServer(async (req, res) => {
       const mine = scopeCampaigns(req);
       const entries = await readAudit({ entity, id: entityId, limit: mine ? 2000 : limit });
       return json(res, 200, { entries: mine ? entries.filter((e) => e.actor === req.user.email || (e.entity === 'campaign' && mine.includes(e.entityId))).slice(0, limit) : entries });
+    }
+    if (url.pathname === '/api/monitor' && req.method === 'GET') {
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      return json(res, 200, { enabled: monitorEnabled, intervalMs: monitorIntervalMs, targets: monitor.snapshot(scopeCampaigns(req)) });
+    }
+    if (url.pathname === '/api/monitor/check' && req.method === 'POST') {
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      if (restrictedUser(req)) return json(res, 403, { error: 'owner_only' });
+      const result = await monitor.check();
+      return json(res, 200, { ...result, targets: monitor.snapshot() });
     }
     if (url.pathname === '/api/domains' && req.method === 'GET') return json(res, 200, { primary: primaryHost || null, domains: await trackingDomains() });
     if (url.pathname === '/api/rates' && req.method === 'GET') return json(res, 200, { defaultCurrency: rates.defaultCurrency, ...rates.info() });
@@ -2135,6 +2166,7 @@ const server = http.createServer(async (req, res) => {
         costFromParam: body.costFromParam === undefined ? cur.costFromParam : body.costFromParam,
         sourcePostbackUrl: body.sourcePostbackUrl === undefined ? cur.sourcePostbackUrl : body.sourcePostbackUrl,
         sourcePostbackStatuses: body.sourcePostbackStatuses === undefined ? cur.sourcePostbackStatuses : body.sourcePostbackStatuses,
+        monitoring: body.monitoring === undefined ? cur.monitoring : body.monitoring,
       }));
       await persistCampaign(id, campaigns.get(id));
       await audit(req, 'update', 'campaign', id, cur, campaigns.get(id));
@@ -2372,9 +2404,9 @@ if (db) {
         .map((line) => { try { return JSON.parse(line); } catch { return null; } }).filter((e) => e?.type === 'bot' && e.campaign);
       for (let i = 0; i < old.length; i += 500) {
         const chunk = old.slice(i, i + 500); const values = [];
-        const tuples = chunk.map((e, j) => { values.push(e.campaign, e.offerId ?? null, e.stream ?? null, e.userAgent ?? null, e.ip ?? null, e.reason ?? null, e.at || new Date().toISOString());
-          const b = j * 7; return `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7})`; });
-        await db.query(`INSERT INTO bots (campaign, offer_id, stream, user_agent, ip, reason, created_at) VALUES ${tuples.join(',')}`, values);
+        const tuples = chunk.map((e, j) => { values.push(e.campaign, e.offerId ?? null, e.stream ?? null, e.userAgent ?? null, e.ip ?? null, e.reason ?? null, e.isp ?? null, e.at || new Date().toISOString());
+          const b = j * 8; return `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7},$${b + 8})`; });
+        await db.query(`INSERT INTO bots (campaign, offer_id, stream, user_agent, ip, reason, isp, created_at) VALUES ${tuples.join(',')}`, values);
       }
       if (old.length) console.log(`[db] copied ${old.length} bot events from the journal`);
     }
@@ -2388,7 +2420,8 @@ if (retentionDays > 0) {
   setTimeout(() => { retentionTick(); setInterval(retentionTick, 86400000).unref(); }, firstRunMs).unref();
   console.log(`[retention] enabled: ${retentionDays} days`);
 }
+if (monitorEnabled) monitor.start();
 
-async function shutdown() { await new Promise((resolve) => server.close(resolve)); await eventMirror?.drain(); await closeDb(); process.exit(0); }
+async function shutdown() { monitor.stop(); await new Promise((resolve) => server.close(resolve)); await eventMirror?.drain(); await closeDb(); process.exit(0); }
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);

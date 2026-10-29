@@ -9,7 +9,7 @@ export function createEventMirror({ query, onError = () => {} }) {
   function enqueue({ type, at, ...payload }) {
     if (!['click', 'conversion', 'lp_click', 'bot'].includes(type)) return null;
     if (type === 'bot') {
-      const task = query('INSERT INTO bots (campaign, offer_id, stream, user_agent, ip, reason, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)', [payload.campaign, payload.offerId ?? null, payload.stream ?? null, payload.userAgent ?? null, payload.ip ?? null, payload.reason ?? null, at]).catch((error) => onError(type, error));
+      const task = query('INSERT INTO bots (campaign, offer_id, stream, user_agent, ip, reason, isp, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [payload.campaign, payload.offerId ?? null, payload.stream ?? null, payload.userAgent ?? null, payload.ip ?? null, payload.reason ?? null, payload.isp ?? null, at]).catch((error) => onError(type, error));
       pending.add(task); task.then(() => pending.delete(task)); return task;
     }
     const task = lock(payload.clickId, async () => {

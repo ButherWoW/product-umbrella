@@ -497,7 +497,7 @@ async function pageDashboard() {
     const { from, to } = periodRange();
     const campaign = campSel.value || null;
     try {
-      const [s, series, recent, team, botsData, statsBotsData] = await Promise.all([api('/stats' + qs({ from, to, campaign })), timeseries({ campaign, from, to }), api('/api/clicks' + qs({ from, to, campaign, limit: 10 })).catch(() => ({ clicks: [] })), api('/api/settings').catch(() => ({ buyerSharePct: 35 })), api('/api/bots' + qs({ from, to, campaign, limit: 1000 })).catch(() => ({ bots: [] })), api('/stats/bots' + qs({ from, to, campaign })).catch(() => ({ total: 0, byCampaign: {} }))]);
+      const [s, series, recent, team, botsData, statsBotsData, monitorData] = await Promise.all([api('/stats' + qs({ from, to, campaign })), timeseries({ campaign, from, to }), api('/api/clicks' + qs({ from, to, campaign, limit: 10 })).catch(() => ({ clicks: [] })), api('/api/settings').catch(() => ({ buyerSharePct: 35 })), api('/api/bots' + qs({ from, to, campaign, limit: 1000 })).catch(() => ({ bots: [] })), api('/stats/bots' + qs({ from, to, campaign })).catch(() => ({ total: 0, byCampaign: {} })), api('/api/monitor').catch(() => ({ targets: [] }))]);
       const sharePct = Number(team.buyerSharePct) || 0;
       const profit = (s.revenue || 0) - (s.cost || 0);
       // The buyer earns a share of positive net profit; a loss means 0, not a negative payout.
@@ -524,7 +524,14 @@ async function pageDashboard() {
           ...metricCols().filter((c) => ['clicks', 'conversions', 'cr', 'revenue'].includes(c.key))],
       }));
       const top5 = (id, title, rows, nameOf, link) => h('div', { class: 'card' }, h('h2', {}, title), dataTable({ id: 'dash-t5-' + id, pageSize: 5, compact: true, totals: false, rows: [...rows].sort((a, b) => b.revenue - a.revenue).slice(0, 5), columns: [{ key: 'id', label: 'Название', fixed: true, cls: 'name', render: (r) => h('a', { href: link(r) }, nameOf(r)) }, ...metricCols().filter((c) => ['clicks', 'conversions', 'revenue', 'roi'].includes(c.key))] }));
-      put(body, 
+      const down = (monitorData.targets || []).filter((x) => !x.ok);
+      // Offer monitor (src/monitor.js): shown only while something does not answer.
+      const downCard = down.length ? h('div', { class: 'card monitor-down', role: 'alert', style: 'margin-bottom:14px' }, h('h2', {}, `Не отвечают · ${down.length}`),
+        h('ul', {}, down.map((x) => h('li', {},
+          h('span', { class: 'mono' }, x.url || 'URL скрыт'), ' — ', h('span', { class: 'neg' }, x.status ? `HTTP ${x.status}` : (x.error || 'нет ответа')),
+          x.downSince ? h('span', { class: 'muted' }, ` с ${dt(x.downSince)}`) : null, ': ',
+          x.campaigns.map((c, i) => [i ? ', ' : '', h('a', { href: '#/campaigns/' + encodeURIComponent(c.campaign) }, c.name || c.campaign), h('span', { class: 'muted' }, ` (${c.stream}${c.mode === 'disable' ? ', поток выключается' : ''})`)]))))) : null;
+      put(body, downCard,
         h('div', { class: 'kpis' }, kpi('Клики', num(s.clicks), 'var(--k1)'), kpi('Уник. клики', num(s.uniqueClicks), 'var(--k2)'), kpi('Конверсии', num(s.conversions), 'var(--k3)'), kpi('CR', pct(ratio(s.conversions, s.clicks)), 'var(--k2)'),
           hideRev() ? null : kpi('Доход', money(s.revenue), 'var(--k5)', goalBar(s.revenue || 0, team.dailyRevenueGoal)), kpi('Расход', money(s.cost || 0), 'var(--k4)'), ...(hideRev() ? [] : [kpi('Прибыль', h('span', { class: profit >= 0 ? '' : 'neg' }, money(profit)), 'var(--k8)', goalBar(profit, team.dailyProfitGoal)), kpi('ROI', pct(ratio(profit, s.cost || 0)), 'var(--k9)'), earningsTile,
           kpi('EPC', money4(ratio(s.revenue, s.clicks)), 'var(--k6)'), kpi('RPM', money(ratio(s.revenue * 1000, s.clicks)), 'var(--k7)')]),
@@ -1015,6 +1022,9 @@ async function pageCampaignEditor(id) {
         field('Способ редиректа', h('div', { class: 'radios' }, [['http', 'HTTP 302'], ['meta', 'Meta refresh'], ['js', 'JavaScript']].map(([v, l]) => h('label', {},
           h('input', { type: 'radio', name: 'credir', checked: (d.redirectMethod || 'http') === v, onchange: () => { d.redirectMethod = v; mark(); } }), l))),
           'Как посетитель уходит на оффер. HTTP 302 — быстрее всего; meta и JS отдают страницу, которая сама переходит дальше.'),
+        field('Мониторинг офферов', h('select', { class: 'select', 'aria-label': 'Мониторинг офферов', onchange: (e) => { d.monitoring = e.target.value; mark(); } },
+          [['off', 'Выключен'], ['notify', 'Уведомлять'], ['disable', 'Выключать поток']].map(([v, l]) => h('option', { value: v, selected: (d.monitoring || 'notify') === v }, l))),
+          'Каждые 10 минут проверяются офферы и лендинги потоков. Не ответил дважды подряд — событие в журнале и блок «Не отвечают» на дашборде; «Выключать поток» ещё и выключает поток, а когда оффер снова отвечает — включает обратно.'),
         field('Окно конверсии, дней', h('input', { class: 'input', type: 'number', min: 1, max: 365, value: d.conversionWindowDays ?? '', placeholder: 'без ограничения', oninput: bind('conversionWindowDays', 'int') }), 'Постбэк на клик старше окна отклоняется.'),
         field('Источник трафика', h('select', { class: 'select', 'aria-label': 'Источник трафика', onchange: (e) => {
           const sid = e.target.value; d.sourceId = sid || null;
@@ -1083,7 +1093,7 @@ async function pageCampaignEditor(id) {
         h('div', { style: 'min-width:0' },
           h('div', { class: 'title', onclick: () => streamModal(s, (next) => { d.streams[i] = next; mark(); drawStreams(); }, false, d.id) },
             `${i + 1}. ${s.name} `, h('span', { class: 'badge ' + (s.type || 'regular') }, typeLabel[s.type || 'regular']),
-            s.enabled === false ? [' ', h('span', { class: 'badge' }, 'Выключен')] : null,
+            s.enabled === false ? [' ', h('span', { class: 'badge', title: s.disabledBy === 'monitor' ? 'Оффер или лендинг не отвечает; поток включится сам, когда они снова ответят' : null }, s.disabledBy === 'monitor' ? 'Выключен монитором' : 'Выключен')] : null,
             s.countClicks === false ? [' ', h('span', { class: 'badge' }, 'Клики не считаются')] : null),
           h('div', { class: 'meta' }, summarizeConditions(s.conditions)),
           h('div', { class: 'meta' }, (s.action === 'url' ? 'Прямой URL: ' + s.url : s.action === 'campaign' ? '→ кампания ' + (state.campaigns[s.campaignId]?.name || s.campaignId) : s.action === 'not_found' ? 'Действие: ошибка 404' : (s.landings?.length ? 'Лендинги: ' + s.landings.map((l) => `${state.landings[l.landingId]?.name || l.landingId} (${l.weight ?? 1})`).join(', ') + ' → ' : '') + 'Офферы: ' + (s.offers || []).map((o) => `${o.offerId} (${o.weight ?? 1})`).join(', ')) + ((s.type || 'regular') === 'regular' ? ` · вес потока ${s.weight ?? 1}` : ''))),
@@ -1114,7 +1124,7 @@ async function pageCampaignEditor(id) {
     const body = { name: d.name.trim(), group: (d.group || '').trim(), active: d.active, streams: d.streams, dailyCap: d.dailyCap, totalCap: d.totalCap, revenueCap: d.revenueCap, capUrl: d.capUrl, geoCapUrl: d.geoCapUrl,
       allowGeos: d.allowGeos, allowDevices: d.allowDevices, allowOS: d.allowOS, allowBrowsers: d.allowBrowsers, blockedIps: d.blockedIps, allowedIps: d.allowedIps,
       dedupeWindow: d.dedupeWindow || 0, botFilter: d.botFilter, datacenterAsBot: Boolean(d.datacenterAsBot), conversionWindowDays: d.conversionWindowDays, redirectMethod: d.redirectMethod || 'http', domain: d.domain || null, uniquenessHours: d.uniquenessHours ?? 24, streamRotation: d.streamRotation || 'weight', bindVisitors: d.bindVisitors || 'off', bindTtlHours: d.bindTtlHours ?? 24, ...(isOwnerView() ? { ownerId: d.ownerId || null } : {}), paramMap: d.paramMap || {}, costModel: d.costModel || 'none', cpc: d.cpc, costFromParam: d.costFromParam || false, sourceId: d.sourceId || null,
-      sourcePostbackUrl: d.sourcePostbackUrl || null, sourcePostbackStatuses: d.sourcePostbackStatuses || [] };
+      sourcePostbackUrl: d.sourcePostbackUrl || null, sourcePostbackStatuses: d.sourcePostbackStatuses || [], monitoring: d.monitoring || 'notify' };
     saveBtn.disabled = true;
     try {
       const saved = isNew ? await api('/api/campaigns', { method: 'POST', body: { id: d.id, ...body } })
