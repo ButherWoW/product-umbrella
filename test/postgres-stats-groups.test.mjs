@@ -51,6 +51,8 @@ async function scenario(t, env) {
       assert.ok(csv.split('\n').some((line) => line.startsWith(id('fb')) && line.includes(',3,')), 'G4: CSV export by source');
       const bots = await (await call(`/stats/bots?campaign=${id('a')}`)).json();
       assert.equal(bots.byCampaign[id('a')], 1, 'G3: bot counted');
+      const log = await (await call(`/api/bots?campaign=${id('a')}`)).json();
+      assert.deepEqual(log.bots.map((b) => [b.campaign, b.reason, b.userAgent, 'isp' in b]), [[id('a'), 'user_agent', 'Googlebot/2.1', true]], 'bot log (PostgreSQL after a restart)');
     };
     await check();
     if (env.DATABASE_URL) {

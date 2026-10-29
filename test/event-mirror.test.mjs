@@ -53,3 +53,12 @@ test('unmirrored journal events do not query PostgreSQL and logging errors canno
   await assert.doesNotReject(mirror.drain());
   assert.equal(queries, 1);
 });
+
+test('mirror writes the bot isp with created_at as the last parameter', async () => {
+  const calls = [];
+  const mirror = createEventMirror({ query: async (sql, values) => { calls.push({ sql, values }); } });
+  mirror.enqueue({ type: 'bot', campaign: 'camp', offerId: 'o', stream: 's', userAgent: 'Googlebot', ip: '1.2.3.4', reason: 'datacenter', isp: 'OVH SAS', at });
+  await mirror.drain();
+  assert.ok(calls[0].sql.includes('reason, isp, created_at'));
+  assert.deepEqual(calls[0].values, ['camp', 'o', 's', 'Googlebot', '1.2.3.4', 'datacenter', 'OVH SAS', at]);
+});

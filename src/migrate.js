@@ -147,6 +147,7 @@ await db.query(`CREATE INDEX IF NOT EXISTS clicks_campaign_created_idx ON clicks
 await db.query(`CREATE INDEX IF NOT EXISTS clicks_created_idx ON clicks(created_at)`);
 await db.query(`CREATE TABLE IF NOT EXISTS bots (id BIGSERIAL PRIMARY KEY, campaign TEXT NOT NULL, offer_id TEXT, stream TEXT, user_agent TEXT, ip TEXT, reason TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
 await db.query(`CREATE INDEX IF NOT EXISTS bots_campaign_created_idx ON bots(campaign, created_at)`);
+await db.query(`ALTER TABLE bots ADD COLUMN IF NOT EXISTS isp TEXT`);
 // Offer conversion cap counts today's conversions.
 await db.query(`CREATE INDEX IF NOT EXISTS conversions_created_idx ON conversions(created_at)`);
 
