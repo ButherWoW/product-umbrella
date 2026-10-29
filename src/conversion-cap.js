@@ -53,7 +53,8 @@ export function resolveOffer(offerId, { stateOf, altOf, maxHops = 3 }) {
 }
 
 // Per-offer count of today's conversions, cached for `ttlMs` so /r does not query on every click.
-export function createConversionCapCounter({ db = null, eventsFile, ttlMs = 30000, now = () => new Date(), onFallback = () => {} }) {
+// `countJournal(offerId, since)` (the in-memory journal index) replaces reading the journal file.
+export function createConversionCapCounter({ db = null, eventsFile, countJournal = null, ttlMs = 30000, now = () => new Date(), onFallback = () => {} }) {
   const cache = new Map();
 
   async function countFromDb(offerId, since) {
@@ -94,7 +95,7 @@ export function createConversionCapCounter({ db = null, eventsFile, ttlMs = 3000
     if (db) {
       try { n = await countFromDb(offerId, since); } catch (error) { onFallback(error); }
     }
-    if (n === null) n = await countFromJournal(offerId, since);
+    if (n === null) n = countJournal ? countJournal(offerId, since) : await countFromJournal(offerId, since);
     cache.set(key, { n, at: at.getTime(), since: since.getTime() });
     return n;
   }
