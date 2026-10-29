@@ -111,6 +111,22 @@ try {
   }
   await page.screenshot({ path: join(tmpdir(), 'umbrella-admin-mobile.png'), fullPage: true });
 
+  // Heatmap: 7×24 grid (168 cells), click sum matches /stats, no page horizontal scroll at 390px.
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto(server.url + '/admin#/reports');
+  await page.getByRole('heading', { name: 'Отчёт' }).waitFor();
+  const statsForHeatmap = await (await fetch(server.url + '/stats', { headers: { authorization: 'Bearer ' + TOKEN } })).json();
+  await page.getByRole('button', { name: 'Карта по часам' }).click();
+  await page.locator('table.heatmap').waitFor();
+  const hmCells = await page.locator('table.heatmap tbody td').count();
+  assert.equal(hmCells, 168, `heatmap must have 7×24=168 cells, got ${hmCells}`);
+  const hmClickSum = await page.locator('table.heatmap tbody td').evaluateAll((tds) => tds.reduce((s, td) => s + Number(td.dataset.clicks || 0), 0));
+  assert.equal(hmClickSum, statsForHeatmap.clicks || 0, 'heatmap click sum matches /stats total');
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(300);
+  const hmOverflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+  assert.ok(hmOverflow <= 1, `heatmap page overflows at 390px by ${hmOverflow}px`);
+
   assert.deepEqual(errors, []);
 
   // Accounts: a REQUIRE_LOGIN install starts with the setup screen; owner creates a buyer; logout returns to login.

@@ -1117,7 +1117,7 @@ async function pageReports(params) {
   const PARAM_FIELDS = ['keyword', 'source', 'external_id', 'creative_id', 'ad_campaign_id', ...Array.from({ length: 30 }, (_, i) => `sub_id_${i + 1}`)];
   const paramSel = h('select', { class: 'select', 'aria-label': 'Параметр', onchange: (e) => { f.field = e.target.value; drawPresets(); load(); } },
     h('option', { value: '' }, 'Параметр'), PARAM_FIELDS.map((n) => h('option', { value: n, selected: f.field === n }, n)));
-  const drawPresets = () => put(presets, GROUPS.map(([k, l]) => h('button', { class: 'chip-btn' + (f.group === k && !f.field ? ' on' : ''), onclick: () => { f.group = k; f.field = ''; paramSel.value = ''; drawPresets(); load(); } }, l)));
+  const drawPresets = () => put(presets, [...GROUPS.map(([k, l]) => h('button', { class: 'chip-btn' + (f.group === k && !f.field ? ' on' : ''), onclick: () => { f.group = k; f.field = ''; paramSel.value = ''; drawPresets(); load(); } }, l)), h('button', { class: 'chip-btn' + (f.group === 'heatmap' ? ' on' : ''), onclick: () => { f.group = 'heatmap'; f.field = ''; paramSel.value = ''; drawPresets(); load(); } }, 'Карта по часам')]);
   drawPresets();
   const sel = (key, label, options) => h('select', { class: 'select', 'aria-label': label, onchange: (e) => { f[key] = e.target.value; load(); } },
     h('option', { value: '' }, label), options.map(([v, l]) => h('option', { value: v, selected: f[key] === v }, l)));
@@ -1136,10 +1136,59 @@ async function pageReports(params) {
   async function load() {
     sync();
     const { from, to } = periodRange();
+    note.textContent = '';
+    if (f.group === 'heatmap') {
+      table?.detach(); table = null;
+      const tz = store.get('heatmap:tz', 'UTC');
+      const metric = store.get('heatmap:metric', 'clicks');
+      const tzSel = h('select', { class: 'select', 'aria-label': 'Часовой пояс', onchange: (e) => { store.set('heatmap:tz', e.target.value); load(); } },
+        ['UTC', ...TIME_ZONES.filter((z) => z !== 'UTC')].map((z) => h('option', { value: z, selected: z === tz }, z)));
+      const metricSel = h('select', { class: 'select', 'aria-label': 'Метрика тепловой карты', onchange: (e) => { store.set('heatmap:metric', e.target.value); load(); } },
+        [['clicks', 'Клики'], ['conversions', 'Конверсии'], ['cr', 'CR'], ['revenue', 'Доход']].map(([k, l]) => h('option', { value: k, selected: k === metric }, l)));
+      try {
+        const ts = await api('/stats/timeseries' + qs({ campaign: f.campaign, from, to, granularity: 'hour' }));
+        const grid = Array.from({ length: 7 }, () => new Array(24).fill(0));
+        const gConv = Array.from({ length: 7 }, () => new Array(24).fill(0));
+        const gRev = Array.from({ length: 7 }, () => new Array(24).fill(0));
+        const WD_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+        for (const p of ts.series || []) {
+          const d = new Date(p.bucket ?? p.date);
+          const parts = new Intl.DateTimeFormat('en', { timeZone: tz, hour12: false, weekday: 'short', hour: '2-digit' }).formatToParts(d);
+          const wdRaw = WD_SHORT.indexOf(parts.find((x) => x.type === 'weekday')?.value ?? 'Sun');
+          const wd = wdRaw < 0 ? 0 : (wdRaw + 6) % 7; // 0=Mon … 6=Sun
+          const hr = Number(parts.find((x) => x.type === 'hour')?.value ?? 0) % 24;
+          grid[wd][hr] += p.clicks || 0;
+          gConv[wd][hr] += p.conversions || 0;
+          gRev[wd][hr] += p.revenue || 0;
+        }
+        const getVal = (wd, hr) => {
+          if (metric === 'clicks') return grid[wd][hr];
+          if (metric === 'conversions') return gConv[wd][hr];
+          if (metric === 'cr') return (grid[wd][hr] ? gConv[wd][hr] / grid[wd][hr] : 0);
+          if (metric === 'revenue') return gRev[wd][hr];
+          return 0;
+        };
+        const maxVal = Math.max(...Array.from({ length: 7 }, (_, w) => Array.from({ length: 24 }, (_, h2) => getVal(w, h2))).flat(), 1);
+        const fmtVal = (v) => metric === 'revenue' ? money(v) : metric === 'cr' ? pct(v) : num(v);
+        const WD_LABELS = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
+        const heatTable = h('div', { style: 'overflow-x:auto' },
+          h('table', { class: 'heatmap', 'aria-label': 'Тепловая карта по часам', style: 'border-collapse:collapse;min-width:max-content' },
+            h('thead', {}, h('tr', {}, h('th', { style: 'padding:2px 6px' }, ''), ...Array.from({ length: 24 }, (_, hr) => h('th', { style: 'padding:2px 4px;text-align:center;font-size:11px;color:var(--fg-2)' }, String(hr))))),
+            h('tbody', {}, ...WD_LABELS.map((label, wd) =>
+              h('tr', {},
+                h('th', { scope: 'row', style: 'padding:2px 6px;font-size:12px;white-space:nowrap;color:var(--fg-2);font-weight:normal' }, label),
+                ...Array.from({ length: 24 }, (_, hr) => {
+                  const v = getVal(wd, hr);
+                  const op = Math.round(5 + 90 * v / maxVal);
+                  return h('td', { 'data-clicks': String(grid[wd][hr]), title: fmtVal(v), style: `padding:2px 4px;text-align:center;font-size:11px;min-width:28px;background:color-mix(in srgb,var(--k1) ${op}%,transparent)` }, v > 0 ? (metric === 'revenue' ? num(Math.round(v)) : metric === 'cr' ? String(Math.round(v * 100)) + '%' : String(v)) : '');
+                }))))));
+        put(holder, h('div', { class: 'toolbar', style: 'margin-bottom:8px' }, tzSel, metricSel), heatTable);
+      } catch (e) { put(holder, h('p', { class: 'err' }, 'Ошибка тепловой карты: ' + e.message)); }
+      return;
+    }
     const [key, label, prop] = GROUPS.find((g) => g[0] === f.group) || GROUPS[0];
     try {
       let rows; let drill = null;
-      note.textContent = '';
       if (f.field) {
         const s = await api('/stats/params' + qs({ field: f.field, campaign: f.campaign, from, to }));
         rows = (s.rows || []).map((x) => ({ id: x.value || '(не передан)', clicks: x.clicks || 0, conversions: x.conversions || 0, revenue: x.revenue || 0, cost: x.cost || 0, profit: x.profit || 0, roi: x.roi || 0 }));
