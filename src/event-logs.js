@@ -51,6 +51,7 @@ function normalizeClick(item) {
     referrer: item.referrer ?? null, userAgent, subid: item.subid ?? null,
     country: item.country ?? null, ip: item.ip ?? null,
     params: item.params ?? null, cost: Number(item.cost) || 0,
+    landingId: item.landingId ?? item.landing_id ?? null,
     // Compatibility aliases for clients of the original PostgreSQL API.
     click_id: clickId, offer_id: offerId, created_at: at, user_agent: userAgent };
 }
@@ -115,7 +116,7 @@ async function fromPostgres(kind, query, db) {
   if (query.until !== null) add(`${timestamp} <`, new Date(query.until).toISOString());
   params.push(query.limit + 1, query.offset);
   const fields = kind === 'clicks'
-    ? 'c.click_id, c.campaign, c.offer_id, c.stream, c.path, c.referrer, c.user_agent, c.subid, c.country, c.ip, c.params, c.cost, c.created_at'
+    ? 'c.click_id, c.campaign, c.offer_id, c.stream, c.path, c.referrer, c.user_agent, c.subid, c.country, c.ip, c.params, c.cost, c.landing_id, c.created_at'
     : 'cv.click_id, c.campaign, c.offer_id, c.stream, cv.revenue, cv.currency, cv.created_at';
   const source = kind === 'clicks' ? 'clicks c' : 'conversions cv JOIN clicks c USING (click_id)';
   const { rows } = await db.query(`SELECT ${fields} FROM ${source}

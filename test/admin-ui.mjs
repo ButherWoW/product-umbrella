@@ -48,12 +48,35 @@ try {
   await page.locator('.editor-head .btn.primary').click();
   await page.locator('#toast', { hasText: 'Сохранено' }).waitFor();
 
+  // Landings: create in the section, then attach to the Main stream in its «Схема» tab.
+  await page.locator('[data-nav=landings]').click();
+  await page.getByRole('button', { name: 'Создать', exact: true }).click();
+  const lpDialog = page.getByRole('dialog', { name: 'Создание лендинга' });
+  await lpDialog.locator('input').nth(0).fill('lp-ui');
+  await lpDialog.locator('input').nth(1).fill('UI landing');
+  await lpDialog.locator('input[type=url]').fill('https://lp.example.net/?go={lp_click_url}');
+  await lpDialog.getByRole('button', { name: 'Создать' }).click();
+  await page.locator('table.grid tbody tr', { hasText: 'UI landing' }).waitFor();
+  await page.goto(server.url + '/admin#/campaigns/ui-flows');
+  await page.locator('.stream .title').nth(1).click();
+  const spare = page.getByRole('dialog', { name: 'Редактирование потока' });
+  await spare.getByRole('tab', { name: 'Схема' }).click();
+  await spare.getByRole('button', { name: '+ Добавить лендинг' }).click();
+  await spare.getByLabel('Лендинг', { exact: true }).selectOption('lp-ui');
+  await spare.getByRole('button', { name: 'Применить' }).click();
+  await page.locator('.stream', { hasText: 'Лендинги: UI landing' }).waitFor();
+  await page.locator('.editor-head .btn.primary').click();
+  await page.locator('#toast', { hasText: 'Сохранено' }).waitFor();
+
+
   const stored = (await (await fetch(server.url + '/api/campaigns')).json()).campaigns['ui-flows'].streams;
   assert.equal(stored[0].action, 'url');
   assert.equal(stored[0].url, 'https://landing.example.net/?c={campaign}');
   assert.equal(stored[0].countClicks, false);
   assert.ok(!('offers' in stored[0]));
-  assert.equal(stored[1].name, 'Spare', 'untouched stream is kept');
+  assert.equal(stored[1].name, 'Spare');
+  assert.deepEqual(stored[1].landings, [{ landingId: 'lp-ui', weight: 1 }], 'landing attached through the UI is saved');
+  assert.equal(stored[0].action, 'url', 'reopening the editor keeps action streams intact');
 
   // Phone width: no horizontal page scroll on the main screens.
   await page.setViewportSize({ width: 390, height: 844 });

@@ -7,16 +7,19 @@ export function createEventMirror({ query, onError = () => {} }) {
   const pending = new Set();
 
   function enqueue({ type, at, ...payload }) {
-    if (!['click', 'conversion'].includes(type)) return;
+    if (!['click', 'conversion', 'lp_click'].includes(type)) return;
     const task = lock(payload.clickId, async () => {
       if (type === 'click') {
         await query(`INSERT INTO clicks
-          (click_id, campaign, offer_id, path, referrer, user_agent, subid, country, ip, stream, params, cost, created_at)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13) ON CONFLICT DO NOTHING`,
+          (click_id, campaign, offer_id, path, referrer, user_agent, subid, country, ip, stream, params, cost, landing_id, created_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14) ON CONFLICT DO NOTHING`,
         [payload.clickId, payload.campaign, payload.offerId, payload.path ?? null,
           payload.referrer ?? null, payload.userAgent ?? null, payload.subid ?? null,
           payload.country ?? null, payload.ip ?? null, payload.stream ?? null,
-          payload.params ? JSON.stringify(payload.params) : null, payload.cost ?? 0, at]);
+          payload.params ? JSON.stringify(payload.params) : null, payload.cost ?? 0, payload.landingId ?? null, at]);
+      } else if (type === 'lp_click') {
+        // First landing click wins; repeats keep the original time.
+        await query('UPDATE clicks SET lp_clicked_at = COALESCE(lp_clicked_at, $2) WHERE click_id = $1', [payload.clickId, at]);
       } else {
         await query(`INSERT INTO conversions (click_id, revenue, currency, created_at)
           VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING`,

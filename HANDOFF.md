@@ -1,5 +1,12 @@
 # Product Umbrella — handoff для Claude
 
+## @claude-code 2026-10-30 — DONE: лендинги (stream → landing → offer)
+
+- `landings` (API, JSON-файл/таблица), `stream.landings` с весами, `pickStream` → `landingId`, макрос `{lp_click_url}`, `GET /lp/click?click_id=` (оффер с тем же click_id, параметры исходного клика, `redirectMethod` кампании)
+- `stats-report.js`: группа `byLanding` (ключ `none` без лендинга), `lpClicks`, `lpCtr`; тест «empty reports» обновлён. PG: `GROUP BY ... c.landing_id`, `COUNT(c.lp_clicked_at)`
+- `event-mirror.js`: `landing_id` в INSERT (created_at остался последним), тип `lp_click` → `UPDATE clicks SET lp_clicked_at = COALESCE(lp_clicked_at, $2)`. `event-logs.js`: `landingId`
+- /admin: раздел «Лендинги» (просмотры, клики LP, LP CTR), лендинги в «Схеме» потока, группировка отчёта «Лендинг»
+- FIX: редактор кампании при повторном открытии превращал потоки-действия (url / 404 / кампания) в битый «старый формат» — следующее сохранение их теряло. Покрыто `test/admin-ui.mjs`
 ## @claude-code 2026-10-30 — DONE: отправка в кампанию, фильтры ИЛИ, способ редиректа
 
 - Поток `action: 'campaign'` + `campaignId`: маршрут `/r/:campaign` теперь цикл по кампаниям, максимум 3 перехода, цикл → 508 `campaign_loop`, неактивная кампания в цепочке → 404. Клик пишется в конечной кампании с `parentCampaign` (только JSONL, в PG колонки нет — при необходимости добавлю)

@@ -52,6 +52,16 @@ await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS ip TEXT`);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS stream TEXT`);
 await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS daily_cap INTEGER`);
 await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS name TEXT`);
+await db.query(`
+  CREATE TABLE IF NOT EXISTS landings (
+    id         TEXT        PRIMARY KEY,
+    url        TEXT        NOT NULL,
+    name       TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  )
+`);
+await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS landing_id TEXT`);
+await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS lp_clicked_at TIMESTAMPTZ`);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS params JSONB`);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS cost NUMERIC(12,6) NOT NULL DEFAULT 0`);
 

@@ -14,7 +14,7 @@ test('all report dimensions preserve conversions and revenue', () => {
   assert.equal(report.clicks, 3);
   assert.equal(report.conversions, 2);
   assert.equal(report.revenue, 6);
-  for (const group of ['byCampaign', 'byCountry', 'byOffer', 'byStream']) {
+  for (const group of ['byCampaign', 'byCountry', 'byOffer', 'byStream', 'byLanding']) {
     const items = Object.values(report[group]);
     assert.equal(items.reduce((sum, value) => sum + value.clicks, 0), report.clicks);
     assert.equal(items.reduce((sum, value) => sum + value.conversions, 0), report.conversions);
@@ -36,8 +36,8 @@ test('PostgreSQL aggregates produce the same report as JSONL events', () => {
 
 test('empty reports always expose metrics and all dimensions', () => {
   const report = reportFromEvents([], []);
-  assert.deepEqual(report, { clicks: 0, conversions: 0, revenue: 0, cost: 0, profit: 0, cr: 0, epc: 0, rpm: 0, roi: 0,
-    byCampaign: {}, byCountry: {}, byOffer: {}, byStream: {} });
+  assert.deepEqual(report, { clicks: 0, conversions: 0, revenue: 0, cost: 0, lpClicks: 0, lpCtr: 0, profit: 0, cr: 0, epc: 0, rpm: 0, roi: 0,
+    byCampaign: {}, byCountry: {}, byOffer: {}, byStream: {}, byLanding: {} });
 });
 
 test('user-supplied stream names cannot collide with object prototypes', () => {

@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS clicks (
   stream text,
   params jsonb,
   cost numeric(12,6) NOT NULL DEFAULT 0,
+  landing_id text,
+  lp_clicked_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -59,3 +61,10 @@ CREATE TABLE IF NOT EXISTS sessions (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);
+
+CREATE TABLE IF NOT EXISTS landings (
+  id text PRIMARY KEY,
+  url text NOT NULL CHECK (url ~ '^https://'),
+  name text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);

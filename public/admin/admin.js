@@ -1,5 +1,5 @@
 // Umbrella admin UI — layout and workflows modelled on Keitaro, backed by the existing tracker API.
-const state = { token: null, offers: {}, campaigns: {} };
+const state = { token: null, offers: {}, campaigns: {}, landings: {} };
 // Set by the server when the tracker runs under a path prefix (BASE_PATH, e.g. /umbrella behind nginx).
 const BASE = typeof window.UMBRELLA_BASE === 'string' ? window.UMBRELLA_BASE : '';
 const view = document.getElementById('view');
@@ -79,9 +79,10 @@ const qs = (params) => {
 };
 
 async function loadRefs() {
-  const [o, c] = await Promise.all([api('/api/offers'), api('/api/campaigns')]);
+  const [o, c, l] = await Promise.all([api('/api/offers'), api('/api/campaigns'), api('/api/landings')]);
   state.offers = o.offers || {};
   state.campaigns = c.campaigns || {};
+  state.landings = l.landings || {};
 }
 
 // ---------- period ----------
@@ -291,7 +292,7 @@ const metricCols = (opts = {}) => [
   { key: 'rpm', label: 'RPM', title: 'RPM — доход на 1000 кликов', num: true, hidden: !opts.rpm, value: (r) => ratio(r.revenue * 1000, r.clicks), render: (r) => money(ratio(r.revenue * 1000, r.clicks)), total: (rs) => money(ratio(sum(rs, 'revenue') * 1000, sum(rs, 'clicks'))) },
 ];
 const sum = (rows, key) => rows.reduce((s, r) => s + (Number(r[key]) || 0), 0);
-const groupRows = (obj) => Object.entries(obj || {}).map(([id, v]) => ({ id, clicks: v.clicks || 0, conversions: v.conversions || 0, revenue: v.revenue || 0 }));
+const groupRows = (obj) => Object.entries(obj || {}).map(([id, v]) => ({ id, clicks: v.clicks || 0, conversions: v.conversions || 0, revenue: v.revenue || 0, cost: v.cost || 0, lpClicks: v.lpClicks || 0 }));
 const trackingUrl = (id) => `${location.origin}${BASE}/r/${encodeURIComponent(id)}`;
 const typeLabel = { regular: 'Обычный', fallback: 'Замыкающий', forced: 'Перехватывающий' };
 
@@ -458,7 +459,8 @@ async function pageCampaigns() {
 
 // Normalize legacy flat streams into the conditional shape used by the editor.
 function editableStreams(streams) {
-  return (streams || []).map((s) => (s.offers ? structuredClone(s) : { name: s.name || s.offerId, type: 'regular', conditions: {}, offers: [{ offerId: s.offerId, weight: 1 }], weight: s.weight }));
+  // Only true legacy streams ({ offerId, weight }) are converted; action streams (url / not_found / campaign) have no offers and stay as they are.
+  return (streams || []).map((s) => (s.offers || s.action ? structuredClone(s) : { name: s.name || s.offerId, type: 'regular', conditions: {}, offers: [{ offerId: s.offerId, weight: 1 }], weight: s.weight }));
 }
 const COND = {
   devices: [['mobile', 'Мобильные'], ['tablet', 'Планшеты'], ['desktop', 'Десктоп']],
@@ -489,6 +491,18 @@ function streamModal(stream, onApply, isNew = false, currentCampaignId = null) {
   s.offers = s.offers || [];
   const err = h('p', { class: 'err' });
   const offerIds = Object.keys(state.offers);
+  const landingIds = Object.keys(state.landings);
+  s.landings = s.landings || [];
+  const landingsBox = h('div');
+  const drawLandings = () => put(landingsBox,
+    s.landings.length ? s.landings.map((l, i) => h('div', { class: 'offer-row' },
+      h('select', { class: 'select', 'aria-label': 'Лендинг', onchange: (e) => { l.landingId = e.target.value; } },
+        h('option', { value: '' }, 'Выберите лендинг'), landingIds.map((id) => h('option', { value: id, selected: l.landingId === id }, state.landings[id]?.name ? `${state.landings[id].name} (${id})` : id))),
+      h('input', { class: 'input', type: 'number', min: 1, value: l.weight ?? 1, 'aria-label': 'Вес лендинга', title: 'Вес', oninput: (e) => { l.weight = Number(e.target.value); } }),
+      h('button', { class: 'btn danger square', 'aria-label': 'Убрать лендинг', onclick: () => { s.landings.splice(i, 1); drawLandings(); } }, '✕'))) : h('p', { class: 'muted' }, 'Без лендинга — посетитель сразу уходит на оффер.'),
+    h('button', { class: 'btn', onclick: () => { s.landings.push({ landingId: landingIds[0] || '', weight: 1 }); drawLandings(); } }, '+ Добавить лендинг'),
+    landingIds.length ? null : h('p', { class: 'muted' }, 'Лендинги создаются в разделе «Лендинги».'));
+  drawLandings();
   const offersBox = h('div');
   const drawOffers = () => put(offersBox, 
     s.offers.length ? s.offers.map((o, i) => h('div', { class: 'offer-row' },
@@ -515,7 +529,7 @@ function streamModal(stream, onApply, isNew = false, currentCampaignId = null) {
         h('label', {}, h('input', { type: 'radio', name: 'senabled', checked: s.enabled === false, onchange: () => { s.enabled = false; } }), 'Выключен'))))],
     ['Схема', () => {
       const box = h('div');
-      const draw = () => put(box, s.action === 'offers' ? [h('p', { class: 'muted' }, 'Офферы потока и их доля трафика (вес).'), offersBox]
+      const draw = () => put(box, s.action === 'offers' ? [h('h2', {}, 'Лендинги'), landingsBox, h('h2', { style: 'margin-top:16px' }, 'Офферы'), h('p', { class: 'muted' }, 'Офферы потока и их доля трафика (вес).'), offersBox]
         : s.action === 'url' ? field('URL', h('input', { class: 'input', type: 'url', value: s.url || '', placeholder: 'https://…', oninput: (e) => { s.url = e.target.value.trim(); } }), 'Редирект на этот адрес. Макросы: {click_id} {subid} {campaign} {device} {country}.')
         : s.action === 'campaign' ? field('Кампания', h('select', { class: 'select', onchange: (e) => { s.campaignId = e.target.value; } },
             h('option', { value: '' }, 'Выберите кампанию'),
@@ -547,6 +561,9 @@ function streamModal(stream, onApply, isNew = false, currentCampaignId = null) {
       if (s.action === 'url' && !/^https:\/\//i.test(s.url || '')) { err.textContent = 'Прямой URL должен начинаться с https://'; return; }
       if (s.action === 'campaign' && !s.campaignId) { err.textContent = 'Выберите кампанию на вкладке «Схема».'; return; }
       if (s.offers.some((o) => !(o.weight > 0)) || !(s.weight > 0)) { err.textContent = 'Веса должны быть больше нуля.'; return; }
+      s.landings = (s.landings || []).filter((l) => l.landingId);
+      if (s.landings.some((l) => !(l.weight > 0))) { err.textContent = 'Веса лендингов должны быть больше нуля.'; return; }
+      if (s.action !== 'offers' || !s.landings.length) delete s.landings;
       if (s.action === 'offers') { delete s.action; delete s.url; delete s.campaignId; } else { delete s.offers; if (s.action !== 'url') delete s.url; if (s.action !== 'campaign') delete s.campaignId; }
       onApply(s); close();
     } }, 'Применить')],
@@ -622,7 +639,7 @@ async function pageCampaignEditor(id) {
             s.enabled === false ? [' ', h('span', { class: 'badge' }, 'Выключен')] : null,
             s.countClicks === false ? [' ', h('span', { class: 'badge' }, 'Клики не считаются')] : null),
           h('div', { class: 'meta' }, summarizeConditions(s.conditions)),
-          h('div', { class: 'meta' }, (s.action === 'url' ? 'Прямой URL: ' + s.url : s.action === 'campaign' ? '→ кампания ' + (state.campaigns[s.campaignId]?.name || s.campaignId) : s.action === 'not_found' ? 'Действие: ошибка 404' : 'Офферы: ' + (s.offers || []).map((o) => `${o.offerId} (${o.weight ?? 1})`).join(', ')) + ((s.type || 'regular') === 'regular' ? ` · вес потока ${s.weight ?? 1}` : ''))),
+          h('div', { class: 'meta' }, (s.action === 'url' ? 'Прямой URL: ' + s.url : s.action === 'campaign' ? '→ кампания ' + (state.campaigns[s.campaignId]?.name || s.campaignId) : s.action === 'not_found' ? 'Действие: ошибка 404' : (s.landings?.length ? 'Лендинги: ' + s.landings.map((l) => `${state.landings[l.landingId]?.name || l.landingId} (${l.weight ?? 1})`).join(', ') + ' → ' : '') + 'Офферы: ' + (s.offers || []).map((o) => `${o.offerId} (${o.weight ?? 1})`).join(', ')) + ((s.type || 'regular') === 'regular' ? ` · вес потока ${s.weight ?? 1}` : ''))),
         h('div', { class: 'nums' }, `${num(st.clicks)} кл.`, h('br'), `${num(st.conversions)} конв.`,
           h('div', { class: 'row-actions' },
             h('button', { title: 'Изменить', 'aria-label': 'Изменить поток', onclick: () => streamModal(s, (next) => { d.streams[i] = next; mark(); drawStreams(); }, false, d.id) }, '✎'),
@@ -718,6 +735,64 @@ function offerModal(id, onSaved) {
   });
 }
 
+function landingModal(id, onSaved) {
+  const isNew = !id;
+  const l = isNew ? { id: '', name: '', url: '' } : { id, name: state.landings[id].name || '', url: state.landings[id].url };
+  const err = h('p', { class: 'err' });
+  const close = openModal({
+    title: isNew ? 'Создание лендинга' : 'Редактирование лендинга',
+    body: h('div', {},
+      field('ID лендинга', h('input', { class: 'input', value: l.id, readonly: !isNew, oninput: (e) => { l.id = e.target.value.trim(); } }), isNew ? 'Латиница, цифры, - и _.' : null),
+      field('Название', h('input', { class: 'input', value: l.name, maxlength: 200, oninput: (e) => { l.name = e.target.value; } })),
+      field('URL лендинга', h('input', { class: 'input', type: 'url', value: l.url, placeholder: 'https://…', oninput: (e) => { l.url = e.target.value.trim(); } }),
+        'Посетитель попадает сюда из потока, к ссылке добавляется click_id. Кнопка на лендинге должна вести на ссылку перехода — её можно передать макросом {lp_click_url}, например https://ваш-лендинг/?go={lp_click_url}'),
+      h('p', { class: 'muted' }, `Ссылка перехода на оффер: ${location.origin}${BASE}/lp/click?click_id=<click_id>`),
+      err),
+    footer: [h('button', { class: 'btn', onclick: () => close() }, 'Отмена'), h('button', { class: 'btn primary', onclick: async () => {
+      err.textContent = '';
+      if (!ID_RE.test(l.id)) { err.textContent = 'ID: 2–80 символов, латиница, цифры, - и _.'; return; }
+      if (!/^https:\/\//i.test(l.url)) { err.textContent = 'URL должен начинаться с https://'; return; }
+      if (isNew && state.landings[l.id]) { err.textContent = 'Лендинг с таким ID уже есть.'; return; }
+      try {
+        const body = { name: l.name.trim() || null, url: l.url };
+        await (isNew ? api('/api/landings', { method: 'POST', body: { id: l.id, ...body } }) : api('/api/landings/' + encodeURIComponent(l.id), { method: 'PATCH', body }));
+        toast(isNew ? 'Лендинг создан' : 'Сохранено'); close(); onSaved();
+      } catch (e) { err.textContent = 'Не сохранено: ' + e.message; }
+    } }, isNew ? 'Создать' : 'Сохранить')],
+  });
+}
+
+async function pageLandings() {
+  const table = dataTable({
+    id: 'landings', pageSize: 250,
+    columns: [
+      { key: 'id', label: 'ID', fixed: true, render: (r) => h('a', { href: '#/landings', onclick: (e) => { e.preventDefault(); landingModal(r.id, load); } }, r.id) },
+      { key: 'name', label: 'Название', cls: 'name', value: (r) => r.name || '', render: (r) => r.name || '—' },
+      { key: 'url', label: 'URL', cls: 'name', hidden: true },
+      { key: 'clicks', label: 'Просмотры', title: 'Просмотры лендинга (клики, попавшие на лендинг)', num: true, render: (r) => num(r.clicks), total: (rs) => num(sum(rs, 'clicks')) },
+      { key: 'lpClicks', label: 'Клики LP', title: 'Переходы с лендинга на оффер', num: true, render: (r) => num(r.lpClicks), total: (rs) => num(sum(rs, 'lpClicks')) },
+      { key: 'lpCtr', label: 'LP CTR', num: true, value: (r) => ratio(r.lpClicks, r.clicks), render: (r) => pct(ratio(r.lpClicks, r.clicks)), total: (rs) => pct(ratio(sum(rs, 'lpClicks'), sum(rs, 'clicks'))) },
+      ...metricCols().filter((c) => ['conversions', 'cr', 'revenue', 'epc'].includes(c.key)),
+    ],
+  });
+  put(view,
+    h('div', { class: 'toolbar' }, h('button', { class: 'btn primary', onclick: () => landingModal(null, load) }, 'Создать')),
+    h('div', { class: 'toolbar' }, periodControl(() => load()),
+      h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'),
+      h('button', { class: 'btn square', title: 'Колонки', 'aria-label': 'Колонки', onclick: () => table.chooser() }, '⚙')),
+    table);
+  async function load() {
+    try {
+      await loadRefs();
+      const s = await api('/stats' + qs(periodRange()));
+      const by = s.byLanding || {};
+      table.setRows(Object.entries(state.landings).map(([id, l]) => ({ id, ...l, clicks: by[id]?.clicks || 0, lpClicks: by[id]?.lpClicks || 0, conversions: by[id]?.conversions || 0, revenue: by[id]?.revenue || 0 })));
+    } catch (e) { toast('Ошибка загрузки лендингов: ' + e.message, true); }
+  }
+  load();
+  return () => table.detach();
+}
+
 async function pageOffers() {
   const table = dataTable({
     id: 'offers', pageSize: 250,
@@ -752,7 +827,7 @@ async function pageOffers() {
 }
 
 const GROUPS = [
-  ['campaign', 'Кампания', 'byCampaign'], ['offer', 'Оффер', 'byOffer'], ['stream', 'Поток', 'byStream'], ['country', 'Страна', 'byCountry'],
+  ['campaign', 'Кампания', 'byCampaign'], ['offer', 'Оффер', 'byOffer'], ['stream', 'Поток', 'byStream'], ['landing', 'Лендинг', 'byLanding'], ['country', 'Страна', 'byCountry'],
   ['day', 'День', null], ['hour', 'Час', null], ['referrer', 'Реферер', null], ['path', 'Путь', null],
 ];
 async function pageReports(params) {
@@ -800,7 +875,7 @@ async function pageReports(params) {
         rows = (r.referrers || r.paths || []).map((x) => ({ id: x.referrer ?? x.path ?? '—', clicks: x.clicks || 0, conversions: 0, revenue: 0 }));
         note.textContent = 'Рефереры и пути считаются за всё время, применяется только фильтр кампании; конверсии здесь не считаются.';
       }
-      const nameOf = (r) => (key === 'campaign' ? state.campaigns[r.id]?.name || r.id : r.id);
+      const nameOf = (r) => (key === 'campaign' ? state.campaigns[r.id]?.name || r.id : key === 'landing' ? (r.id === 'none' ? '(без лендинга)' : state.landings[r.id]?.name || r.id) : r.id);
       table?.detach();
       table = dataTable({
         id: 'report-' + key, pageSize: 100,
@@ -980,6 +1055,7 @@ async function route() {
     if (section === 'campaigns' && parts[1]) cleanup = await pageCampaignEditor(decodeURIComponent(parts[1]));
     else if (section === 'campaigns') cleanup = await pageCampaigns();
     else if (section === 'offers') cleanup = await pageOffers();
+    else if (section === 'landings') cleanup = await pageLandings();
     else if (section === 'reports') cleanup = await pageReports(params);
     else if (section === 'clicks' || section === 'conversions') cleanup = pageLog(section, params);
     else if (section === 'users') cleanup = await pageUsers();

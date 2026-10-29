@@ -149,3 +149,46 @@ test('send to campaign, OR filters and redirect methods', { timeout: 15000 }, as
     assert.equal((await (await fetch(url + '/api/campaigns')).json()).campaigns.weird.redirectMethod, 'http', 'unknown method falls back to http');
   });
 });
+
+test('landing flow: stream → landing → /lp/click → offer, with landing stats', { timeout: 15000 }, async (t) => {
+  await withServer(t, {}, async ({ url, post, hit }) => {
+    assert.equal((await post('/api/landings', { id: 'lp-a', name: 'Cdiscount LP', url: 'http://insecure.example/' })).status, 400, 'https only');
+    assert.equal((await post('/api/landings', { id: 'lp-a', name: 'Cdiscount LP', url: 'https://lp.example.net/a?go={lp_click_url}' })).status, 201);
+    await post('/api/offers', { id: 'lp-offer', url: 'https://net.example.com/o?sub1={click_id}&s2={sub_id_2}' });
+    await post('/api/campaigns', { id: 'lp-camp', name: 'LP', streams: [{ name: 'main', offers: [{ offerId: 'lp-offer' }], landings: [{ landingId: 'lp-a', weight: 1 }] }] });
+
+    const first = await hit('/r/lp-camp?sub_id_2=x');
+    const landingUrl = new URL(first.headers.get('location'));
+    assert.equal(landingUrl.host, 'lp.example.net', 'visitor lands on the landing first');
+    const clickId = landingUrl.searchParams.get('click_id');
+    assert.match(clickId, /^[0-9a-f-]{36}$/);
+    const go = new URL(landingUrl.searchParams.get('go'));
+    assert.equal(go.pathname, '/lp/click');
+    assert.equal(go.searchParams.get('click_id'), clickId, 'landing button URL carries the same click id');
+
+    const before = await (await fetch(url + '/stats?campaign=lp-camp')).json();
+    assert.equal(before.byLanding['lp-a'].clicks, 1);
+    assert.equal(before.lpClicks, 0);
+
+    const toOffer = await hit(`/lp/click?click_id=${clickId}`);
+    const offerUrl = new URL(toOffer.headers.get('location'));
+    assert.equal(offerUrl.host, 'net.example.com');
+    assert.equal(offerUrl.searchParams.get('sub1'), clickId, 'offer gets the original click id');
+    assert.equal(offerUrl.searchParams.get('s2'), 'x', 'source params from the original click are reused');
+    await hit(`/lp/click?click_id=${clickId}`);
+    assert.equal((await fetch(`${url}/postback?click_id=${clickId}&secret=conversion-test-secret&revenue=10`)).status, 200);
+
+    const after = await (await fetch(url + '/stats?campaign=lp-camp')).json();
+    assert.equal(after.lpClicks, 1, 'repeated landing clicks count once');
+    assert.equal(after.byLanding['lp-a'].lpCtr, 1);
+    assert.equal(after.byLanding['lp-a'].conversions, 1);
+    assert.equal((await hit('/lp/click?click_id=00000000-0000-4000-8000-000000000000')).status, 404);
+    assert.equal((await hit('/lp/click?click_id=../../etc')).status, 400);
+
+    const patched = await (await post('/api/landings/lp-a', { name: 'Renamed' }, 'PATCH')).json();
+    assert.equal(patched.name, 'Renamed');
+    assert.equal(patched.url, 'https://lp.example.net/a?go={lp_click_url}');
+    const log = (await (await fetch(url + '/api/clicks?campaign=lp-camp')).json()).clicks;
+    assert.equal(log[0].landingId, 'lp-a');
+  });
+});

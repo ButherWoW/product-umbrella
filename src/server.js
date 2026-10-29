@@ -14,6 +14,7 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const dataDir = process.env.DATA_DIR || join(root, 'data');
 const eventsFile = join(dataDir, 'events.jsonl');
 const offersFile = join(dataDir, 'offers.json');
+const landingsFile = join(dataDir, 'landings.json');
 const campaignsFile = join(dataDir, 'campaigns.json');
 const port = Number(process.env.PORT || 4100);
 // Public path prefix when served behind a proxy under a subpath (nginx strips it before proxying).
@@ -112,6 +113,8 @@ function parseStreams(raw) {
       const stream = { ...name, type: STREAM_TYPES.includes(s.type) ? s.type : 'regular', conditions: parseConditions(s.conditions), weight };
       if (action === 'offers') {
         stream.offers = parseOfferWeights(s.offers);
+        const landingList = parseList(s.landings, (l) => ({ landingId: String(l?.landingId || ''), weight: Number(l?.weight ?? 1) }), (l) => OFFER_ID_RE.test(l.landingId) && l.weight > 0).slice(0, 20);
+        if (landingList.length) stream.landings = landingList;
         if (!stream.offers.length) continue;
       } else {
         stream.action = action;
@@ -168,7 +171,8 @@ function pickStream(streams, visitor = {}, excluded = new Set()) {
   if (!stream) return null;
   if (stream.action) return { stream, offerId: null };
   const offerId = stream.offers ? weightedPick(available(stream)).offerId : stream.offerId;
-  return { stream, offerId };
+  const landingId = stream.landings?.length ? weightedPick(stream.landings).landingId : null;
+  return { stream, offerId, landingId };
 }
 
 const BOT_UA_RE = /bot\b|bot\/|crawl|spider|slurp|facebookexternalhit|headless|phantomjs|selenium|puppeteer|playwright|lighthouse|pingdom|uptimerobot|scrapy|curl\/|wget\/|python-requests|python-urllib|aiohttp|go-http-client|java\/|okhttp|apache-httpclient|libwww-perl/i;
@@ -218,7 +222,7 @@ function parseParamMap(raw) {
   return out;
 }
 
-const MACRO_RE = new RegExp(`\\{(click_id|subid|campaign|offer_id|device|country|revenue|currency|cost|${TRACK_FIELDS.join('|')})\\}`, 'g');
+const MACRO_RE = new RegExp(`\\{(click_id|subid|campaign|offer_id|device|country|revenue|currency|cost|lp_click_url|${TRACK_FIELDS.join('|')})\\}`, 'g');
 // Values are URL-encoded: they come from visitors' query strings and must not inject extra parameters.
 function applyMacros(template, vars) {
   return template.replace(MACRO_RE, (_, k) => encodeURIComponent(vars[k] ?? ''));
@@ -497,6 +501,8 @@ async function stats({ campaign = null, from = null, to = null, subid = null, co
           c.country,
           c.offer_id,
           c.stream,
+          c.landing_id,
+          COUNT(c.lp_clicked_at)::int             AS lp_clicks,
           COUNT(c.click_id)::int                  AS clicks,
           COUNT(cv.click_id)::int                 AS conversions,
           COALESCE(SUM(cv.revenue), 0)::float     AS revenue,
@@ -504,7 +510,7 @@ async function stats({ campaign = null, from = null, to = null, subid = null, co
         FROM clicks c
         LEFT JOIN conversions cv USING (click_id)
         ${where}
-        GROUP BY c.campaign, c.country, c.offer_id, c.stream
+        GROUP BY c.campaign, c.country, c.offer_id, c.stream, c.landing_id
       `, params);
       return reportFromRows(rows);
     } catch (e) {
@@ -531,7 +537,8 @@ async function stats({ campaign = null, from = null, to = null, subid = null, co
     });
     const visibleClickIds = new Set(clicks.map((c) => c.clickId));
     const conversions = lines.filter((item) => item.type === 'conversion' && visibleClickIds.has(item.clickId));
-    return reportFromEvents(clicks, conversions);
+    const lpClicked = new Set(lines.filter((item) => item.type === 'lp_click').map((item) => item.clickId));
+    return reportFromEvents(clicks.map((c) => (lpClicked.has(c.clickId) ? { ...c, lpClicked: true } : c)), conversions);
   } catch (error) {
     if (error.code === 'ENOENT') return reportFromEvents([], []);
     throw error;
@@ -577,6 +584,57 @@ async function paramReport({ field, campaign, from, to }) {
 }
 
 // Returns { offerId, campaign } for a click, or null if not found.
+const landings = new Map();
+
+function parseLanding(raw) {
+  const url = String(raw?.url || '').trim();
+  if (!/^https:\/\//i.test(url)) return null;
+  const name = typeof raw?.name === 'string' && raw.name.trim() ? raw.name.trim().slice(0, 200) : null;
+  return { url: url.slice(0, 2048), name };
+}
+
+async function loadLandings() {
+  if (db) {
+    try {
+      const { rows } = await db.query('SELECT id, url, name FROM landings');
+      for (const row of rows) { const l = OFFER_ID_RE.test(row.id) && parseLanding(row); if (l) landings.set(row.id, l); }
+      return;
+    } catch (error) { console.warn('[db] landings load fallback:', error.message); }
+  }
+  try {
+    for (const [id, raw] of Object.entries(JSON.parse(await readFile(landingsFile, 'utf8')))) { const l = OFFER_ID_RE.test(id) && parseLanding(raw); if (l) landings.set(id, l); }
+  } catch (error) { if (error.code !== 'ENOENT') console.warn('[landings] invalid config ignored'); }
+}
+
+async function persistLanding(id, landing) {
+  if (db) await db.query('INSERT INTO landings (id, url, name) VALUES ($1, $2, $3) ON CONFLICT (id) DO UPDATE SET url = EXCLUDED.url, name = EXCLUDED.name', [id, landing.url, landing.name]);
+  else { await mkdir(dataDir, { recursive: true }); await writeFile(landingsFile, JSON.stringify(Object.fromEntries(landings), null, 2) + '\n'); }
+}
+
+// Public URL of this tracker as the visitor sees it (behind a proxy: scheme from X-Forwarded-Proto, plus BASE_PATH).
+function publicBase(req) {
+  const proto = trustProxyHops > 0 && req.headers['x-forwarded-proto'] === 'https' ? 'https' : (req.socket?.encrypted ? 'https' : 'http');
+  return `${proto}://${req.headers.host || 'localhost'}${basePath}`;
+}
+
+// Full click record for /lp/click. PostgreSQL first; JSONL when the mirror has not caught up yet.
+async function getClickRecord(clickId) {
+  if (db) {
+    try {
+      const { rows } = await db.query('SELECT campaign, offer_id, landing_id, subid, country, params, cost FROM clicks WHERE click_id = $1', [clickId]);
+      if (rows.length) { const r = rows[0]; return { campaign: r.campaign, offerId: r.offer_id, landingId: r.landing_id, subid: r.subid, country: r.country, params: r.params, cost: Number(r.cost) || 0 }; }
+    } catch (e) { console.warn('[db] getClickRecord fallback:', e.message); }
+  }
+  try {
+    const lines = (await readFile(eventsFile, 'utf8')).split('\n');
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      if (!lines[i].includes(clickId)) continue;
+      try { const item = JSON.parse(lines[i]); if (item.type === 'click' && item.clickId === clickId) return item; } catch { /* skip */ }
+    }
+  } catch { /* non-fatal */ }
+  return null;
+}
+
 async function getClickData(clickId) {
   if (db) {
     try {
@@ -911,7 +969,8 @@ const server = http.createServer(async (req, res) => {
         const fromParam = rawCost === null || rawCost.trim() === '' ? NaN : Number(rawCost);
         cost = Number.isFinite(fromParam) && fromParam >= 0 && fromParam < 1000 ? fromParam : c.cpc;
       }
-      const macroVars = { ...params, cost: cost || '', click_id: clickId, subid: subid || '', campaign: campaignId, offer_id: offerId, device, country: country || '' };
+      const macroVars = { ...params, cost: cost || '', click_id: clickId, subid: subid || '', campaign: campaignId, offer_id: offerId, device, country: country || '',
+        lp_click_url: `${publicBase(req)}/lp/click?click_id=${clickId}` };
       const expanded = applyMacros(targetTemplate, macroVars);
       const destination = new URL(expanded);
       if (!targetTemplate.includes('{click_id}')) destination.searchParams.set('click_id', clickId);
@@ -956,6 +1015,9 @@ const server = http.createServer(async (req, res) => {
         if (picked.stream.action === 'url') return await handleClick(campaignId, '', picked.stream.url, picked.stream.name || null, countClick, extra);
         const offer = offers.get(picked.offerId);
         if (!offer) return json(res, 404, { error: 'offer_not_found' });
+        // Landing first: the visitor sees the landing; its button goes to /lp/click, which sends them to this offer.
+        const landing = picked.landingId ? landings.get(picked.landingId) : null;
+        if (landing) return await handleClick(campaignId, picked.offerId, landing.url, picked.stream.name || null, countClick, { ...extra, landingId: picked.landingId });
         return await handleClick(campaignId, picked.offerId, offer.url, picked.stream.name || null, countClick, extra);
       }
     }
@@ -999,6 +1061,43 @@ const server = http.createServer(async (req, res) => {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       return json(res, 200, await readEventLog({ kind: 'conversions', params: url.searchParams, eventsFile, db,
         onFallback: (error) => console.warn('[db] conversion log fallback:', error.message) }));
+    }
+    if (url.pathname === '/lp/click' && req.method === 'GET') {
+      const clickId = url.searchParams.get('click_id') || '';
+      if (!/^[0-9a-f-]{36}$/i.test(clickId)) return json(res, 400, { error: 'click_id_required' });
+      const click = await getClickRecord(clickId);
+      if (!click) return json(res, 404, { error: 'click_not_found' });
+      const offer = offers.get(click.offerId);
+      if (!offer) return json(res, 404, { error: 'offer_not_found' });
+      await event('lp_click', { clickId, campaign: click.campaign, landingId: click.landingId ?? null });
+      const vars = { ...(click.params || {}), cost: click.cost || '', click_id: clickId, subid: click.subid || '', campaign: click.campaign, offer_id: click.offerId, device: '', country: click.country || '' };
+      const destination = new URL(applyMacros(offer.url, vars));
+      if (!offer.url.includes('{click_id}')) destination.searchParams.set('click_id', clickId);
+      return sendRedirect(res, destination.toString(), campaigns.get(click.campaign)?.redirectMethod);
+    }
+    if (url.pathname === '/api/landings' && req.method === 'GET') return json(res, 200, { landings: Object.fromEntries(landings) });
+    if (url.pathname === '/api/landings' && req.method === 'POST') {
+      const body = await readJson(req);
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      if (!OFFER_ID_RE.test(String(body.id || ''))) return json(res, 400, { error: 'valid_id_required' });
+      const landing = parseLanding(body);
+      if (!landing) return json(res, 400, { error: 'https_url_required' });
+      landings.set(String(body.id), landing);
+      await persistLanding(String(body.id), landing);
+      return json(res, 201, { id: body.id, ...landing });
+    }
+    const landingUpdate = url.pathname.match(/^\/api\/landings\/([A-Za-z0-9_-]{2,80})$/);
+    if (landingUpdate && req.method === 'PATCH') {
+      const body = await readJson(req);
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      const id = landingUpdate[1];
+      const cur = landings.get(id);
+      if (!cur) return json(res, 404, { error: 'landing_not_found' });
+      const updated = parseLanding({ url: body.url ?? cur.url, name: body.name !== undefined ? body.name : cur.name });
+      if (!updated) return json(res, 400, { error: 'https_url_required' });
+      landings.set(id, updated);
+      await persistLanding(id, updated);
+      return json(res, 200, { id, ...updated });
     }
     if (url.pathname === '/api/offers' && req.method === 'GET') {
       return json(res, 200, { offers: Object.fromEntries(offers) });
@@ -1226,6 +1325,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 await loadOffers();
+await loadLandings();
 await loadCampaigns();
 server.listen(port, '127.0.0.1', () => console.log(`Product Umbrella listening on http://127.0.0.1:${server.address().port}`));
 
