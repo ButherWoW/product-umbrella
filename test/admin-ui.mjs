@@ -138,6 +138,23 @@ try {
   const createdOffers = await (await fetch(server.url + '/api/offers')).json();
   assert.equal(createdOffers.offers['offer-ui'].networkId, 'net-ui', 'offer keeps selected partner network');
 
+  await page.goto(server.url + '/admin#/campaigns/ui-flows');
+  // Offer monitor: the mode is chosen in the editor; a dead offer shows on the dashboard after two failed checks.
+  await page.getByLabel('Мониторинг офферов').selectOption('off');
+  await page.locator('.editor-head .btn.primary').click();
+  await page.locator('#toast', { hasText: 'Сохранено' }).waitFor();
+  assert.equal((await (await fetch(server.url + '/api/campaigns')).json()).campaigns['ui-flows'].monitoring, 'off');
+  await api('/api/offers', { id: 'dead-ui', url: 'https://127.0.0.1:9/gone?token=x' });
+  await api('/api/campaigns', { id: 'ui-dead', name: 'UI dead', monitoring: 'disable', streams: [{ name: 'Dead', offers: [{ offerId: 'dead-ui', weight: 1 }] }] });
+  for (let i = 0; i < 2; i++) await api('/api/monitor/check', {});
+  await page.goto(server.url + '/admin#/dashboard');
+  const downCard = page.locator('.monitor-down');
+  await downCard.filter({ hasText: 'Не отвечают' }).waitFor();
+  assert.match(await downCard.innerText(), /https:\/\/127\.0\.0\.1:9\/gone(?!\?)/);
+  assert.equal(await downCard.getByRole('link', { name: 'UI dead' }).getAttribute('href'), '#/campaigns/ui-dead');
+  await downCard.getByRole('link', { name: 'UI dead' }).click();
+  await page.locator('.stream', { hasText: 'Выключен монитором' }).waitFor();
+  assert.equal(await page.getByLabel('Мониторинг офферов').inputValue(), 'disable');
 
   // Currency switch on the dashboard: 25 USD = 20 EUR = 2000 RUB at the fixed test rates.
   await page.goto(server.url + '/admin#/dashboard');

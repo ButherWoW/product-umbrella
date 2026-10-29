@@ -17,7 +17,7 @@ const conversions = clicks.slice(0, 2).map((click) => ({ type: 'conversion', cli
   at: '2026-10-29T13:00:00.000Z', revenue: 2.5, currency: 'USD' }));
 await writeFile(join(dataDir, 'events.jsonl'), [...clicks, ...conversions].map((item) => JSON.stringify(item)).join('\n') + '\n');
 const child = spawn(process.execPath, ['src/server.js'], { env: { ...process.env, PORT: '4213', DATA_DIR: dataDir,
-  DATABASE_URL: '', GEOIP_DB: '', ADMIN_TOKEN: 'log-ui-token', CLICK_RATE_LIMIT: '0' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  DATABASE_URL: '', GEOIP_DB: '', ADMIN_TOKEN: 'log-ui-token', CLICK_RATE_LIMIT: '0', MONITOR: '0' }, stdio: ['ignore', 'pipe', 'pipe'] });
 let browser;
 let output = '';
 child.stderr.on('data', (chunk) => { output += chunk; });
