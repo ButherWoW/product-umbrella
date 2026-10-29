@@ -402,6 +402,10 @@ const metricCols = (opts = {}) => [
   { key: 'sales', label: 'Продажи', title: 'Продажи — подтверждённые конверсии', num: true, hidden: true, render: (r) => num(r.sales), total: (rs) => num(sum(rs, 'sales')) },
   { key: 'rejected', label: 'Отклонённые', num: true, hidden: true, render: (r) => num(r.rejected), total: (rs) => num(sum(rs, 'rejected')) },
   { key: 'pendingRevenue', label: 'Доход (ожидаемый)', title: 'Сумма по лидам, ещё не подтверждённым', num: true, hidden: true, render: (r) => money(r.pendingRevenue), total: (rs) => money(sum(rs, 'pendingRevenue')) },
+  { key: 'uepc', label: 'uEPC', title: 'uEPC — доход на уникальный клик', num: true, hidden: true, value: (r) => (r.uniqueClicks ? r.revenue / r.uniqueClicks : 0), render: (r) => (r.uniqueClicks ? money4(r.revenue / r.uniqueClicks) : '—'), total: (rs) => { const u = sum(rs, 'uniqueClicks'); return u ? money4(sum(rs, 'revenue') / u) : '—'; } },
+  { key: 'approvePct', label: 'Approve %', title: 'Approve % — доля подтверждённых от всех завершённых', num: true, hidden: true, value: (r) => { const d = (r.sales || 0) + (r.rejected || 0) + (r.leads || 0); return d ? (r.sales || 0) / d : 0; }, render: (r) => { const d = (r.sales || 0) + (r.rejected || 0) + (r.leads || 0); return d ? pct((r.sales || 0) / d) : '—'; }, total: (rs) => { const d = sum(rs, 'sales') + sum(rs, 'rejected') + sum(rs, 'leads'); return d ? pct(sum(rs, 'sales') / d) : '—'; } },
+  { key: 'crHold', label: 'CR (холд)', title: 'CR (холд) — доля лидов от кликов', num: true, hidden: true, value: (r) => ratio(r.leads, r.clicks), render: (r) => (r.clicks ? pct(ratio(r.leads, r.clicks)) : '—'), total: (rs) => { const c = sum(rs, 'clicks'); return c ? pct(sum(rs, 'leads') / c) : '—'; } },
+  { key: 'cpa', label: 'CPA', title: 'CPA — расход на продажу', num: true, hidden: true, value: (r) => (r.sales ? (r.cost || 0) / r.sales : 0), render: (r) => (r.sales ? money4((r.cost || 0) / r.sales) : '—'), total: (rs) => { const s = sum(rs, 'sales'); return s ? money4(sum(rs, 'cost') / s) : '—'; } },
 ];
 const sum = (rows, key) => rows.reduce((s, r) => s + (Number(r[key]) || 0), 0);
 const groupRows = (obj) => Object.entries(obj || {}).map(([id, v]) => ({ id, clicks: v.clicks || 0, uniqueClicks: v.uniqueClicks || 0, conversions: v.conversions || 0, revenue: v.revenue || 0, cost: v.cost || 0, lpClicks: v.lpClicks || 0,
@@ -1196,6 +1200,8 @@ async function pageReports(params) {
   let table = null;
   const sync = () => { const next = '#/reports' + qs(f); if (location.hash !== next) history.replaceState(null, '', next); };
   const presets = h('div', { class: 'toolbar' });
+  let currentParamRows = [];
+  const LIST_FIELDS = new Set(['source', 'creative_id', ...Array.from({ length: 30 }, (_, i) => `sub_id_${i + 1}`)]);
   const PARAM_FIELDS = ['keyword', 'source', 'external_id', 'creative_id', 'ad_campaign_id', ...Array.from({ length: 30 }, (_, i) => `sub_id_${i + 1}`)];
   const paramSel = h('select', { class: 'select', 'aria-label': 'Параметр', onchange: (e) => { f.field = e.target.value; drawPresets(); load(); } },
     h('option', { value: '' }, 'Параметр'), PARAM_FIELDS.map((n) => h('option', { value: n, selected: f.field === n }, n)));
@@ -1236,6 +1242,31 @@ async function pageReports(params) {
   const sel = (key, label, options) => h('select', { class: 'select', 'aria-label': label, onchange: (e) => { f[key] = e.target.value; load(); } },
     h('option', { value: '' }, label), options.map(([v, l]) => h('option', { value: v, selected: f[key] === v }, l)));
   const txt = (key, label) => h('input', { class: 'input', value: f[key], placeholder: label, 'aria-label': label, style: 'width:130px', onchange: (e) => { f[key] = e.target.value.trim(); load(); } });
+  const listsBtn = h('button', { class: 'btn', hidden: true, onclick: () => {
+    const roiThr = h('input', { type: 'number', class: 'input', value: '-30', style: 'width:80px', 'aria-label': 'Порог ROI (%)' });
+    const minCl = h('input', { type: 'number', class: 'input', value: '100', style: 'width:80px', 'aria-label': 'Минимум кликов' });
+    const blackOut = h('div');
+    const whiteOut = h('div');
+    const compute = () => {
+      const thr = (Number(roiThr.value) || -30) / 100;
+      const min = Number(minCl.value) || 0;
+      const eligible = currentParamRows.filter((r) => r.clicks >= min);
+      const black = eligible.filter((r) => r.roi < thr).map((r) => r.id);
+      const white = eligible.filter((r) => r.roi >= 0).map((r) => r.id);
+      const copyBtn = (arr) => arr.length ? h('button', { class: 'btn', onclick: () => navigator.clipboard?.writeText(arr.join(', ')).catch(() => {}) }, 'Копировать') : null;
+      put(blackOut, black.length ? document.createTextNode(black.join(', ')) : h('em', {}, '(нет значений)'), copyBtn(black));
+      put(whiteOut, white.length ? document.createTextNode(white.join(', ')) : h('em', {}, '(нет значений)'), copyBtn(white));
+    };
+    roiThr.addEventListener('input', compute);
+    minCl.addEventListener('input', compute);
+    compute();
+    openModal({ title: 'Списки',
+      body: h('div', {},
+        h('div', { class: 'toolbar', style: 'margin-bottom:12px' },
+          h('label', {}, 'Порог ROI (%): ', roiThr), h('label', {}, 'Мин. кликов: ', minCl)),
+        h('h3', {}, 'Чёрный список'), blackOut,
+        h('h3', {}, 'Белый список'), whiteOut) });
+  } }, 'Списки');
   put(view, h('h1', {}, 'Отчёт'), savedBar, presets,
     h('div', { class: 'toolbar' },
       paramSel,
@@ -1243,6 +1274,7 @@ async function pageReports(params) {
       sel('offer', 'Все офферы', Object.keys(state.offers).map((id) => [id, id])),
       txt('country', 'Страна'), txt('stream', 'Поток'), txt('subid', 'Sub ID'),
       periodControl(() => load()), currencyControl(() => load()),
+      listsBtn,
       h('button', { class: 'btn', onclick: saveReport }, '💾 Сохранить'),
       h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'),
       h('button', { class: 'btn square', title: 'Колонки', 'aria-label': 'Колонки', onclick: () => table?.chooser() }, '⚙')),
@@ -1252,6 +1284,7 @@ async function pageReports(params) {
     sync();
     const { from, to } = periodRange();
     note.textContent = '';
+    listsBtn.hidden = !f.field || !LIST_FIELDS.has(f.field);
     if (f.group === 'heatmap') {
       table?.detach(); table = null;
       const tz = store.get('heatmap:tz', 'UTC');
@@ -1308,6 +1341,7 @@ async function pageReports(params) {
       if (f.field) {
         const s = await api('/stats/params' + qs({ field: f.field, campaign: f.campaign, from, to }));
         rows = (s.rows || []).map((x) => ({ id: x.value || '(не передан)', clicks: x.clicks || 0, conversions: x.conversions || 0, revenue: x.revenue || 0, cost: x.cost || 0, profit: x.profit || 0, roi: x.roi || 0 }));
+        currentParamRows = rows;
         note.textContent = 'Для отчёта по параметру применяются только кампания и период.';
       } else if (prop) {
         const s = await api('/stats' + qs({ from, to, campaign: f.campaign, offer: f.offer, country: f.country, stream: f.stream, subid: f.subid }));
