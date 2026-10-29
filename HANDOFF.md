@@ -1,9 +1,14 @@
 # Product Umbrella — handoff для Claude
 
-## @claude-code 2026-10-30 — IN PROGRESS: свои пользователи + своя БД (отдельно от bananabun)
+## @claude-code 2026-10-30 — DONE: свои пользователи + своя БД (отдельно от bananabun)
 
-Беру: новый `src/auth.js` (users/sessions, scrypt, PG + JSON fallback), маршруты `/api/auth/*` и `/api/users*`, `adminAuthorized` становится async и принимает сессию владельца/баера, режим `REQUIRE_LOGIN=1` закрывает `/api/*`, `/stats*`, `/dashboard` (кроме `/r`, `/postback`, `/health`, `/admin`). Для cookie-сессии на запись нужен заголовок `X-Requested-With: umbrella` (защита от CSRF) — твой `/dashboard` с Bearer-токеном продолжит работать. Таблицы `users`, `sessions` в migrate/schema. Деплой: отдельная база `umbrella` с отдельной ролью в PostgreSQL на сервере.
-
+- `src/auth.js`: users/sessions (PG или `users.json`/`sessions.json` 0600), scrypt, токен сессии хранится только как sha256, TTL 14 дней
+- API: `GET /api/auth/me`, `POST /api/auth/setup` (первый владелец; при заданном ADMIN_TOKEN — только с Bearer), `POST /api/auth/login` (10 ошибок за 15 мин → 429), `POST /api/auth/logout`, `GET/POST /api/users`, `DELETE /api/users/:id` (owner; нельзя себя и последнего владельца)
+- `adminAuthorized` теперь async: Bearer ИЛИ сессия (+ `X-Requested-With: umbrella` для записи по cookie). Свежая dev-установка без токена и без пользователей остаётся открытой — все старые тесты не тронуты
+- `REQUIRE_LOGIN=1`: `/api/*`, `/stats*`, `/assets/*` → 401, `/dashboard` → редирект на /admin. Трекинг `/r`, `/postback`, `/health`, `/admin` публичные. GPT: твой /dashboard работает после входа в /admin (cookie same-origin) или с Bearer
+- FIX (важно): `return handleClick(...)` внутри try без await — исключение из обработчика клика не ловилось и роняло процесс. Теперь `return await` везде
+- Деплой: `deploy/setup-db.sh` создаёт роль и базу `umbrella` в локальном PostgreSQL, `REVOKE ALL ... FROM PUBLIC`; пароль в `/opt/umbrella/.db_password` (root, 0600); без PostgreSQL — JSONL в `/opt/umbrella/data`
+- Тесты: `test/auth.test.mjs` (3), Playwright `test/admin-ui.mjs` дополнен сценарием первый запуск → баер → выход → вход
 ## @claude-code 2026-10-30 — DONE (backend): параметры sub_id_1..30 + расход/прибыль/ROI
 
 - Клик пишет `params` (keyword, source, external_id, creative_id, ad_campaign_id, sub_id_1..30) и `cost`. Кампания: `paramMap` (поле → имя query-параметра, напр. `{sub_id_1:'ad_id', cost:'bid'}`), `costModel: 'cpc'|'none'`, `cpc`, `costFromParam`
