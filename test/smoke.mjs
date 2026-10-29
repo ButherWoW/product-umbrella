@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { Script } from 'node:vm';
 
 const dataDir = await mkdtemp(join(tmpdir(), 'product-umbrella-'));
-const child = spawn(process.execPath, ['src/server.js'], { env: { ...process.env, PORT: '4199', DATA_DIR: dataDir, POSTBACK_SECRET: 'test-secret', TRUST_PROXY: '1', DATABASE_URL: '', ADMIN_TOKEN: '', GEOIP_DB: '', CLICK_RATE_LIMIT: '0' }, stdio: ['ignore', 'pipe', 'pipe'] });
+const child = spawn(process.execPath, ['src/server.js'], { env: { ...process.env, PORT: '4199', DATA_DIR: dataDir, POSTBACK_SECRET: 'test-secret', TRUST_PROXY: '1', FX_REFRESH: '0', DATABASE_URL: '', ADMIN_TOKEN: '', GEOIP_DB: '', CLICK_RATE_LIMIT: '0' }, stdio: ['ignore', 'pipe', 'pipe'] });
 await new Promise((resolve, reject) => {
   const timer = setTimeout(() => reject(new Error('server start timeout')), 5000);
   child.stdout.on('data', (chunk) => { if (String(chunk).includes('listening')) { clearTimeout(timer); resolve(); } });

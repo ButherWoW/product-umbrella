@@ -74,6 +74,12 @@ Tracking URL принимает `utm_source`, `utm_medium`, `utm_campaign`, `utm
 - `conditions.mode: "or"` — поток подходит, если сработал любой из заданных фильтров (по умолчанию все — «И»).
 - Кампания: `redirectMethod` — `http` (302, по умолчанию), `meta` (страница с meta refresh) или `js` (location.replace + meta в noscript). URL в странице экранируется.
 
+## Валюты
+
+Сумма конверсии хранится в той валюте, в которой её прислала партнёрка (`&currency=USD`); без валюты — `DEFAULT_CURRENCY` (по умолчанию EUR). Расход кликов (CPC) и кап дохода кампании задаются в `DEFAULT_CURRENCY`.
+
+Отчёты пересчитывают всё в выбранную валюту по текущему курсу: `/stats?currency=RUB`, `/stats/timeseries?currency=USD`, `/stats/params?currency=…` (ответ содержит `currency`). Курсы — `open.er-api.com` (ExchangeRate-API, 160+ валют, без ключа), обновляются каждые 12 часов и кэшируются в `DATA_DIR/fx-rates.json`; при недоступности источника используются последние известные. `GET /api/rates` — курсы и время обновления. `FX_REFRESH=0` отключает загрузку (тесты). В /admin переключатель валюты на дашборде и на страницах со статистикой, под плитками — курс пересчёта. Ссылка «Rates By Exchange Rate API» в меню — условие использования источника.
+
 ## Статусы конверсий
 
 `/postback?...&status=lead|sale|rejected|trash` (как в Keitaro). Синонимы партнёрок: `pending`/`hold` → lead, `approved`/`confirmed`/`paid` → sale, `declined`/`cancelled`/`refund`/`chargeback` → rejected, `fraud`/`duplicate` → trash; неизвестный статус → 400. Без `status` — продажа (как раньше).

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { db, query, closeDb } from './db.js';
 import { reportFromRows, reportFromEvents, metrics } from './stats-report.js';
 import { createUserStore, readCookie, SESSION_TTL_MS } from './auth.js';
+import { createRates, normalizeCurrency } from './currency.js';
 import { readEventLog } from './event-logs.js';
 import { createConversionRecorder, hasRecordedConversion, findRecordedConversion } from './conversion-recorder.js';
 import { createEventMirror } from './event-mirror.js';
@@ -22,6 +23,24 @@ const basePath = /^\/[A-Za-z0-9_-]{1,40}$/.test(process.env.BASE_PATH || '') ? p
 // Umbrella's own accounts (see src/auth.js). REQUIRE_LOGIN=1 closes reports and APIs to anonymous visitors.
 const users = createUserStore({ db, dataDir });
 const requireLogin = /^(1|true|yes)$/i.test(process.env.REQUIRE_LOGIN || '');
+// Amounts without a currency (and all click costs) are in DEFAULT_CURRENCY; reports convert to any currency at current rates.
+const rates = createRates({ dataDir, defaultCurrency: normalizeCurrency(process.env.DEFAULT_CURRENCY, 'EUR'),
+  refreshMs: process.env.FX_REFRESH === '0' ? 0 : 12 * 3600 * 1000 });
+const reportCurrency = (raw) => normalizeCurrency(raw, rates.defaultCurrency);
+// Adds the conversion factors to a SQL parameter list; returns the SQL fragments that use them.
+function sqlFx(params, currency) {
+  params.push(JSON.stringify(rates.factors(currency)), rates.defaultCurrency, rates.factor(rates.defaultCurrency, currency));
+  const n = params.length;
+  const amount = `cv.revenue * COALESCE(($${n - 2}::jsonb ->> COALESCE(cv.currency, $${n - 1}))::float, 1)`;
+  return {
+    revenue: `COALESCE(SUM(${amount}) FILTER (WHERE cv.status = 'sale'), 0)`,
+    pending: `COALESCE(SUM(${amount}) FILTER (WHERE cv.status = 'lead'), 0)`,
+    cost: `COALESCE(SUM(c.cost), 0) * $${n}::float`,
+  };
+}
+// JSONL equivalents.
+const convertConversion = (cv, currency) => (cv.revenue === null || cv.revenue === undefined ? cv : { ...cv, revenue: Number(cv.revenue) * rates.factor(cv.currency, currency) });
+const convertClickCost = (click, currency) => (click.cost ? { ...click, cost: Number(click.cost) * rates.factor(rates.defaultCurrency, currency) } : click);
 const SESSION_COOKIE = 'umb_session';
 const loginFailures = new Map();
 const postbackSecret = process.env.POSTBACK_SECRET || '';
@@ -353,12 +372,15 @@ async function todayRevenue(campaign) {
   const today = new Date().toISOString().slice(0, 10);
   if (db) {
     try {
+      // Revenue cap is set in DEFAULT_CURRENCY; conversions in other currencies are converted.
+      const capParams = [campaign, `${today}T00:00:00Z`];
+      const capFx = sqlFx(capParams, rates.defaultCurrency);
       const { rows } = await db.query(
-        `SELECT ${SQL_REVENUE}::float AS rev
+        `SELECT ${capFx.revenue}::float AS rev
          FROM conversions cv
          JOIN clicks c USING (click_id)
          WHERE c.campaign = $1 AND cv.created_at >= $2`,
-        [campaign, `${today}T00:00:00Z`],
+        capParams,
       );
       return rows[0].rev;
     } catch (e) { console.warn('[db] todayRevenue fallback:', e.message); }
@@ -372,7 +394,7 @@ async function todayRevenue(campaign) {
     );
     return [...latestConversions(lines).values()]
       .filter((item) => clickIds.has(item.clickId))
-      .reduce((sum, item) => sum + saleRevenue(item), 0);
+      .reduce((sum, item) => sum + saleRevenue(item) * rates.factor(item.currency, rates.defaultCurrency), 0);
   } catch { return 0; }
 }
 
@@ -490,7 +512,7 @@ async function event(type, payload) {
   eventMirror?.enqueue(record);
 }
 
-async function stats({ campaign = null, from = null, to = null, subid = null, country = null, offer = null, stream = null } = {}) {
+async function stats({ campaign = null, from = null, to = null, subid = null, country = null, offer = null, stream = null, currency = rates.defaultCurrency } = {}) {
   if (from && !/^\d{4}-\d{2}-\d{2}$/.test(from)) throw Object.assign(new Error('invalid_from_date'), { statusCode: 400 });
   if (to && !/^\d{4}-\d{2}-\d{2}$/.test(to)) throw Object.assign(new Error('invalid_to_date'), { statusCode: 400 });
 
@@ -507,6 +529,7 @@ async function stats({ campaign = null, from = null, to = null, subid = null, co
       if (offer) { params.push(offer); conditions.push(`c.offer_id = $${params.length}`); }
       if (stream) { params.push(stream); conditions.push(`COALESCE(NULLIF(c.stream, ''), 'default') = $${params.length}`); }
       const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+      const fx = sqlFx(params, currency);
       const { rows } = await db.query(`
         SELECT
           c.campaign,
@@ -517,19 +540,19 @@ async function stats({ campaign = null, from = null, to = null, subid = null, co
           COUNT(c.lp_clicked_at)::int             AS lp_clicks,
           COUNT(c.click_id)::int                  AS clicks,
           ${SQL_CONVERSIONS}::int                 AS conversions,
-          ${SQL_REVENUE}::float                   AS revenue,
+          ${fx.revenue}::float                    AS revenue,
           COUNT(cv.click_id) FILTER (WHERE cv.status = 'lead')::int     AS leads,
           COUNT(cv.click_id) FILTER (WHERE cv.status = 'sale')::int     AS sales,
           COUNT(cv.click_id) FILTER (WHERE cv.status = 'rejected')::int AS rejected,
           COUNT(cv.click_id) FILTER (WHERE cv.status = 'trash')::int    AS trash,
-          COALESCE(SUM(cv.revenue) FILTER (WHERE cv.status = 'lead'), 0)::float AS pending_revenue,
-          COALESCE(SUM(c.cost), 0)::float         AS cost
+          ${fx.pending}::float AS pending_revenue,
+          ${fx.cost}::float                       AS cost
         FROM clicks c
         LEFT JOIN conversions cv USING (click_id)
         ${where}
         GROUP BY c.campaign, c.country, c.offer_id, c.stream, c.landing_id
       `, params);
-      return reportFromRows(rows);
+      return { ...reportFromRows(rows), currency };
     } catch (e) {
       if (e.statusCode) throw e;
       console.warn('[db] stats fallback to JSONL:', e.message);
@@ -555,24 +578,26 @@ async function stats({ campaign = null, from = null, to = null, subid = null, co
     const visibleClickIds = new Set(clicks.map((c) => c.clickId));
     const conversions = [...latestConversions(lines).values()].filter((item) => visibleClickIds.has(item.clickId));
     const lpClicked = new Set(lines.filter((item) => item.type === 'lp_click').map((item) => item.clickId));
-    return reportFromEvents(clicks.map((c) => (lpClicked.has(c.clickId) ? { ...c, lpClicked: true } : c)), conversions);
+    return { ...reportFromEvents(clicks.map((c) => convertClickCost(lpClicked.has(c.clickId) ? { ...c, lpClicked: true } : c, currency)),
+      conversions.map((cv) => convertConversion(cv, currency))), currency };
   } catch (error) {
-    if (error.code === 'ENOENT') return reportFromEvents([], []);
+    if (error.code === 'ENOENT') return { ...reportFromEvents([], []), currency };
     throw error;
   }
 }
 
 // Clicks/conversions/revenue/cost grouped by one tracked parameter value ('' = not passed).
-async function paramReport({ field, campaign, from, to }) {
+async function paramReport({ field, campaign, from, to, currency = rates.defaultCurrency }) {
   if (db) {
     try {
       const conditions = []; const values = [field];
       if (campaign) { values.push(campaign); conditions.push(`c.campaign = $${values.length}`); }
       if (from) { values.push(`${from}T00:00:00Z`); conditions.push(`c.created_at >= $${values.length}`); }
       if (to) { values.push(`${to}T23:59:59Z`); conditions.push(`c.created_at <= $${values.length}`); }
+      const fx = sqlFx(values, currency);
       const { rows } = await db.query(`
         SELECT COALESCE(c.params->>$1, '') AS value, COUNT(c.click_id)::int AS clicks, ${SQL_CONVERSIONS}::int AS conversions,
-          ${SQL_REVENUE}::float AS revenue, COALESCE(SUM(c.cost), 0)::float AS cost
+          ${fx.revenue}::float AS revenue, ${fx.cost}::float AS cost
         FROM clicks c LEFT JOIN conversions cv USING (click_id)
         ${conditions.length ? 'WHERE ' + conditions.join(' AND ') : ''}
         GROUP BY 1 ORDER BY clicks DESC LIMIT 500`, values);
@@ -593,8 +618,8 @@ async function paramReport({ field, campaign, from, to }) {
     const key = click.params?.[field] ?? '';
     const g = groups.get(key) || { value: key, clicks: 0, conversions: 0, revenue: 0, cost: 0 };
     const cv = conv.get(click.clickId);
-    g.clicks += 1; g.cost += Number(click.cost) || 0;
-    if (cv && conversionCounts(cv)) { g.conversions += 1; g.revenue += saleRevenue(cv); }
+    g.clicks += 1; g.cost += (Number(click.cost) || 0) * rates.factor(rates.defaultCurrency, currency);
+    if (cv && conversionCounts(cv)) { g.conversions += 1; g.revenue += saleRevenue(cv) * rates.factor(cv.currency, currency); }
     groups.set(key, g);
   }
   return [...groups.values()].sort((a, b) => b.clicks - a.clicks).slice(0, 500).map(metrics);
@@ -1062,6 +1087,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/stats' && req.method === 'GET') {
       return json(res, 200, await stats({
+        currency: reportCurrency(url.searchParams.get('currency')),
         campaign: url.searchParams.get('campaign') || null,
         from: url.searchParams.get('from') || null,
         to: url.searchParams.get('to') || null,
@@ -1094,6 +1120,7 @@ const server = http.createServer(async (req, res) => {
       if (!offer.url.includes('{click_id}')) destination.searchParams.set('click_id', clickId);
       return sendRedirect(res, destination.toString(), campaigns.get(click.campaign)?.redirectMethod);
     }
+    if (url.pathname === '/api/rates' && req.method === 'GET') return json(res, 200, { defaultCurrency: rates.defaultCurrency, ...rates.info() });
     if (url.pathname === '/api/landings' && req.method === 'GET') return json(res, 200, { landings: Object.fromEntries(landings) });
     if (url.pathname === '/api/landings' && req.method === 'POST') {
       const body = await readJson(req);
@@ -1221,6 +1248,7 @@ const server = http.createServer(async (req, res) => {
       const tsTo = url.searchParams.get('to') || null;
       const tsCampaign = url.searchParams.get('campaign') || null;
       const granularity = url.searchParams.get('granularity') === 'hour' ? 'hour' : 'day';
+      const tsCurrency = reportCurrency(url.searchParams.get('currency'));
       if (tsFrom && !/^\d{4}-\d{2}-\d{2}$/.test(tsFrom)) return json(res, 400, { error: 'invalid_from_date' });
       if (tsTo && !/^\d{4}-\d{2}-\d{2}$/.test(tsTo)) return json(res, 400, { error: 'invalid_to_date' });
       if (db) {
@@ -1231,18 +1259,19 @@ const server = http.createServer(async (req, res) => {
           if (tsTo) { params.push(`${tsTo}T23:59:59Z`); conds.push(`c.created_at <= $${params.length}`); }
           const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
           const trunc = granularity === 'hour' ? 'hour' : 'day';
+          const fx = sqlFx(params, tsCurrency);
           const { rows } = await db.query(`
             SELECT
               DATE_TRUNC('${trunc}', c.created_at) AS bucket,
               COUNT(c.click_id)::int                AS clicks,
               ${SQL_CONVERSIONS}::int               AS conversions,
-              ${SQL_REVENUE}::float                 AS revenue
+              ${fx.revenue}::float                  AS revenue
             FROM clicks c
             LEFT JOIN conversions cv USING (click_id)
             ${where}
             GROUP BY bucket ORDER BY bucket
           `, params);
-          return json(res, 200, { granularity, series: rows.map((r) => ({ date: r.bucket.toISOString().slice(0, granularity === 'hour' ? 13 : 10), clicks: r.clicks, conversions: r.conversions, revenue: r.revenue })) });
+          return json(res, 200, { granularity, currency: tsCurrency, series: rows.map((r) => ({ date: r.bucket.toISOString().slice(0, granularity === 'hour' ? 13 : 10), clicks: r.clicks, conversions: r.conversions, revenue: r.revenue })) });
         } catch (e) { console.warn('[db] timeseries fallback:', e.message); }
       }
       // JSONL fallback
@@ -1272,12 +1301,12 @@ const server = http.createServer(async (req, res) => {
           if (!b) continue;
           buckets[b] ||= { clicks: 0, conversions: 0, revenue: 0 };
           buckets[b].conversions += 1;
-          buckets[b].revenue += saleRevenue(conv);
+          buckets[b].revenue += saleRevenue(conv) * rates.factor(conv.currency, tsCurrency);
         }
         const series = Object.entries(buckets).sort(([a], [b]) => a.localeCompare(b)).map(([date, v]) => ({ date, ...v }));
-        return json(res, 200, { granularity, series });
+        return json(res, 200, { granularity, currency: tsCurrency, series });
       } catch (e) {
-        if (e.code === 'ENOENT') return json(res, 200, { granularity, series: [] });
+        if (e.code === 'ENOENT') return json(res, 200, { granularity, currency: tsCurrency, series: [] });
         throw e;
       }
     }
@@ -1313,7 +1342,8 @@ const server = http.createServer(async (req, res) => {
       const pTo = url.searchParams.get('to') || null;
       if ((pFrom && !/^\d{4}-\d{2}-\d{2}$/.test(pFrom)) || (pTo && !/^\d{4}-\d{2}-\d{2}$/.test(pTo))) return json(res, 400, { error: 'invalid_date' });
       const pCampaign = url.searchParams.get('campaign') || null;
-      return json(res, 200, { field, rows: await paramReport({ field, campaign: pCampaign, from: pFrom, to: pTo }) });
+      const pCurrency = reportCurrency(url.searchParams.get('currency'));
+      return json(res, 200, { field, currency: pCurrency, rows: await paramReport({ field, campaign: pCampaign, from: pFrom, to: pTo, currency: pCurrency }) });
     }
     if (url.pathname === '/stats/paths' && req.method === 'GET') {
       const pathCampaign = url.searchParams.get('campaign') || null;
@@ -1343,6 +1373,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+await rates.start();
 await loadOffers();
 await loadLandings();
 await loadCampaigns();

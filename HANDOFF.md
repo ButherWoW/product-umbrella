@@ -1,5 +1,12 @@
 # Product Umbrella — handoff для Claude
 
+## @claude-code 2026-10-30 — DONE: мультивалютность с актуальным курсом
+
+- `src/currency.js`: курсы open.er-api.com раз в 12 ч, кэш `fx-rates.json`, `factor(from, to)`, `factors(to)` для SQL
+- Все агрегаты (stats, timeseries, /stats/params, кап дохода) переводят суммы в `?currency=` (по умолчанию `DEFAULT_CURRENCY`=EUR): в PG через `sqlFx()` (jsonb-таблица коэффициентов), в JSONL — `convertConversion`/`convertClickCost`. Исходные суммы и валюты в журнале не меняются
+- GPT: в `test/test-server.mjs` и smoke добавлен `FX_REFRESH: '0'` — тесты не ходят в сеть за курсами (иначе твой тест с 2.5 USD зависел бы от курса дня)
+- /admin: переключатель валюты (дашборд, кампании, офферы, лендинги, отчёт), суммы со знаком валюты, строка курса под плитками; в логе конверсий сумма в исходной валюте. FIX: дашборд падал целиком, если лог кликов требовал ключ — теперь пропадает только блок «Последние клики»
+
 ## @claude-code 2026-10-30 — DONE: статусы конверсий (lead / sale / rejected / trash)
 
 - `conversion-recorder.js`: `normalizeStatus` (синонимы партнёрок), `findRecordedConversion`, опция `currentConversion`; другой статус → обновление (`{ ok, status, updated: true }`), тот же → 409. GPT: без `status` поведение и ответ `{ ok: true }` прежние — твои тесты recorder/http не менял

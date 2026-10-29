@@ -29,8 +29,10 @@ const store = {
 };
 const nf = new Intl.NumberFormat('ru-RU');
 const num = (v) => nf.format(Number(v) || 0);
-const money = (v) => (Number(v) || 0).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-const money4 = (v) => (Number(v) || 0).toLocaleString('ru-RU', { minimumFractionDigits: 4, maximumFractionDigits: 4 });
+// Report amounts carry the selected currency sign; `amount` is for raw values that have their own currency column.
+const amount = (v) => (Number(v) || 0).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const money = (v) => { try { return (Number(v) || 0).toLocaleString('ru-RU', { style: 'currency', currency: currency.code, minimumFractionDigits: 2, maximumFractionDigits: 2 }); } catch { return amount(v) + ' ' + currency.code; } };
+const money4 = (v) => { try { return (Number(v) || 0).toLocaleString('ru-RU', { style: 'currency', currency: currency.code, minimumFractionDigits: 4, maximumFractionDigits: 4 }); } catch { return (Number(v) || 0).toFixed(4) + ' ' + currency.code; } };
 const pct = (v) => ((Number(v) || 0) * 100).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '%';
 const dt = (iso) => (iso ? iso.replace('T', ' ').slice(0, 19) : '—');
 const ratio = (a, b) => (b ? a / b : 0);
@@ -62,6 +64,7 @@ async function api(path, { method = 'GET', body } = {}) {
   const headers = { 'x-requested-with': 'umbrella' };
   if (body !== undefined) headers['content-type'] = 'application/json';
   if (state.token) headers.authorization = 'Bearer ' + state.token;
+  if (path.startsWith('/stats') && currency.code) path += (path.includes('?') ? '&' : '?') + 'currency=' + encodeURIComponent(currency.code);
   const res = await fetch(BASE + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
   const data = await res.json().catch(() => ({}));
   if (res.status === 401 && !path.startsWith('/api/auth/')) {
@@ -118,6 +121,30 @@ function periodControl(onChange) {
   };
   render();
   return wrap;
+}
+
+// ---------- currency ----------
+// Reports convert every amount into the chosen currency at the current rate (server side, /api/rates).
+const POPULAR = ['EUR', 'USD', 'RUB', 'GBP', 'UAH', 'KZT', 'PLN', 'TRY', 'BRL', 'INR'];
+const currency = { code: store.get('currency', ''), info: null };
+async function loadRates() {
+  if (currency.info) return currency.info;
+  try { currency.info = await api('/api/rates'); } catch { currency.info = { defaultCurrency: 'EUR', currencies: ['EUR'], rates: { EUR: 1 } }; }
+  if (!currency.code || !currency.info.currencies.includes(currency.code)) currency.code = currency.info.defaultCurrency;
+  return currency.info;
+}
+function currencyControl(onChange) {
+  const info = currency.info || { currencies: [currency.code || 'EUR'] };
+  const codes = [...POPULAR.filter((c) => info.currencies.includes(c)), ...info.currencies.filter((c) => !POPULAR.includes(c))];
+  return h('select', { class: 'select', 'aria-label': 'Валюта', title: 'Валюта отчётов', onchange: (e) => { currency.code = e.target.value; store.set('currency', currency.code); onChange(); } },
+    codes.map((c) => h('option', { value: c, selected: c === currency.code }, c)));
+}
+function ratesNote() {
+  const info = currency.info;
+  if (!info?.updatedAt) return h('p', { class: 'muted rates-note' }, 'Курсы валют ещё не загружены — суммы в других валютах не пересчитываются.');
+  const base = info.defaultCurrency; const rate = currency.code === base ? null : (info.rates[currency.code] / info.rates[base]);
+  return h('p', { class: 'muted rates-note' }, `Пересчёт по курсу на ${dt(info.updatedAt).slice(0, 16)} UTC`,
+    rate ? ` · 1 ${base} = ${rate.toLocaleString('ru-RU', { maximumFractionDigits: 4 })} ${currency.code}` : '', ' · суммы конверсий хранятся в исходной валюте.');
 }
 
 // ---------- modal ----------
@@ -360,12 +387,12 @@ async function pageDashboard() {
   const campSel = h('select', { class: 'select', 'aria-label': 'Кампания', onchange: () => load() }, h('option', { value: '' }, 'Все кампании'),
     Object.entries(state.campaigns).map(([id, c]) => h('option', { value: id }, c.name || id)));
   put(view, h('div', { class: 'page-head' }, h('h1', {}, 'Дашборд'),
-    h('div', { class: 'toolbar', style: 'margin:0' }, campSel, periodControl(() => load()), h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'))), body);
+    h('div', { class: 'toolbar', style: 'margin:0' }, campSel, periodControl(() => load()), currencyControl(() => load()), h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'))), body);
   async function load() {
     const { from, to } = periodRange();
     const campaign = campSel.value || null;
     try {
-      const [s, series, recent] = await Promise.all([api('/stats' + qs({ from, to, campaign })), timeseries({ campaign, from, to }), api('/api/clicks' + qs({ from, to, campaign, limit: 10 }))]);
+      const [s, series, recent] = await Promise.all([api('/stats' + qs({ from, to, campaign })), timeseries({ campaign, from, to }), api('/api/clicks' + qs({ from, to, campaign, limit: 10 })).catch(() => ({ clicks: [] }))]);
       const kpi = (label, value, color) => h('div', { class: 'kpi', style: `background:${color}` }, h('div', { class: 'k' }, label), h('div', { class: 'v' }, value));
       const small = (title, id, rows, nameOf, link) => h('div', { class: 'card' }, h('h2', {}, title), dataTable({
         id: 'dash-' + id, pageSize: 10, compact: true, rows: rows.sort((a, b) => b.clicks - a.clicks),
@@ -375,6 +402,7 @@ async function pageDashboard() {
       put(body, 
         h('div', { class: 'kpis' }, kpi('Клики', num(s.clicks), 'var(--k1)'), kpi('Конверсии', num(s.conversions), 'var(--k3)'), kpi('CR', pct(ratio(s.conversions, s.clicks)), 'var(--k2)'),
           kpi('Доход', money(s.revenue), 'var(--k5)'), kpi('EPC', money4(ratio(s.revenue, s.clicks)), 'var(--k6)'), kpi('RPM', money(ratio(s.revenue * 1000, s.clicks)), 'var(--k7)')),
+        ratesNote(),
         h('div', { class: 'card', style: 'margin-bottom:14px' }, lineChart([
           { key: 'clicks', label: 'Клики', color: '#4d86f0', values: series.map((p) => p.clicks) },
           { key: 'conversions', label: 'Конв.', color: '#e0496a', values: series.map((p) => p.conversions) },
@@ -441,7 +469,7 @@ async function pageCampaigns() {
   }
   put(view, 
     h('div', { class: 'toolbar' }, h('a', { class: 'btn primary', href: '#/campaigns/new' }, 'Создать'), bulk),
-    h('div', { class: 'toolbar' }, stateFilter, periodControl(() => load()),
+    h('div', { class: 'toolbar' }, stateFilter, periodControl(() => load()), currencyControl(() => load()),
       h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'),
       h('button', { class: 'btn square', title: 'Колонки', 'aria-label': 'Колонки', onclick: () => table.chooser() }, '⚙')),
     table);
@@ -620,7 +648,7 @@ async function pageCampaignEditor(id) {
       h('div', { class: 'field-row' },
         field('Дневной кап кликов', h('input', { class: 'input', type: 'number', min: 1, value: d.dailyCap ?? '', placeholder: 'нет', oninput: bind('dailyCap', 'int') })),
         field('Общий кап кликов', h('input', { class: 'input', type: 'number', min: 1, value: d.totalCap ?? '', placeholder: 'нет', oninput: bind('totalCap', 'int') }), 'При достижении кампания встаёт на паузу.')),
-      field('Дневной кап дохода', h('input', { class: 'input', type: 'number', min: 0, step: '0.01', value: d.revenueCap ?? '', placeholder: 'нет', oninput: bind('revenueCap', 'float') })),
+      field(`Дневной кап дохода, ${currency.info?.defaultCurrency || 'EUR'}`, h('input', { class: 'input', type: 'number', min: 0, step: '0.01', value: d.revenueCap ?? '', placeholder: 'нет', oninput: bind('revenueCap', 'float') })),
       field('URL при достижении капа', h('input', { class: 'input', type: 'url', value: d.capUrl || '', placeholder: 'https://… (иначе ответ 429)', oninput: bind('capUrl', 'url') })))],
     ['Tracking', () => isNew ? h('p', { class: 'muted' }, 'Ссылка кампании будет доступна после её сохранения.') : h('div', {},
       field('Ссылка кампании', h('div', { class: 'link-box' }, h('input', { class: 'input', readonly: true, value: trackingUrl(d.id) }), h('button', { class: 'btn', onclick: () => copyText(trackingUrl(d.id)) }, 'Копировать')), 'Добавьте ?subid=… и utm-метки, они передадутся в оффер.'),
@@ -782,7 +810,7 @@ async function pageLandings() {
   });
   put(view,
     h('div', { class: 'toolbar' }, h('button', { class: 'btn primary', onclick: () => landingModal(null, load) }, 'Создать')),
-    h('div', { class: 'toolbar' }, periodControl(() => load()),
+    h('div', { class: 'toolbar' }, periodControl(() => load()), currencyControl(() => load()),
       h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'),
       h('button', { class: 'btn square', title: 'Колонки', 'aria-label': 'Колонки', onclick: () => table.chooser() }, '⚙')),
     table);
@@ -816,7 +844,7 @@ async function pageOffers() {
   });
   put(view, 
     h('div', { class: 'toolbar' }, h('button', { class: 'btn primary', onclick: () => offerModal(null, load) }, 'Создать')),
-    h('div', { class: 'toolbar' }, periodControl(() => load()),
+    h('div', { class: 'toolbar' }, periodControl(() => load()), currencyControl(() => load()),
       h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'),
       h('button', { class: 'btn square', title: 'Колонки', 'aria-label': 'Колонки', onclick: () => table.chooser() }, '⚙')),
     table);
@@ -853,7 +881,7 @@ async function pageReports(params) {
       sel('campaign', 'Все кампании', Object.entries(state.campaigns).map(([id, c]) => [id, c.name || id])),
       sel('offer', 'Все офферы', Object.keys(state.offers).map((id) => [id, id])),
       txt('country', 'Страна'), txt('stream', 'Поток'), txt('subid', 'Sub ID'),
-      periodControl(() => load()),
+      periodControl(() => load()), currencyControl(() => load()),
       h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'),
       h('button', { class: 'btn square', title: 'Колонки', 'aria-label': 'Колонки', onclick: () => table?.chooser() }, '⚙')),
     note, holder);
@@ -919,7 +947,7 @@ function pageLog(kind, params) {
     { key: 'campaign', label: 'Кампания', cls: 'name', render: (r) => h('a', { href: '#/campaigns/' + encodeURIComponent(r.campaign) }, state.campaigns[r.campaign]?.name || r.campaign) },
     { key: 'stream', label: 'Поток' }, { key: 'offerId', label: 'Оффер' },
     { key: 'status', label: 'Статус', value: (r) => ({ lead: 'Лид', sale: 'Продажа', rejected: 'Отклонена', trash: 'Мусор' })[r.status] || r.status || 'Продажа' },
-    { key: 'revenue', label: 'Доход', num: true, render: (r) => (r.revenue == null ? '—' : money(r.revenue)), total: () => '' },
+    { key: 'revenue', label: 'Сумма', title: 'Сумма в валюте конверсии', num: true, render: (r) => (r.revenue == null ? '—' : amount(r.revenue)), total: () => '' },
     { key: 'currency', label: 'Валюта' },
   ];
   const paging = {
@@ -1057,7 +1085,7 @@ async function route() {
     if (!state.me) { state.me = await (await fetch(BASE + '/api/auth/me')).json(); drawUserBox(); }
     if ((state.me.loginRequired || state.me.setupRequired && state.me.loginRequired) && !state.me.user) return authScreen();
     document.body.classList.remove('auth-mode');
-    if (!state.loaded) { await loadRefs(); state.loaded = true; }
+    if (!state.loaded) { await loadRefs(); await loadRates(); state.loaded = true; }
     if (section === 'campaigns' && parts[1]) cleanup = await pageCampaignEditor(decodeURIComponent(parts[1]));
     else if (section === 'campaigns') cleanup = await pageCampaigns();
     else if (section === 'offers') cleanup = await pageOffers();

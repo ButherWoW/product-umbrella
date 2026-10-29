@@ -1,6 +1,6 @@
 // Optional browser check for /admin. Requires Playwright, or PLAYWRIGHT_MODULE pointing at an existing installation.
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startTestServer } from './test-server.mjs';
@@ -8,6 +8,7 @@ import { startTestServer } from './test-server.mjs';
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const TOKEN = 'admin-ui-token';
 const dataDir = await mkdtemp(join(tmpdir(), 'umbrella-admin-ui-'));
+await writeFile(join(dataDir, 'fx-rates.json'), JSON.stringify({ base: 'EUR', rates: { EUR: 1, USD: 1.25, RUB: 100 }, updatedAt: '2026-10-30T00:00:00.000Z', source: 'test' }));
 const server = await startTestServer(dataDir, { ADMIN_TOKEN: TOKEN });
 const api = (path, body, method = 'POST') => fetch(server.url + path, { method, headers: { 'content-type': 'application/json', authorization: 'Bearer ' + TOKEN }, body: JSON.stringify(body) });
 let browser;
@@ -17,6 +18,8 @@ try {
     { name: 'Spare', type: 'fallback', offers: [{ offerId: 'offer-1', weight: 1 }] },
   ] });
   for (let i = 0; i < 3; i++) await fetch(server.url + '/r/ui-flows', { redirect: 'manual' });
+  const paidClick = new URL((await fetch(server.url + '/r/demo/offer-1', { redirect: 'manual' })).headers.get('location')).searchParams.get('click_id');
+  await fetch(`${server.url}/postback?secret=conversion-test-secret&click_id=${paidClick}&revenue=25&currency=USD`);
 
   browser = await chromium.launch({ headless: true });
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
@@ -68,6 +71,17 @@ try {
   await page.locator('.editor-head .btn.primary').click();
   await page.locator('#toast', { hasText: 'Сохранено' }).waitFor();
 
+
+  // Currency switch on the dashboard: 25 USD = 20 EUR = 2000 RUB at the fixed test rates.
+  await page.goto(server.url + '/admin#/dashboard');
+  const revenueTile = page.locator('.kpi', { hasText: 'Доход' }).locator('.v');
+  await revenueTile.filter({ hasText: '€' }).waitFor();
+  assert.match(await revenueTile.innerText(), /20,00/);
+  await page.getByLabel('Валюта').selectOption('RUB');
+  await revenueTile.filter({ hasText: '₽' }).waitFor();
+  assert.match((await revenueTile.innerText()).replace(/\s/g, ''), /2000,00₽/);
+  assert.match(await page.locator('.rates-note').innerText(), /1 EUR = 100 RUB/);
+  await page.getByLabel('Валюта').selectOption('EUR');
 
   const stored = (await (await fetch(server.url + '/api/campaigns')).json()).campaigns['ui-flows'].streams;
   assert.equal(stored[0].action, 'url');

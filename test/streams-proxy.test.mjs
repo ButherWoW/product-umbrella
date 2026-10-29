@@ -243,3 +243,34 @@ test('postback statuses: lead → sale → rejected, duplicates, aliases, amount
     assert.ok(log.some((c) => c.clickId === cid && c.status === 'rejected'));
   });
 });
+
+test('multi-currency: amounts kept in their currency, reports converted at current rates', { timeout: 15000 }, async (t) => {
+  const { writeFile, mkdtemp: mk } = await import('node:fs/promises');
+  const dataDir = await mk(join(tmpdir(), 'umbrella-fx-'));
+  // Fixed rates per 1 EUR so the test does not depend on the network.
+  await writeFile(join(dataDir, 'fx-rates.json'), JSON.stringify({ base: 'EUR', rates: { EUR: 1, USD: 1.25, RUB: 100 }, updatedAt: '2026-10-30T00:00:00.000Z', source: 'test' }));
+  const server = await startTestServer(dataDir, {});
+  t.after(async () => { await server.stop(); await rm(dataDir, { recursive: true, force: true }); });
+  const click = async () => new URL((await fetch(server.url + '/r/demo/offer-1', { redirect: 'manual' })).headers.get('location')).searchParams.get('click_id');
+  const pb = (cid, q) => fetch(`${server.url}/postback?secret=conversion-test-secret&click_id=${cid}&${q}`);
+  assert.equal((await pb(await click(), 'revenue=10&currency=EUR')).status, 200);
+  assert.equal((await pb(await click(), 'revenue=25&currency=USD')).status, 200);
+  assert.equal((await pb(await click(), 'revenue=5')).status, 200, 'no currency = DEFAULT_CURRENCY (EUR)');
+
+  const eur = await (await fetch(server.url + '/stats?campaign=demo')).json();
+  assert.equal(eur.currency, 'EUR');
+  assert.equal(eur.revenue, 10 + 25 / 1.25 + 5, '10 EUR + 25 USD (=20 EUR) + 5 EUR');
+  const rub = await (await fetch(server.url + '/stats?campaign=demo&currency=rub')).json();
+  assert.equal(rub.currency, 'RUB');
+  assert.equal(rub.revenue, 3500);
+  assert.equal(rub.byCampaign.demo.revenue, 3500, 'groups are converted too');
+  const usd = await (await fetch(server.url + '/stats/timeseries?campaign=demo&currency=USD')).json();
+  assert.equal(usd.currency, 'USD');
+  assert.equal(usd.series.reduce((sum, p) => sum + p.revenue, 0), 43.75);
+  assert.equal((await (await fetch(server.url + '/stats?currency=12x')).json()).currency, 'EUR', 'bad code falls back to default');
+  const info = await (await fetch(server.url + '/api/rates')).json();
+  assert.equal(info.defaultCurrency, 'EUR');
+  assert.deepEqual(info.currencies, ['EUR', 'RUB', 'USD']);
+  const log = (await (await fetch(server.url + '/api/conversions?campaign=demo&limit=10')).json()).conversions;
+  assert.ok(log.some((c) => c.revenue === 25 && c.currency === 'USD'), 'the log keeps the original amount and currency');
+});
