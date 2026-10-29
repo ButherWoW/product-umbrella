@@ -17,6 +17,7 @@ import { createSourcePostbacks, resolveSourcePostback, parsePostbackUrl, parsePo
 import { connectionType, CONNECTION_TYPES } from './connection-type.js';
 import { createBindingStore, bindingKey, boundChoice, streamRef, parseBindMode, parseBindTtl } from './visitor-binding.js';
 import { createMonitor, MONITOR_MODES } from './monitor.js';
+import { BOT_UA_RE, DATACENTER_RE, cloakingCondition, cloakingMessage, disabledByPolicy, streamPolicyError } from './stream-policy.js';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const dataDir = process.env.DATA_DIR || join(root, 'data');
@@ -99,8 +100,7 @@ if (process.env.GEOIP_ASN_DB) {
     console.log('[geo] ASN database loaded');
   } catch (e) { console.warn('[geo] ASN database unavailable, ISP lookup disabled:', e.message); }
 }
-// Hosting / cloud networks: real visitors do not browse from these; crawlers, scanners and review bots do.
-const DATACENTER_RE = /\b(amazon|google llc|google cloud|microsoft|azure|digitalocean|ovh|hetzner|linode|akamai|vultr|oracle|alibaba|tencent|cloudflare|leaseweb|contabo|scaleway|choopa|m247|datacamp|facebook|hostinger|ionos|hosting|servers?|data ?cent(er|re)s?|colocation)\b/i;
+// Hosting / cloud networks (DATACENTER_RE) and bot User-Agents (BOT_UA_RE) live in stream-policy.js, shared with the no-cloaking check.
 function lookupAsn(ip) {
   if (!asnReader || !ip) return null;
   try {
@@ -254,6 +254,11 @@ function parseStreams(raw) {
       if (s.enabled === false) stream.enabled = false;
       // Remembers that the offer monitor (src/monitor.js) switched the stream off, so it may switch it back on.
       if (s.enabled === false && s.disabledBy === 'monitor') stream.disabledBy = 'monitor';
+      // Switched off by the no-cloaking policy (src/stream-policy.js); the reason is shown in the panel.
+      if (s.enabled === false && s.disabledBy === 'policy') {
+        stream.disabledBy = 'policy';
+        if (s.disabledReason) stream.disabledReason = String(s.disabledReason).slice(0, 500);
+      }
       if (s.countClicks === false) stream.countClicks = false;
       out.push(stream);
     } else if (OFFER_ID_RE.test(String(s.offerId || '')) && Number(s.weight) > 0) {
@@ -435,8 +440,6 @@ async function simulateClick(input, canSee) {
       destinations: destinations.map((d) => ({ ...d, url: d.url ? applyMacros(d.url, { ...vars, offer_id: d.offerId || '' }) : null })) });
   }
 }
-
-const BOT_UA_RE = /bot\b|bot\/|crawl|spider|slurp|facebookexternalhit|headless|phantomjs|selenium|puppeteer|playwright|lighthouse|pingdom|uptimerobot|scrapy|curl\/|wget\/|python-requests|python-urllib|aiohttp|go-http-client|java\/|okhttp|apache-httpclient|libwww-perl/i;
 
 function isBot(ua) {
   return !ua || BOT_UA_RE.test(ua);
@@ -922,6 +925,28 @@ async function loadCampaigns() {
       if (/^[a-z0-9_-]{2,80}$/i.test(id)) campaigns.set(id, parseCampaign(id, value));
     }
   } catch (error) { if (error.code !== 'ENOENT') console.warn('[campaigns] invalid config ignored'); }
+}
+
+// No-cloaking policy on stored campaigns: a stream with a forbidden condition is kept (so the owner sees what it was)
+// but switched off with the reason, once, with an audit entry from «system».
+async function enforceStreamPolicy() {
+  for (const [id, c] of campaigns) {
+    let changed = false;
+    const streams = (c.streams || []).map((s) => {
+      const found = s.conditions && !disabledByPolicy(s) ? cloakingCondition(s.conditions) : null;
+      if (!found) return s;
+      changed = true;
+      return { ...s, enabled: false, disabledBy: 'policy', disabledReason: cloakingMessage(s.name, found), _wasEnabled: s.enabled !== false };
+    });
+    if (!changed) continue;
+    for (const s of streams.filter((x) => '_wasEnabled' in x)) {
+      console.warn(`[policy] campaign ${id}: stream «${s.name || ''}» switched off — ${s.disabledReason}`);
+      await event('audit', { actor: 'system', action: 'disable_stream', entity: 'campaign', entityId: id,
+        changes: { stream: [null, s.name ?? null], enabled: [s._wasEnabled, false], reason: [null, s.disabledReason] } });
+    }
+    campaigns.set(id, { ...c, streams: streams.map(({ _wasEnabled, ...s }) => s) });
+    await persistCampaign(id, campaigns.get(id));
+  }
 }
 
 async function saveCampaigns() {
@@ -1447,6 +1472,7 @@ function loginBlocked(ip) {
 }
 
 async function readJson(req, maxBytes = 64 * 1024) {
+  if (req.jsonBody !== undefined) return req.jsonBody;
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
@@ -1456,80 +1482,6 @@ async function readJson(req, maxBytes = 64 * 1024) {
   }
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); }
   catch { throw Object.assign(new Error('invalid_json'), { statusCode: 400 }); }
-}
-
-function dashboard(res) {
-  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
-  res.end(`<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Product Umbrella</title><link rel="stylesheet" href="/assets/event-logs.css">
-  <style>:root{--tiffany:#0abab5;--deep:#123b40;--ink:#173b40;--line:#d6eeeb;--paper:#fff}*{box-sizing:border-box}body{font:16px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,sans-serif;max-width:1040px;margin:0 auto;padding:48px 24px;background:linear-gradient(145deg,#f1fffd,#fff 55%,#e9fbf8);color:var(--ink)}h1{font-size:36px;letter-spacing:-.04em;margin:0 0 2px;color:var(--deep)}h2{margin:34px 0 14px;color:var(--deep)}small,.muted{color:#648287}.cards{display:flex;gap:16px;flex-wrap:wrap;margin:30px 0}.card{background:rgba(255,255,255,.85);border:1px solid var(--line);box-shadow:0 12px 30px rgba(18,59,64,.08);border-radius:18px;padding:20px;min-width:180px;flex:1}.value{font-size:34px;font-weight:750;color:var(--deep)}form{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px}input,button{font:inherit;border-radius:10px;padding:11px 13px;border:1px solid #b8ded9}input{background:#fff;min-width:190px;color:var(--ink)}button{background:var(--tiffany);border-color:var(--tiffany);color:#fff;font-weight:700;cursor:pointer;box-shadow:0 5px 12px rgba(10,186,181,.25)}button:hover{background:#079b98}ul{list-style:none;margin:0;padding:0;display:grid;gap:8px}li{background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px 14px}table{width:100%;border-collapse:separate;border-spacing:0;background:rgba(255,255,255,.9);border:1px solid var(--line);border-radius:16px;overflow:hidden;box-shadow:0 10px 25px rgba(18,59,64,.06)}td,th{text-align:left;padding:14px 16px;border-bottom:1px solid var(--line)}th{color:#5c7d81;background:#f3fffd;font-size:13px;text-transform:uppercase;letter-spacing:.08em}tr:last-child td{border-bottom:0}</style>
-  <style>#stream-editor{margin-top:40px;padding:24px;background:white;border:1px solid var(--line);border-radius:18px}#stream-editor fieldset{border:1px solid var(--line);border-radius:12px;margin:18px 0;padding:18px}#stream-editor label{display:grid;gap:5px;min-width:0}#stream-editor label span{font-size:12px;color:#648287}#stream-editor input,#stream-editor select{width:100%;min-width:0;font:inherit;padding:10px;border:1px solid #b8ded9;border-radius:10px;background:white}#stream-editor .editor-row{display:flex;flex-wrap:wrap;align-items:end;gap:10px;margin:12px 0}#stream-editor .editor-row label{flex:1;min-width:140px}#stream-editor .editor-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin:12px 0}#stream-editor summary{cursor:pointer;color:var(--deep)}#stream-editor [role=status]{color:#17685f}#stream-editor a{color:#17685f;overflow-wrap:anywhere}#stream-editor button:disabled{opacity:.5;cursor:wait}</style>
-  <h1>Product Umbrella</h1><small>Локальный трекер кампаний</small><div id="app">Загрузка…</div><section id="stream-editor" aria-label="Редактор потоков"></section><section id="event-logs" aria-label="Журнал событий"></section>
-  <script>
-  function fmt(n){return n==null?'—':Number(n).toFixed(2);}
-  function esc(value){return String(value).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#39;');}
-  function tbl(rows,hdrs){return '<table><thead><tr>'+hdrs.map(h=>'<th>'+h+'</th>').join('')+'</tr></thead><tbody>'+(rows||'<tr><td colspan="'+hdrs.length+'">Нет данных</td></tr>')+'</tbody></table>';}
-  function csvDownload(data,filename){const a=document.createElement('a');a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(data);a.download=filename;a.click();}
-  function sparkline(series){const BARS='▁▂▃▄▅▆▇█';const vals=series.map(v=>v.clicks);const mx=Math.max(...vals,1);return vals.map(v=>BARS[Math.round((v/mx)*(BARS.length-1))]).join('');}
-  let lastStats={};
-  async function render(q={}){
-    const p=new URLSearchParams(q);
-    const compareUrl=q.from&&q.to?('/stats/compare?from='+encodeURIComponent(q.from)+'&to='+encodeURIComponent(q.to)):null;
-    const paramField=q.param||'sub_id_1';
-    const [s,o,c,ts,src,net,cmp,pr,bots]=await Promise.all([fetch('/stats?'+p).then(r=>r.json()),fetch('/api/offers').then(r=>r.json()),fetch('/api/campaigns').then(r=>r.json()),fetch('/stats/timeseries?from='+new Date(Date.now()-6*86400000).toISOString().slice(0,10)).then(r=>r.json()),fetch('/api/sources').then(r=>r.json()),fetch('/api/networks').then(r=>r.json()),compareUrl?fetch(compareUrl).then(r=>r.json()):Promise.resolve(null),fetch('/stats/params?field='+encodeURIComponent(paramField)+(q.from?'&from='+q.from:'')+(q.to?'&to='+q.to:'')).then(r=>r.json()),fetch('/stats/bots'+(q.from?'?from='+q.from+(q.to?'&to='+q.to:''):'')).then(r=>r.json())]);
-    lastStats=s;
-    const campRows=Object.entries(s.byCampaign).map(([name,v])=>'<tr><td><a href="?campaign='+encodeURIComponent(name)+'" style="color:#087f7b;text-decoration:none;font-weight:650">'+esc(name)+'</a></td><td>'+v.clicks+'</td><td>'+v.conversions+'</td><td>'+((v.conversions/Math.max(v.clicks,1))*100).toFixed(2)+'%</td><td>'+fmt(v.revenue)+'</td></tr>').join('');
-    const ctryRows=Object.entries(s.byCountry||{}).sort((a,b)=>b[1].clicks-a[1].clicks).slice(0,15).map(([ctry,v])=>'<tr><td>'+ctry+'</td><td>'+v.clicks+'</td><td>'+v.conversions+'</td><td>'+fmt(v.revenue)+'</td></tr>').join('');
-    const offerRows=Object.entries(s.byOffer||{}).sort((a,b)=>b[1].clicks-a[1].clicks).map(([id,v])=>'<tr><td>'+id+'</td><td>'+v.clicks+'</td><td>'+v.conversions+'</td><td>'+((v.conversions/Math.max(v.clicks,1))*100).toFixed(2)+'%</td><td>'+fmt(v.revenue)+'</td></tr>').join('');
-    const streamRows=Object.entries(s.byStream||{}).sort((a,b)=>b[1].clicks-a[1].clicks).map(([name,v])=>'<tr><td>'+esc(name)+'</td><td>'+v.clicks+'</td><td>'+v.conversions+'</td><td>'+((v.cr||0)*100).toFixed(2)+'%</td><td>'+fmt(v.revenue)+'</td><td>'+fmt(v.epc)+'</td></tr>').join('');
-    const paramRows=(pr.rows||[]).map(v=>'<tr><td>'+esc(v.value||'(не передан)')+'</td><td>'+v.clicks+'</td><td>'+v.conversions+'</td><td>'+fmt(v.revenue)+'</td></tr>').join('');
-    const offerList=Object.entries(o.offers).map(([id,v])=>'<li><input type="checkbox" data-offer-select="'+esc(id)+'"> <b>'+esc(id)+'</b> — '+esc(typeof v==='string'?v:v.url)+(v.group?' <small>['+esc(v.group)+']</small>':'')+(v.postbackUrl?' <small>[S2S]</small>':'')+(v.networkId&&net.networks?.[v.networkId]?' <small>['+esc(net.networks[v.networkId].name)+']</small>':'')+' <button data-offer-action="clone" data-offer="'+esc(id)+'">Копировать</button> <button data-offer-action="archive" data-offer="'+esc(id)+'">'+(v.archived?'Восстановить':'В архив')+'</button></li>').join('');
-    const campList=Object.entries(c.campaigns).map(([id,v])=>'<li><b>'+esc(id)+'</b> — '+esc(v.name)+(v.group?' <small>['+esc(v.group)+']</small>':'')+' <button data-campaign="'+esc(id)+'" data-active="'+(!v.active)+'">'+(v.active?'Выключить':'Включить')+'</button> <button data-campaign-action="clone" data-campaign-id="'+esc(id)+'">Копировать</button> <button data-campaign-action="archive" data-campaign-id="'+esc(id)+'">'+(v.archived?'Восстановить':'В архив')+'</button></li>').join('');
-    const campOpts='<option value="">Все кампании</option>'+Object.keys(c.campaigns).map(id=>'<option>'+id+'</option>').join('');
-    const sourceOpts='<option value="">Без источника</option>'+Object.entries(src.sources||{}).map(([id,v])=>'<option value="'+esc(id)+'">'+esc(v.name)+' ('+esc(id)+')</option>').join('');
-    const networkOpts='<option value="">Без сети</option>'+Object.entries(net.networks||{}).map(([id,v])=>'<option value="'+esc(id)+'">'+esc(v.name)+' ('+esc(id)+')</option>').join('');
-    const inp=k=>'<input id="f-'+k+'" '+(k==='from'||k==='to'?'type="date"':'placeholder="'+(k==='country'?'Страна (US)':'Оффер')+'"')+' style="font:inherit;border-radius:10px;padding:10px;border:1px solid #b8ded9;background:#fff;width:130px">';
-    const spark=ts&&ts.series&&ts.series.length?'<div style="font-family:monospace;font-size:18px;letter-spacing:2px;color:#1a7f6e;margin:-6px 0 6px;line-height:1" title="Клики за 7 дней">'+sparkline(ts.series)+'</div><div style="font-size:11px;color:#999;margin-bottom:8px">7 дней</div>':'';
-    document.querySelector('#app').innerHTML=
-      '<div class="cards"><div class="card"><div class="muted">Клики</div><div class="value">'+s.clicks+'</div>'+spark+(cmp?.deltaPct?.clicks!=null?'<small>Δ '+cmp.deltaPct.clicks+'%</small>':'')+'</div>'
-      +'<div class="card"><div class="muted">Конверсии</div><div class="value">'+s.conversions+'</div>'+(cmp?.deltaPct?.conversions!=null?'<small>Δ '+cmp.deltaPct.conversions+'%</small>':'')+'</div>'
-      +'<div class="card"><div class="muted">CR</div><div class="value">'+((s.conversions/Math.max(s.clicks,1))*100).toFixed(2)+'%</div></div>'
-      +'<div class="card"><div class="muted">Revenue</div><div class="value">'+fmt(s.revenue)+'</div>'+(cmp?.deltaPct?.revenue!=null?'<small>Δ '+cmp.deltaPct.revenue+'%</small>':'')+'</div></div>'
-      +(bots.total>0?'<div class="card" style="margin-bottom:20px"><div class="muted">Боты</div><div class="value">'+bots.total+'</div><small>Доля: '+((bots.total/Math.max(s.clicks+bots.total,1))*100).toFixed(2)+'%</small></div>':'')
-      +'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px;align-items:center">'
-      +'<select id="f-campaign" style="font:inherit;border-radius:10px;padding:10px 13px;border:1px solid #b8ded9;background:#fff">'+campOpts+'</select>'
-      +inp('from')+inp('to')+inp('country')+inp('offer')
-      +'<input id="f-stream" placeholder="Поток (или default)" aria-label="Фильтр по потоку">'
-      +'<button id="f-apply">Применить</button>'
-      +'<button id="f-csv" style="background:#1a7f6e">CSV</button></div>'
-      +'<h2>По кампаниям</h2>'+tbl(campRows,['Кампания','Клики','Конв.','CR','Revenue'])
-      +(offerRows?'<h2>По офферам</h2>'+tbl(offerRows,['Оффер','Клики','Конв.','CR','Revenue']):'')
-      +(streamRows?'<h2>По потокам</h2>'+tbl(streamRows,['Поток','Клики','Конв.','CR','Revenue','EPC']):'')
-      +'<h2>По параметру</h2><div style="margin-bottom:8px"><select id="f-param" style="font:inherit;border-radius:10px;padding:10px;border:1px solid #b8ded9;background:#fff"><option value="sub_id_1">sub_id_1</option><option value="source">source</option><option value="keyword">keyword</option><option value="creative_id">creative_id</option></select><button id="f-param-apply">Показать</button></div>'+tbl(paramRows,['Значение','Клики','Конв.','Revenue'])
-      +(ctryRows?'<h2>По странам (топ-15)</h2>'+tbl(ctryRows,['Страна','Клики','Конв.','Revenue']):'')
-      +'<h2>Добавить оффер</h2><form id="offer-form"><input name="id" placeholder="offer-id" required pattern="[A-Za-z0-9_-]{2,80}"><input name="url" type="url" placeholder="https://..." required><input name="group" placeholder="Группа (необязательно)" maxlength="60"><input name="postbackUrl" type="url" placeholder="S2S URL (необязательно)"><select name="networkId" style="font:inherit;border-radius:10px;padding:10px 13px;border:1px solid #b8ded9;background:#fff">'+networkOpts+'</select><button>Сохранить</button></form>'
-      +'<h2>Офферы</h2><button id="bulk-offer-archive" style="background:#1a7f6e">Архивировать выбранные</button><ul>'+(offerList||'<li>Пока нет офферов</li>')+'</ul>'
-      +'<h2>Кампании</h2><form id="campaign-form"><input name="id" placeholder="campaign-id" required pattern="[A-Za-z0-9_-]{2,80}"><input name="name" placeholder="Название" required><input name="group" placeholder="Группа (необязательно)" maxlength="60"><select name="sourceId" style="font:inherit;border-radius:10px;padding:10px 13px;border:1px solid #b8ded9;background:#fff">'+sourceOpts+'</select><button>Создать</button></form>'
-      +'<h2>Источники</h2><form id="source-form"><input name="id" placeholder="source-id" required pattern="[A-Za-z0-9_-]{2,80}"><input name="name" placeholder="Название источника" required><select name="costModel" style="font:inherit;border-radius:10px;padding:10px;border:1px solid #b8ded9;background:#fff"><option value="none">Без CPC</option><option value="cpc">CPC</option></select><input name="cpc" type="number" min="0" step="0.000001" placeholder="CPC"><input name="paramMap" placeholder="Параметры JSON: {&quot;sub_id_1&quot;:&quot;ad_id&quot;}"><button>Добавить источник</button></form><ul>'+(Object.entries(src.sources||{}).map(([id,v])=>'<li><b>'+esc(id)+'</b> — '+esc(v.name)+' <small>('+esc(v.costModel||'none')+')</small></li>').join('')||'<li>Источники пока не созданы</li>')+'</ul>'
-      +'<h2>Партнёрские сети</h2><form id="network-form"><input name="id" placeholder="network-id" required pattern="[A-Za-z0-9_-]{2,80}"><input name="name" placeholder="Название сети" required><input name="clickIdParam" placeholder="click id: sub1"><input name="payoutParam" placeholder="payout: payout"><button>Добавить сеть</button></form><ul>'+(Object.entries(net.networks||{}).map(([id,v])=>'<li><b>'+esc(id)+'</b> — '+esc(v.name)+' <small>click: '+esc(v.clickIdParam||'sub1')+', payout: '+esc(v.payoutParam||'payout')+'</small></li>').join('')||'<li>Сети пока не созданы</li>')+'</ul>'
-      +'<ul>'+(campList||'<li>Нет кампаний</li>')+'</ul>'
-      +'<h2>Тренды</h2><div><select id="trend-campaigns" multiple size="4" style="min-width:220px;font:inherit;border:1px solid #b8ded9;border-radius:10px;padding:8px">'+Object.keys(c.campaigns).map(id=>'<option value="'+esc(id)+'">'+esc(id)+'</option>').join('')+'</select><select id="trend-metric" style="font:inherit;border:1px solid #b8ded9;border-radius:10px;padding:10px"><option value="clicks">Клики</option><option value="conversions">Конверсии</option><option value="revenue">Доход</option></select><button id="trend-load">Показать</button></div><div id="trend-output" class="muted" style="margin-top:10px">Выберите до пяти кампаний</div>';
-    for(const key of ['campaign','from','to','country','offer','stream'])document.querySelector('#f-'+key).value=q[key]||'';
-    document.querySelector('#f-param').value=paramField;
-    document.querySelector('#f-param-apply').onclick=()=>render({...q,param:document.querySelector('#f-param').value});
-    document.querySelector('#f-apply').onclick=()=>{const f={};for(const key of ['campaign','from','to','country','offer','stream']){const value=document.querySelector('#f-'+key).value;if(value)f[key]=value;}render(f);};
-    document.querySelector('#f-csv').onclick=()=>{const rows=['campaign,clicks,conversions,cr,revenue',...Object.entries(lastStats.byCampaign||{}).map(([n,v])=>[n,v.clicks,v.conversions,((v.conversions/Math.max(v.clicks,1))*100).toFixed(2),v.revenue.toFixed(2)].join(','))].join('\\n');csvDownload(rows,'stats.csv');};
-    document.querySelector('#trend-load').onclick=async()=>{const ids=[...document.querySelector('#trend-campaigns').selectedOptions].slice(0,5).map(x=>x.value);if(!ids.length)return;const metric=document.querySelector('#trend-metric').value;const rows=await Promise.all(ids.map(async id=>({id,data:(await (await fetch('/stats/timeseries?campaign='+encodeURIComponent(id))).json()).series||[]})));const days=[...new Set(rows.flatMap(x=>x.data.map(v=>v.date)))].sort();document.querySelector('#trend-output').innerHTML=tbl(days.map(day=>'<tr><td>'+day+'</td>'+rows.map(x=>'<td>'+fmt((x.data.find(v=>v.date===day)||{})[metric]||0)+'</td>').join('')+'</tr>').join(''),['День',...rows.map(x=>x.id)]);};
-    document.querySelector('#offer-form').onsubmit=async e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.target));if(!body.postbackUrl)delete body.postbackUrl;const r=await fetch('/api/offers',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});if(!r.ok)return alert('Ошибка');render();};
-    document.querySelector('#campaign-form').onsubmit=async e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.target));const r=await fetch('/api/campaigns',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});if(!r.ok)return alert('Ошибка');render();};
-    document.querySelector('#source-form').onsubmit=async e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.target));if(body.cpc)body.cpc=Number(body.cpc);if(body.paramMap){try{body.paramMap=JSON.parse(body.paramMap);}catch{return alert('Неверный JSON paramMap');}}else delete body.paramMap;const r=await fetch('/api/sources',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});if(!r.ok)return alert('Ошибка');render();};
-    document.querySelector('#network-form').onsubmit=async e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.target));const r=await fetch('/api/networks',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});if(!r.ok)return alert('Ошибка');render();};
-    document.querySelectorAll('[data-campaign]').forEach(b=>b.onclick=async()=>{await fetch('/api/campaigns/'+b.dataset.campaign,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({active:b.dataset.active==='true'})});render();});
-    document.querySelectorAll('[data-campaign-action]').forEach(b=>b.onclick=async()=>{const id=b.dataset.campaignId;if(b.dataset.campaignAction==='clone')await fetch('/api/campaigns/'+id+'/clone',{method:'POST'});else await fetch('/api/campaigns/'+id,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({archived:b.textContent.includes('В архив')})});render();});
-    document.querySelectorAll('[data-offer-action]').forEach(b=>b.onclick=async()=>{const id=b.dataset.offer;if(b.dataset.offerAction==='clone')await fetch('/api/offers/'+id+'/clone',{method:'POST'});else await fetch('/api/offers/'+id,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({archived:b.textContent.includes('В архив')})});render();});
-    document.querySelector('#bulk-offer-archive').onclick=async()=>{const ids=[...document.querySelectorAll('[data-offer-select]:checked')].map(x=>x.dataset.offer);await Promise.all(ids.map(id=>fetch('/api/offers/'+id,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({archived:true})})));render();};
-  }
-  render();
-  </script><script type="module" src="/assets/stream-editor.js"></script><script type="module" src="/assets/event-logs.js"></script></html>`);
 }
 
 const htmlAttr = (v) => String(v).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
@@ -1568,19 +1520,29 @@ const hidesRevenue = (req) => restrictedUser(req) && req.user.hideRevenue === tr
 const isViewer = (req) => req.user?.role === 'viewer' && !bearerAuthorized(req);
 // hideRevenue removes these keys (not zeroes them: a zero profit or ROI would be a lie) at any depth of the response.
 const REVENUE_KEY = /revenue|profit|payout|earning|^(roi|epc|uepc|rpm)$/i;
-const URL_KEY = /^(url|postbackUrl)$/;
+// Names of postback parameters (a network's payoutParam) are configuration, not amounts.
+const isRevenueKey = (k) => REVENUE_KEY.test(k) && !/Param$/.test(k);
+// urls mode also drops destination URLs: offer/postback URLs and the landing URL in /api/simulate.
+const URL_KEY = /^(url|postbackUrl|landing)$/;
 function stripRevenue(value, urls) {
   if (Array.isArray(value)) return value.map((v) => stripRevenue(v, urls));
   if (!value || typeof value !== 'object') return value;
-  return Object.fromEntries(Object.entries(value).filter(([k]) => !REVENUE_KEY.test(k) && !(urls && URL_KEY.test(k))).map(([k, v]) => [k, stripRevenue(v, urls)]));
+  return Object.fromEntries(Object.entries(value).filter(([k]) => !isRevenueKey(k) && !(urls && URL_KEY.test(k))).map(([k, v]) => [k, stripRevenue(v, urls)]));
 }
-// Paths whose responses are filtered for a hideRevenue user; urls: also drop offer/postback URLs.
+// Every /api/* and /stats* JSON response is filtered for a hideRevenue user (so a new endpoint cannot leak revenue,
+// revenueCap or the team's revenue/profit goals by default). Not filtered: the account/user/key routes, whose
+// payload carries the permission flags themselves (hideRevenue would match REVENUE_KEY).
+const REVENUE_FILTER_EXEMPT = (path) => path.startsWith('/api/auth/') || path === '/api/users' || path.startsWith('/api/users/')
+  || path === '/api/keys' || path.startsWith('/api/keys/') || path === '/api/security';
+// urls: also drop offer/postback/landing URLs (postback journals: the URLs carry revenue/payout values).
 function revenueFilterFor(path) {
-  if (path === '/stats' || path.startsWith('/stats/') || path === '/api/conversions') return { urls: false };
-  // Postback journals: revenue fields and the URLs (they carry revenue/payout values) are dropped.
   if (path === '/api/offers' || path.startsWith('/api/offers/') || path === '/api/audit' || path === '/api/simulate' || path === '/api/monitor' || path === '/api/postbacks') return { urls: true };
+  if ((path.startsWith('/api/') && !REVENUE_FILTER_EXEMPT(path)) || path === '/stats' || path.startsWith('/stats/')) return { urls: false };
   return null;
 }
+// Top-level body fields a hideRevenue user may not write: payout, payoutType, payoutCurrency, revenueCap,
+// dailyRevenueGoal, dailyProfitGoal… (every key the filter hides from them, even null to clear a value).
+const revenueWriteFields = (body) => (body && typeof body === 'object' && !Array.isArray(body) ? Object.keys(body).filter(isRevenueKey) : []);
 // offersAccess 'own': ids of offers used in the streams of campaigns the user can see; null = no restriction.
 function visibleOfferIds(req) {
   if (!restrictedUser(req) || req.user.offersAccess !== 'own') return null;
@@ -1762,8 +1724,14 @@ const server = http.createServer(async (req, res) => {
     // Read-only role: every write to the panel API is refused; signing in and out stays possible.
     if (isViewer(req) && !['GET', 'HEAD'].includes(req.method) && isPrivatePath(url.pathname)) return json(res, 403, { error: 'read_only' });
     if (hidesRevenue(req)) {
-      if (url.pathname === '/dashboard') { res.writeHead(302, { location: `${basePath}/admin` }); return res.end(); }
       res.revenueFilter = revenueFilterFor(url.pathname);
+      // Revenue settings cannot be written by someone who cannot see them. The body is read here once and
+      // handed to the route through readJson (req.jsonBody).
+      if (res.revenueFilter && ['POST', 'PATCH', 'PUT'].includes(req.method)) {
+        req.jsonBody = await readJson(req);
+        const fields = revenueWriteFields(req.jsonBody);
+        if (fields.length) return json(res, 403, { error: 'revenue_hidden', fields });
+      }
     }
     if (url.pathname === '/stats' || url.pathname.startsWith('/stats/') || url.pathname === '/api/clicks' || url.pathname === '/api/conversions' || url.pathname === '/api/bots'
       || url.pathname === '/api/postbacks') {
@@ -1773,17 +1741,6 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname.startsWith('/api/auth/') || url.pathname === '/api/users' || url.pathname.startsWith('/api/users/')
       || url.pathname === '/api/keys' || url.pathname.startsWith('/api/keys/') || url.pathname === '/api/security') {
       return await handleAuthRoute(req, res, url);
-    }
-    const logAsset = new Map([['/assets/event-logs.js', ['event-logs.js', 'text/javascript']],
-      ['/assets/event-logs.css', ['event-logs.css', 'text/css']]]).get(url.pathname);
-    if (logAsset && req.method === 'GET') {
-      const asset = await readFile(join(root, 'public', logAsset[0]));
-      res.writeHead(200, { 'content-type': `${logAsset[1]}; charset=utf-8`, 'cache-control': 'no-store' });
-      return res.end(asset);
-    }
-    if (url.pathname === '/assets/stream-editor.js' && req.method === 'GET') {
-      res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store' });
-      return res.end(await readFile(join(root, 'public', 'stream-editor.js')));
     }
     // Shared click handler for both stream and explicit-offer routes.
     async function handleClick(campaignId, offerId, targetTemplate, streamName = null, countClick = true, extra = {}) {
@@ -2335,6 +2292,8 @@ const server = http.createServer(async (req, res) => {
       if (OFFER_ID_RE.test(String(body.sourceId ?? '')) && !sources.has(String(body.sourceId))) return json(res, 400, { error: 'source_not_found' });
       if (body.sourcePostbackUrl && !parsePostbackUrl(body.sourcePostbackUrl, { allowHttp: sourcePostbackAllowPrivate })) return json(res, 400, { error: 'invalid_postback_url' });
       if (campaigns.has(String(body.id)) && !canEditCampaign(req, campaigns.get(String(body.id)))) return json(res, 403, { error: 'campaign_not_yours' });
+      const cloaking = streamPolicyError(parseStreams(body.streams));
+      if (cloaking) return json(res, 400, cloaking);
       // A buyer's new campaign is always theirs; the owner may assign it to someone.
       const ownerId = isBuyer(req) ? req.user.id : (body.ownerId ?? req.user?.id ?? null);
       const sourceDefaults = body.sourceId ? sources.get(String(body.sourceId)) : null;
@@ -2358,6 +2317,8 @@ const server = http.createServer(async (req, res) => {
       if (!campaigns.has(id)) return json(res, 404, { error: 'campaign_not_found' });
       if (!canEditCampaign(req, campaigns.get(id))) return json(res, 403, { error: 'campaign_not_yours' });
       const body = await readJson(req);
+      const cloaking = body.streams === undefined ? null : streamPolicyError(parseStreams(body.streams));
+      if (cloaking) return json(res, 400, cloaking);
       if (OFFER_ID_RE.test(String(body.sourceId ?? '')) && !sources.has(String(body.sourceId))) return json(res, 400, { error: 'source_not_found' });
       if (body.sourcePostbackUrl && !parsePostbackUrl(body.sourcePostbackUrl, { allowHttp: sourcePostbackAllowPrivate })) return json(res, 400, { error: 'invalid_postback_url' });
       const cur = campaigns.get(id);
@@ -2431,13 +2392,21 @@ const server = http.createServer(async (req, res) => {
       if (!Array.isArray(body.streams)) return json(res, 400, { error: 'streams_array_required' });
       const streams = parseStreams(body.streams);
       if (body.streams.length > 0 && streams.length === 0) return json(res, 400, { error: 'invalid_streams_all_rejected' });
+      const cloaking = streamPolicyError(streams);
+      if (cloaking) return json(res, 400, cloaking);
       const current = campaigns.get(id);
       campaigns.set(id, { ...current, streams });
       await persistCampaign(id, campaigns.get(id));
       await audit(req, 'update', 'campaign', id, current, campaigns.get(id));
       return json(res, 200, { id, streams });
     }
-    if (url.pathname === '/dashboard' && req.method === 'GET') return dashboard(res);
+    // The legacy inline /dashboard page is gone (the panel is /admin); old bookmarks are redirected.
+    if (url.pathname === '/dashboard' && req.method === 'GET') { res.writeHead(302, { location: `${basePath}/admin` }); return res.end(); }
+    // The no-cloaking rule shared with the panel: one module, so the editor and the API refuse the same conditions.
+    if (url.pathname === '/admin/stream-policy.js' && req.method === 'GET') {
+      res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store' });
+      return res.end(await readFile(join(root, 'src', 'stream-policy.js')));
+    }
     const adminAsset = { '/admin': ['index.html', 'text/html'], '/admin/': ['index.html', 'text/html'], '/admin/admin.js': ['admin.js', 'text/javascript'], '/admin/admin.css': ['admin.css', 'text/css'] }[url.pathname];
     if (adminAsset && req.method === 'GET') {
       res.writeHead(200, { 'content-type': `${adminAsset[1]}; charset=utf-8`, 'cache-control': 'no-store' });
@@ -2625,6 +2594,7 @@ await loadNetworks();
 await loadOffers();
 await loadLandings();
 await loadCampaigns();
+await enforceStreamPolicy();
 // One-time copy of bot events recorded before the bots table existed (only while the table is empty).
 if (db) {
   try {
