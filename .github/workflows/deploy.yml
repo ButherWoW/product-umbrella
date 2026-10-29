@@ -89,7 +89,7 @@ jobs:
             rm /opt/umbrella/.env.base
             chown root:umbrella /opt/umbrella/.env && chmod 640 /opt/umbrella/.env
             if grep -q "^DATABASE_URL=" /opt/umbrella/.env; then
-              cd /opt/umbrella/app && npm ci --omit=dev --no-audit --no-fund --loglevel=error
+              cd /opt/umbrella/app && (umask 022; npm ci --omit=dev --no-audit --no-fund --loglevel=error)
               set -a; . /opt/umbrella/.env; set +a
               node src/migrate.js
             else
@@ -100,8 +100,11 @@ jobs:
         run: |
           ssh root@$HOST 'set -e
             cd /opt/umbrella/app
+            umask 022
             npm ci --omit=dev --no-audit --no-fund --loglevel=error
             chown -R root:root /opt/umbrella/app
+            # Root may have a strict umask on this host; the service user must be able to read the code and node_modules.
+            chmod -R a+rX /opt/umbrella/app
             install -m 644 deploy/umbrella.service /etc/systemd/system/umbrella.service
             systemctl daemon-reload
             systemctl enable --quiet umbrella
