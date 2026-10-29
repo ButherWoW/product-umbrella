@@ -62,8 +62,8 @@ export function isBlockedAddress(ip, { allowPrivate = false } = {}) {
   const family = net.isIP(ip);
   if (!family) return true;
   const type = family === 4 ? 'ipv4' : 'ipv6';
-  if (allowPrivate && loopback.check(ip, type)) return false;
   if (type === 'ipv6' && /^(0{0,4}:){0,5}:?ffff:/i.test(ip)) return true;
+  if (allowPrivate && loopback.check(ip, type)) return false;
   return blocked.check(ip, type);
 }
 
