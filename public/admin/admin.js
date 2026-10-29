@@ -1,5 +1,5 @@
 // Umbrella admin UI — layout and workflows modelled on Keitaro, backed by the existing tracker API.
-const state = { token: null, offers: {}, campaigns: {}, landings: {}, users: [] };
+const state = { token: null, offers: {}, campaigns: {}, landings: {}, networks: {}, users: [] };
 // Set by the server when the tracker runs under a path prefix (BASE_PATH, e.g. /umbrella behind nginx).
 const BASE = document.querySelector('meta[name="umbrella-base"]')?.getAttribute('content') || '';
 const view = document.getElementById('view');
@@ -82,10 +82,11 @@ const qs = (params) => {
 };
 
 async function loadRefs() {
-  const [o, c, l] = await Promise.all([api('/api/offers'), api('/api/campaigns'), api('/api/landings')]);
+  const [o, c, l, n] = await Promise.all([api('/api/offers'), api('/api/campaigns'), api('/api/landings'), api('/api/networks').catch(() => ({ networks: {} }))]);
   state.offers = o.offers || {};
   state.campaigns = c.campaigns || {};
   state.landings = l.landings || {};
+  state.networks = n.networks || {};
   state.domains = (await api('/api/domains').catch(() => ({ domains: [] }))).domains || [];
   // Owners see the team list (for assigning campaigns and per-buyer earnings); buyers get 403 and an empty list.
   state.users = isOwnerView() ? ((await api('/api/users').catch(() => ({ users: [] }))).users || []) : [];
@@ -905,7 +906,7 @@ async function pageCampaignEditor(id) {
 
 function offerModal(id, onSaved) {
   const isNew = !id;
-  const o = isNew ? { id: '', name: '', url: '', postbackUrl: '', dailyCap: '' } : { id, ...state.offers[id], name: state.offers[id].name || '', postbackUrl: state.offers[id].postbackUrl || '', dailyCap: state.offers[id].dailyCap ?? '' };
+  const o = isNew ? { id: '', name: '', url: '', postbackUrl: '', dailyCap: '', networkId: '' } : { id, ...state.offers[id], name: state.offers[id].name || '', postbackUrl: state.offers[id].postbackUrl || '', dailyCap: state.offers[id].dailyCap ?? '', networkId: state.offers[id].networkId || '' };
   const err = h('p', { class: 'err' });
   const body = tabs([
     ['Основные', () => h('div', {},
@@ -914,7 +915,9 @@ function offerModal(id, onSaved) {
       field('URL', h('input', { class: 'input', type: 'url', value: o.url, placeholder: 'https://…', oninput: (e) => { o.url = e.target.value.trim(); } }), 'Макросы: {click_id} {subid} {campaign} {offer_id} {device} {country}. Если {click_id} нет — click_id добавится параметром.'))],
     ['Настройки', () => h('div', {},
       field('Дневной кап кликов', h('input', { class: 'input', type: 'number', min: 1, value: o.dailyCap, placeholder: 'нет', oninput: (e) => { o.dailyCap = e.target.value; } }), 'Считается по всем кампаниям; в потоках капнутый оффер пропускается.'),
-      field('S2S постбэк в партнёрку', h('input', { class: 'input', type: 'url', value: o.postbackUrl, placeholder: 'https://… (необязательно)', oninput: (e) => { o.postbackUrl = e.target.value.trim(); } }), 'Вызывается при конверсии. Макросы: {click_id} {revenue} {currency}.'))],
+      field('S2S постбэк в партнёрку', h('input', { class: 'input', type: 'url', value: o.postbackUrl, placeholder: 'https://… (необязательно)', oninput: (e) => { o.postbackUrl = e.target.value.trim(); } }), 'Вызывается при конверсии. Макросы: {click_id} {revenue} {currency}.'),
+      field('Партнёрская сеть', h('select', { class: 'select', onchange: (e) => { o.networkId = e.target.value; } }, h('option', { value: '' }, 'Без сети'), ...Object.entries(state.networks).map(([nid, n]) => h('option', { value: nid, selected: o.networkId === nid }, n.name || nid)))),
+      h('button', { class: 'btn', onclick: () => { const n = state.networks[o.networkId]; if (!n?.offerParams) return; const sep = o.url.includes('?') ? '&' : '?'; const missing = n.offerParams.split('&').filter((p) => p && !o.url.includes(p.split('=')[0] + '=')); o.url += missing.length ? sep + missing.join('&') : ''; toast(missing.length ? 'Параметры сети добавлены' : 'Параметры уже есть'); } }, 'Добавить параметры сети в URL'))],
   ]);
   const close = openModal({
     title: isNew ? 'Создание оффера' : 'Редактирование оффера', body: h('div', {}, body, err),
@@ -927,7 +930,7 @@ function offerModal(id, onSaved) {
       if (Number.isNaN(cap) || (cap !== null && cap < 1)) { err.textContent = 'Дневной кап — целое число больше нуля.'; return; }
       if (isNew && state.offers[o.id]) { err.textContent = 'Оффер с таким ID уже есть.'; return; }
       try {
-        const body2 = { name: o.name.trim() || null, url: o.url, postbackUrl: o.postbackUrl || null, dailyCap: cap };
+        const body2 = { name: o.name.trim() || null, url: o.url, postbackUrl: o.postbackUrl || null, dailyCap: cap, networkId: o.networkId || null };
         await (isNew ? api('/api/offers', { method: 'POST', body: { id: o.id, ...body2 } }) : api('/api/offers/' + encodeURIComponent(o.id), { method: 'PATCH', body: body2 }));
         toast(isNew ? 'Оффер создан' : 'Сохранено'); close(); onSaved();
       } catch (e) { err.textContent = 'Не сохранено: ' + e.message; }
@@ -1009,7 +1012,8 @@ async function pageNetworks() {
       field('Параметры оффера', h('input', { class: 'input', value: n.offerParams, oninput: (e) => { n.offerParams = e.target.value; } })),
       field('Параметр click ID', h('input', { class: 'input', value: n.clickIdParam, oninput: (e) => { n.clickIdParam = e.target.value; } })),
       field('Параметр выплаты', h('input', { class: 'input', value: n.payoutParam, oninput: (e) => { n.payoutParam = e.target.value; } })),
-      field('Заметки', h('textarea', { class: 'input', rows: 4, oninput: (e) => { n.notes = e.target.value; } }, n.notes)), err),
+      field('Заметки', h('textarea', { class: 'input', rows: 4, oninput: (e) => { n.notes = e.target.value; } }, n.notes)),
+      h('p', { class: 'muted' }, 'Postback: ', h('code', {}, `${location.origin}${BASE}/postback?click_id={${n.clickIdParam}}&revenue={${n.payoutParam}}&currency=EUR&secret=POSTBACK_SECRET`), h('button', { class: 'btn', onclick: () => copyText(`${location.origin}${BASE}/postback?click_id={${n.clickIdParam}}&revenue={${n.payoutParam}}&currency=EUR&secret=POSTBACK_SECRET`) }, 'Копировать')), err),
       footer: [h('button', { class: 'btn', onclick: close }, 'Отмена'), h('button', { class: 'btn primary', onclick: async () => { try { await api(current ? '/api/networks/' + encodeURIComponent(n.id) : '/api/networks', { method: current ? 'PATCH' : 'POST', body: n }); toast('Сеть сохранена'); close(); onSaved(); } catch (e) { err.textContent = e.message; } } }, 'Сохранить')],
     });
   }
