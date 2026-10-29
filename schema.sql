@@ -42,3 +42,19 @@ CREATE TABLE IF NOT EXISTS conversions (
 
 CREATE INDEX IF NOT EXISTS clicks_campaign_created_idx ON clicks(campaign, created_at);
 CREATE INDEX IF NOT EXISTS clicks_created_idx ON clicks(created_at);
+
+CREATE TABLE IF NOT EXISTS users (
+  id uuid PRIMARY KEY,
+  email text NOT NULL UNIQUE,
+  role text NOT NULL CHECK (role IN ('owner', 'buyer')),
+  password_hash text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+  token_hash text PRIMARY KEY,
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  expires_at timestamptz NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);

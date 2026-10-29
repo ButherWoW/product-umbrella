@@ -63,6 +63,25 @@ await db.query(`
   )
 `);
 
+await db.query(`
+  CREATE TABLE IF NOT EXISTS users (
+    id            UUID        PRIMARY KEY,
+    email         TEXT        NOT NULL UNIQUE,
+    role          TEXT        NOT NULL CHECK (role IN ('owner', 'buyer')),
+    password_hash TEXT        NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+  )
+`);
+await db.query(`
+  CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT        PRIMARY KEY,
+    user_id    UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  )
+`);
+await db.query(`CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id)`);
+
 await db.query(`CREATE INDEX IF NOT EXISTS clicks_campaign_created_idx ON clicks(campaign, created_at)`);
 await db.query(`CREATE INDEX IF NOT EXISTS clicks_created_idx ON clicks(created_at)`);
 

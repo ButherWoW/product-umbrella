@@ -73,12 +73,28 @@ jobs:
             echo "TRUST_PROXY=1"
             echo "DATA_DIR=/opt/umbrella/data"
             echo "CLICK_RATE_LIMIT=120"
+            echo "REQUIRE_LOGIN=1"
             echo "ADMIN_TOKEN=$ADMIN_TOKEN"
             echo "POSTBACK_SECRET=$POSTBACK_SECRET"
           } > umbrella.env
-          rsync -az umbrella.env root@$HOST:/opt/umbrella/.env
+          rsync -az umbrella.env root@$HOST:/opt/umbrella/.env.base
           rm umbrella.env
-          ssh root@$HOST 'chown root:umbrella /opt/umbrella/.env && chmod 640 /opt/umbrella/.env'
+
+      - name: Own database (separate PostgreSQL role + database) and env file
+        run: |
+          ssh root@$HOST 'set -e
+            umask 027
+            DBLINE=$(bash /opt/umbrella/app/deploy/setup-db.sh)
+            { cat /opt/umbrella/.env.base; [ -n "$DBLINE" ] && echo "$DBLINE"; } > /opt/umbrella/.env
+            rm /opt/umbrella/.env.base
+            chown root:umbrella /opt/umbrella/.env && chmod 640 /opt/umbrella/.env
+            if grep -q "^DATABASE_URL=" /opt/umbrella/.env; then
+              cd /opt/umbrella/app && npm ci --omit=dev --no-audit --no-fund --loglevel=error
+              set -a; . /opt/umbrella/.env; set +a
+              node src/migrate.js
+            else
+              echo "storage: JSONL in /opt/umbrella/data"
+            fi'
 
       - name: Install deps and restart service
         run: |

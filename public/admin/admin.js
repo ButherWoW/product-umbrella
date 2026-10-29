@@ -59,12 +59,15 @@ function download(name, type, content) {
 }
 
 async function api(path, { method = 'GET', body } = {}) {
-  const headers = {};
+  const headers = { 'x-requested-with': 'umbrella' };
   if (body !== undefined) headers['content-type'] = 'application/json';
   if (state.token) headers.authorization = 'Bearer ' + state.token;
   const res = await fetch(BASE + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
   const data = await res.json().catch(() => ({}));
-  if (res.status === 401) { tokenModal('Для этого действия нужен ключ администратора (ADMIN_TOKEN).'); }
+  if (res.status === 401 && !path.startsWith('/api/auth/')) {
+    if (state.me?.loginRequired || data.error === 'login_required') { state.me = { ...state.me, user: null, loginRequired: true }; authScreen(); }
+    else tokenModal('Для этого действия нужен ключ администратора (ADMIN_TOKEN).');
+  }
   if (!res.ok) throw Object.assign(new Error(data.error || 'HTTP ' + res.status), { status: res.status, data });
   return data;
 }
@@ -856,6 +859,94 @@ function pageLog(kind, params) {
   return () => table?.detach();
 }
 
+// ---------- accounts ----------
+function authScreen() {
+  const setup = state.me?.setupRequired;
+  document.body.classList.add('auth-mode');
+  const err = h('p', { class: 'err' });
+  const email = h('input', { class: 'input', type: 'email', autocomplete: 'username', required: true });
+  const password = h('input', { class: 'input', type: 'password', autocomplete: setup ? 'new-password' : 'current-password', required: true, minlength: setup ? 10 : null });
+  const adminKey = h('input', { class: 'input', type: 'password', autocomplete: 'off' });
+  const submit = h('button', { class: 'btn primary', type: 'submit' }, setup ? 'Создать владельца' : 'Войти');
+  const form = h('form', { class: 'card auth-card', onsubmit: async (e) => {
+    e.preventDefault(); err.textContent = ''; submit.disabled = true;
+    try {
+      const headers = { 'content-type': 'application/json', 'x-requested-with': 'umbrella', ...(setup && adminKey.value ? { authorization: 'Bearer ' + adminKey.value.trim() } : {}) };
+      const res = await fetch(BASE + (setup ? '/api/auth/setup' : '/api/auth/login'), { method: 'POST', headers, body: JSON.stringify({ email: email.value, password: password.value }) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        err.textContent = ({ invalid_credentials: 'Неверный email или пароль.', too_many_attempts: 'Слишком много попыток, подождите 15 минут.', admin_token_required: 'Неверный ключ администратора.',
+          password_too_short: 'Пароль — минимум 10 символов.', invalid_email: 'Проверьте email.', already_set_up: 'Владелец уже создан — войдите.' })[data.error] || 'Ошибка: ' + (data.error || res.status);
+        return;
+      }
+      if (setup && adminKey.value) state.token = adminKey.value.trim();
+      state.me = { user: data.user, setupRequired: false, loginRequired: true };
+      document.body.classList.remove('auth-mode'); drawUserBox(); state.loaded = false; route();
+    } catch (e2) { err.textContent = 'Сеть недоступна: ' + e2.message; }
+    finally { submit.disabled = false; }
+  } },
+    h('h1', {}, setup ? 'Первый запуск' : 'Вход в Umbrella'),
+    setup ? h('p', { class: 'muted' }, 'Создайте учётную запись владельца. Это отдельная база пользователей Umbrella — аккаунты других проектов на этом домене здесь не действуют.') : null,
+    field('Email', email), field('Пароль', password, setup ? 'Минимум 10 символов.' : null),
+    setup ? field('Ключ администратора', adminKey, 'ADMIN_TOKEN сервера — подтверждает, что установку настраивает её хозяин.') : null,
+    err, submit);
+  put(view, form);
+  email.focus();
+}
+
+function drawUserBox() {
+  const box = document.getElementById('user-box');
+  const me = state.me?.user;
+  document.querySelectorAll('[data-owner-only]').forEach((el) => { el.hidden = me?.role !== 'owner'; });
+  put(box, me ? [h('span', { class: 'muted', title: me.role === 'owner' ? 'Владелец' : 'Баер' }, me.email),
+    h('button', { class: 'btn', onclick: async () => { await fetch(BASE + '/api/auth/logout', { method: 'POST', headers: { 'x-requested-with': 'umbrella' } }); state.me = { ...state.me, user: null }; drawUserBox(); state.me.loginRequired ? authScreen() : route(); } }, 'Выйти')]
+    : state.me?.setupRequired ? h('button', { class: 'btn', onclick: () => authScreen() }, 'Создать владельца') : []);
+}
+
+async function pageUsers() {
+  const roleLabel = { owner: 'Владелец', buyer: 'Баер' };
+  const table = dataTable({
+    id: 'users', totals: false,
+    columns: [
+      { key: 'email', label: 'Email', fixed: true },
+      { key: 'role', label: 'Роль', value: (r) => roleLabel[r.role] || r.role },
+      { key: 'createdAt', label: 'Создан', render: (r) => dt(r.createdAt) },
+      { key: 'menu', label: '', sortable: false, value: () => '', render: (r) => (r.id === state.me?.user?.id ? h('span', { class: 'muted' }, 'это вы') : h('span', { class: 'row-actions' },
+        h('button', { title: 'Удалить', 'aria-label': 'Удалить пользователя', onclick: async (e) => {
+          const b = e.currentTarget;
+          if (!b.dataset.armed) { b.dataset.armed = '1'; b.textContent = 'Удалить?'; setTimeout(() => { if (b.isConnected) { delete b.dataset.armed; b.textContent = '✕'; } }, 3000); return; }
+          try { await api('/api/users/' + r.id, { method: 'DELETE' }); toast('Пользователь удалён'); load(); }
+          catch (e2) { toast(({ last_owner: 'Нельзя удалить последнего владельца.' })[e2.message] || 'Не удалось: ' + e2.message, true); }
+        } }, '✕'))) },
+    ],
+  });
+  const create = () => {
+    const u = { email: '', password: '', role: 'buyer' };
+    const err = h('p', { class: 'err' });
+    const close = openModal({
+      title: 'Новый пользователь',
+      body: h('div', {},
+        field('Email', h('input', { class: 'input', type: 'email', autocomplete: 'off', oninput: (e) => { u.email = e.target.value; } })),
+        field('Пароль', h('input', { class: 'input', type: 'password', autocomplete: 'new-password', oninput: (e) => { u.password = e.target.value; } }), 'Минимум 10 символов. Передайте его пользователю лично.'),
+        field('Роль', h('div', { class: 'radios' }, Object.entries(roleLabel).map(([v, l]) => h('label', {}, h('input', { type: 'radio', name: 'urole', checked: v === 'buyer', onchange: () => { u.role = v; } }), l))),
+          'Владелец управляет пользователями. Баер работает с кампаниями, офферами и отчётами.'),
+        err),
+      footer: [h('button', { class: 'btn', onclick: () => close() }, 'Отмена'), h('button', { class: 'btn primary', onclick: async () => {
+        try { await api('/api/users', { method: 'POST', body: u }); toast('Пользователь создан'); close(); load(); }
+        catch (e) { err.textContent = ({ email_taken: 'Такой email уже есть.', password_too_short: 'Пароль — минимум 10 символов.', invalid_email: 'Проверьте email.' })[e.message] || 'Ошибка: ' + e.message; }
+      } }, 'Создать')],
+    });
+  };
+  put(view, h('div', { class: 'page-head' }, h('h1', {}, 'Пользователи'), h('button', { class: 'btn primary', onclick: create }, 'Создать')),
+    h('p', { class: 'muted' }, 'Собственная база пользователей Umbrella, не связанная с другими проектами на домене.'), table);
+  async function load() {
+    try { table.setRows((await api('/api/users')).users); }
+    catch (e) { toast('Не удалось загрузить пользователей: ' + e.message, true); }
+  }
+  load();
+  return () => table.detach();
+}
+
 // ---------- router ----------
 let cleanup = null;
 async function route() {
@@ -869,12 +960,16 @@ async function route() {
   modals.slice().forEach((close) => close());
   put(view, 'Загрузка…');
   try {
+    if (!state.me) { state.me = await (await fetch(BASE + '/api/auth/me')).json(); drawUserBox(); }
+    if ((state.me.loginRequired || state.me.setupRequired && state.me.loginRequired) && !state.me.user) return authScreen();
+    document.body.classList.remove('auth-mode');
     if (!state.loaded) { await loadRefs(); state.loaded = true; }
     if (section === 'campaigns' && parts[1]) cleanup = await pageCampaignEditor(decodeURIComponent(parts[1]));
     else if (section === 'campaigns') cleanup = await pageCampaigns();
     else if (section === 'offers') cleanup = await pageOffers();
     else if (section === 'reports') cleanup = await pageReports(params);
     else if (section === 'clicks' || section === 'conversions') cleanup = pageLog(section, params);
+    else if (section === 'users') cleanup = await pageUsers();
     else cleanup = await pageDashboard();
   } catch (e) { put(view, h('p', { class: 'err' }, 'Ошибка: ' + e.message)); }
 }

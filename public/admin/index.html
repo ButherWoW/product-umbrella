@@ -11,6 +11,7 @@
   <button class="icon-btn" id="menu-toggle" aria-label="Меню">☰</button>
   <a class="brand" href="#/dashboard">☂ Umbrella <small>tracker</small></a>
   <input class="global-search" id="global-search" type="search" placeholder="Поиск по таблице">
+  <span id="user-box" class="user-box"></span>
   <button class="icon-btn" id="token-btn" title="Ключ администратора" aria-label="Ключ администратора">🔑</button>
 </header>
 <nav class="sidebar" id="sidebar">
@@ -23,6 +24,7 @@
     <a href="#/clicks" data-nav="clicks" class="sub">Лог кликов</a>
     <a href="#/conversions" data-nav="conversions" class="sub">Лог конверсий</a>
   </div>
+  <a href="#/users" data-nav="users" data-owner-only hidden><span>◍</span>Пользователи</a>
 </nav>
 <main id="view" class="view">Загрузка…</main>
 <div id="toast" class="toast" role="status" hidden></div>

@@ -66,6 +66,43 @@ try {
   await page.screenshot({ path: join(tmpdir(), 'umbrella-admin-mobile.png'), fullPage: true });
 
   assert.deepEqual(errors, []);
+
+  // Accounts: a REQUIRE_LOGIN install starts with the setup screen; owner creates a buyer; logout returns to login.
+  const dir2 = await mkdtemp(join(tmpdir(), 'umbrella-admin-auth-'));
+  const locked = await startTestServer(dir2, { ADMIN_TOKEN: TOKEN, REQUIRE_LOGIN: '1' });
+  try {
+    const p2 = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+    p2.on('pageerror', (error) => errors.push(error.message));
+    await p2.goto(locked.url + '/admin#/campaigns');
+    await p2.getByRole('heading', { name: 'Первый запуск' }).waitFor();
+    assert.ok(await p2.locator('#sidebar').isHidden(), 'navigation hidden before login');
+    await p2.getByLabel('Email').fill('owner@example.com');
+    await p2.getByLabel('Пароль', { exact: false }).first().fill('owner-password-1');
+    await p2.getByRole('textbox', { name: 'Ключ администратора' }).fill('wrong-key');
+    await p2.getByRole('button', { name: 'Создать владельца' }).click();
+    await p2.getByText('Неверный ключ администратора.').waitFor();
+    await p2.getByRole('textbox', { name: 'Ключ администратора' }).fill(TOKEN);
+    await p2.getByRole('button', { name: 'Создать владельца' }).click();
+    await p2.locator('#user-box', { hasText: 'owner@example.com' }).waitFor();
+    await p2.locator('[data-nav=users]').click();
+    await p2.getByRole('heading', { name: 'Пользователи' }).waitFor();
+    await p2.getByRole('button', { name: 'Создать', exact: true }).click();
+    const dlg = p2.getByRole('dialog', { name: 'Новый пользователь' });
+    await dlg.locator('input[type=email]').fill('buyer@example.com');
+    await dlg.locator('input[type=password]').fill('buyer-password-1');
+    await dlg.getByRole('button', { name: 'Создать' }).click();
+    await p2.locator('table.grid tbody tr', { hasText: 'buyer@example.com' }).waitFor();
+    await p2.getByRole('button', { name: 'Выйти' }).click();
+    await p2.getByRole('heading', { name: 'Вход в Umbrella' }).waitFor();
+    await p2.getByLabel('Email').fill('buyer@example.com');
+    await p2.getByLabel('Пароль').fill('buyer-password-1');
+    await p2.getByRole('button', { name: 'Войти' }).click();
+    await p2.locator('#user-box', { hasText: 'buyer@example.com' }).waitFor();
+    assert.ok(await p2.locator('[data-nav=users]').isHidden(), 'buyers do not see the users section');
+    await p2.screenshot({ path: join(tmpdir(), 'umbrella-admin-buyer.png') });
+  } finally { await locked.stop(); await rm(dir2, { recursive: true, force: true }); }
+
+  assert.deepEqual(errors, []);
   console.log('Admin UI browser test passed');
 } finally {
   await browser?.close();

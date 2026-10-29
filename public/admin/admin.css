@@ -148,3 +148,12 @@ table.grid tr.inactive td { color: var(--fg-3); }
 .toast.error { border-left-color: var(--bad); }
 .link-box { display: flex; gap: 6px; }
 .link-box input { flex: 1; font-family: var(--mono); font-size: 12px; }
+
+.user-box { display: flex; align-items: center; gap: 8px; font-size: 13px; white-space: nowrap; min-width: 0; }
+.user-box .muted { overflow: hidden; text-overflow: ellipsis; max-width: 200px; }
+body.auth-mode .sidebar, body.auth-mode #token-btn, body.auth-mode .global-search, body.auth-mode #user-box { display: none; }
+body.auth-mode .view { margin-left: 0; display: grid; place-items: start center; padding-top: 8vh; }
+.auth-card { width: min(420px, 100%); display: grid; gap: 4px; }
+.auth-card h1 { margin-bottom: 6px; }
+@media (max-width: 520px) { .user-box .muted { display: none; } }
+[hidden] { display: none !important; }

@@ -10,7 +10,9 @@ const send = async (path, body, method = 'POST') => {
   return res.json();
 };
 
-const existing = await (await fetch(base + '/api/campaigns')).json();
+const existingRes = await fetch(base + '/api/campaigns', { headers });
+if (!existingRes.ok) throw new Error(`cannot read campaigns: ${existingRes.status}`);
+const existing = await existingRes.json();
 if (Object.keys(existing.campaigns || {}).some((id) => id.startsWith('demo-'))) {
   console.log('demo data already present, skipping');
   process.exit(0);

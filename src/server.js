@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { db, query, closeDb } from './db.js';
 import { reportFromRows, reportFromEvents, metrics } from './stats-report.js';
+import { createUserStore, readCookie, SESSION_TTL_MS } from './auth.js';
 import { readEventLog } from './event-logs.js';
 import { createConversionRecorder, hasRecordedConversion } from './conversion-recorder.js';
 import { createEventMirror } from './event-mirror.js';
@@ -17,6 +18,11 @@ const campaignsFile = join(dataDir, 'campaigns.json');
 const port = Number(process.env.PORT || 4100);
 // Public path prefix when served behind a proxy under a subpath (nginx strips it before proxying).
 const basePath = /^\/[A-Za-z0-9_-]{1,40}$/.test(process.env.BASE_PATH || '') ? process.env.BASE_PATH : '';
+// Umbrella's own accounts (see src/auth.js). REQUIRE_LOGIN=1 closes reports and APIs to anonymous visitors.
+const users = createUserStore({ db, dataDir });
+const requireLogin = /^(1|true|yes)$/i.test(process.env.REQUIRE_LOGIN || '');
+const SESSION_COOKIE = 'umb_session';
+const loginFailures = new Map();
 const postbackSecret = process.env.POSTBACK_SECRET || '';
 const adminToken = process.env.ADMIN_TOKEN || '';
 const clickRateLimit = Math.max(0, Number(process.env.CLICK_RATE_LIMIT || 120));
@@ -605,9 +611,37 @@ const recordPostback = createConversionRecorder({
   onDeliveryError: (error) => console.warn('[s2s] postback scheduling failed:', error.message),
 });
 
-function adminAuthorized(req) {
-  if (!adminToken) return true;
-  return req.headers.authorization === `Bearer ${adminToken}`;
+function bearerAuthorized(req) {
+  return Boolean(adminToken) && req.headers.authorization === `Bearer ${adminToken}`;
+}
+
+async function sessionUser(req) {
+  const token = readCookie(req, SESSION_COOKIE);
+  if (!token) return null;
+  try { return await users.userForToken(token); }
+  catch (error) { console.warn('[auth] session lookup failed:', error.message); return null; }
+}
+
+// Writes: admin Bearer token, or a logged-in user. Cookie-authenticated writes must carry
+// X-Requested-With: umbrella — a cross-site form cannot set it, which blocks CSRF.
+async function adminAuthorized(req) {
+  if (bearerAuthorized(req)) return true;
+  if (req.user) return req.method === 'GET' || req.headers['x-requested-with'] === 'umbrella';
+  return !adminToken && !requireLogin && (await users.count()) === 0;
+}
+
+function sessionCookie(req, token, maxAgeSeconds) {
+  const secure = process.env.COOKIE_SECURE === '1' || (trustProxyHops > 0 && req.headers['x-forwarded-proto'] === 'https');
+  return `${SESSION_COOKIE}=${token}; Path=${basePath || '/'}; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}${secure ? '; Secure' : ''}`;
+}
+
+const isPrivatePath = (p) => (p.startsWith('/api/') && !p.startsWith('/api/auth/')) || p === '/stats' || p.startsWith('/stats/') || p === '/dashboard' || p.startsWith('/assets/');
+
+function loginBlocked(ip) {
+  const now = Date.now();
+  const recent = (loginFailures.get(ip) || []).filter((t) => now - t < 15 * 60 * 1000);
+  loginFailures.set(ip, recent);
+  return recent.length >= 10;
 }
 
 async function readJson(req, maxBytes = 64 * 1024) {
@@ -678,9 +712,75 @@ function dashboard(res) {
   </script><script type="module" src="/assets/stream-editor.js"></script><script type="module" src="/assets/event-logs.js"></script></html>`);
 }
 
+async function handleAuthRoute(req, res, url) {
+  const path = url.pathname;
+  const csrfOk = req.headers['x-requested-with'] === 'umbrella' || bearerAuthorized(req);
+  if (path === '/api/auth/me' && req.method === 'GET') {
+    const count = await users.count();
+    return json(res, 200, { user: req.user, setupRequired: count === 0, loginRequired: requireLogin || count > 0 });
+  }
+  // Body is read before any rejection so the client is never cut off mid-upload.
+  const body = req.method === 'GET' || req.method === 'DELETE' ? {} : await readJson(req);
+  if (req.method !== 'GET' && !csrfOk) return json(res, 403, { error: 'csrf_header_required' });
+  if (path === '/api/auth/setup' && req.method === 'POST') {
+    if ((await users.count()) > 0) return json(res, 409, { error: 'already_set_up' });
+    // The first owner can only be created by whoever holds ADMIN_TOKEN, so nobody can claim a fresh public install.
+    if (adminToken && !bearerAuthorized(req)) return json(res, 401, { error: 'admin_token_required' });
+    const user = await users.create({ email: body.email, password: body.password, role: 'owner' });
+    const token = await users.createSession(user.id);
+    res.setHeader('set-cookie', sessionCookie(req, token, SESSION_TTL_MS / 1000));
+    return json(res, 201, { user });
+  }
+  if (path === '/api/auth/login' && req.method === 'POST') {
+    const ip = clientIp(req) || 'unknown';
+    if (loginBlocked(ip)) return json(res, 429, { error: 'too_many_attempts' });
+    const user = await users.authenticate(body.email, body.password);
+    if (!user) { loginFailures.get(ip).push(Date.now()); return json(res, 401, { error: 'invalid_credentials' }); }
+    loginFailures.delete(ip);
+    const token = await users.createSession(user.id);
+    res.setHeader('set-cookie', sessionCookie(req, token, SESSION_TTL_MS / 1000));
+    return json(res, 200, { user });
+  }
+  if (path === '/api/auth/logout' && req.method === 'POST') {
+    await users.deleteSession(readCookie(req, SESSION_COOKIE));
+    res.setHeader('set-cookie', sessionCookie(req, '', 0));
+    return json(res, 200, { ok: true });
+  }
+  const isOwner = req.user?.role === 'owner' || bearerAuthorized(req);
+  if (path === '/api/users' && req.method === 'GET') {
+    if (!isOwner) return json(res, 403, { error: 'owner_only' });
+    return json(res, 200, { users: await users.list() });
+  }
+  if (path === '/api/users' && req.method === 'POST') {
+    if (!isOwner) return json(res, 403, { error: 'owner_only' });
+    return json(res, 201, { user: await users.create({ email: body.email, password: body.password, role: body.role || 'buyer' }) });
+  }
+  const userDelete = path.match(/^\/api\/users\/([0-9a-f-]{36})$/);
+  if (userDelete && req.method === 'DELETE') {
+    if (!isOwner) return json(res, 403, { error: 'owner_only' });
+    const id = userDelete[1];
+    if (req.user?.id === id) return json(res, 409, { error: 'cannot_delete_self' });
+    const all = await users.list();
+    const target = all.find((u) => u.id === id);
+    if (!target) return json(res, 404, { error: 'user_not_found' });
+    if (target.role === 'owner' && all.filter((u) => u.role === 'owner').length === 1) return json(res, 409, { error: 'last_owner' });
+    await users.remove(id);
+    return json(res, 200, { ok: true });
+  }
+  return json(res, 404, { error: 'not_found' });
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    req.user = await sessionUser(req);
+    if (requireLogin && isPrivatePath(url.pathname) && !req.user && !bearerAuthorized(req)) {
+      if (url.pathname === '/dashboard') { res.writeHead(302, { location: `${basePath}/admin` }); return res.end(); }
+      return json(res, 401, { error: 'login_required' });
+    }
+    if (url.pathname.startsWith('/api/auth/') || url.pathname === '/api/users' || url.pathname.startsWith('/api/users/')) {
+      return await handleAuthRoute(req, res, url);
+    }
     const logAsset = new Map([['/assets/event-logs.js', ['event-logs.js', 'text/javascript']],
       ['/assets/event-logs.css', ['event-logs.css', 'text/css']]]).get(url.pathname);
     if (logAsset && req.method === 'GET') {
@@ -821,10 +921,10 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
         return res.end('Not Found');
       }
-      if (picked.stream.action === 'url') return handleClick(campaignId, '', picked.stream.url, picked.stream.name || null, countClick);
+      if (picked.stream.action === 'url') return await handleClick(campaignId, '', picked.stream.url, picked.stream.name || null, countClick);
       const offer = offers.get(picked.offerId);
       if (!offer) return json(res, 404, { error: 'offer_not_found' });
-      return handleClick(campaignId, picked.offerId, offer.url, picked.stream.name || null, countClick);
+      return await handleClick(campaignId, picked.offerId, offer.url, picked.stream.name || null, countClick);
     }
     // /r/:campaign/:offer — explicit offer routing (backward compat)
     const match = url.pathname.match(/^\/r\/([^/]+)\/([^/]+)$/);
@@ -832,7 +932,7 @@ const server = http.createServer(async (req, res) => {
       const [, campaignId, offerId] = match;
       const offer = offers.get(offerId);
       if (!offer) return json(res, 404, { error: 'offer_not_found' });
-      return handleClick(campaignId, offerId, offer.url);
+      return await handleClick(campaignId, offerId, offer.url);
     }
     if (url.pathname === '/postback' && req.method === 'GET') {
       if (postbackSecret && url.searchParams.get('secret') !== postbackSecret) return json(res, 401, { error: 'invalid_postback_secret' });
@@ -858,12 +958,12 @@ const server = http.createServer(async (req, res) => {
       }));
     }
     if (url.pathname === '/api/clicks' && req.method === 'GET') {
-      if (!adminAuthorized(req)) return json(res, 401, { error: 'admin_authorization_required' });
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       return json(res, 200, await readEventLog({ kind: 'clicks', params: url.searchParams, eventsFile, db,
         onFallback: (error) => console.warn('[db] click log fallback:', error.message) }));
     }
     if (url.pathname === '/api/conversions' && req.method === 'GET') {
-      if (!adminAuthorized(req)) return json(res, 401, { error: 'admin_authorization_required' });
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       return json(res, 200, await readEventLog({ kind: 'conversions', params: url.searchParams, eventsFile, db,
         onFallback: (error) => console.warn('[db] conversion log fallback:', error.message) }));
     }
@@ -871,7 +971,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { offers: Object.fromEntries(offers) });
     }
     if (url.pathname === '/api/offers' && req.method === 'POST') {
-      if (!adminAuthorized(req)) return json(res, 401, { error: 'admin_authorization_required' });
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const body = await readJson(req);
       if (!/^[a-z0-9_-]{2,80}$/i.test(String(body.id || '')) || !/^https:\/\//i.test(String(body.url || ''))) return json(res, 400, { error: 'id_and_https_url_required' });
       const offer = parseOffer({ url: String(body.url), postbackUrl: body.postbackUrl, dailyCap: body.dailyCap });
@@ -883,7 +983,7 @@ const server = http.createServer(async (req, res) => {
     const offerUpdate = url.pathname.match(/^\/api\/offers\/([A-Za-z0-9_-]{2,80})$/);
     if (offerUpdate && req.method === 'PATCH') {
       const id = offerUpdate[1];
-      if (!adminAuthorized(req)) return json(res, 401, { error: 'admin_authorization_required' });
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       if (!offers.has(id)) return json(res, 404, { error: 'offer_not_found' });
       const body = await readJson(req);
       const cur = offers.get(id);
@@ -898,7 +998,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/api/campaigns' && req.method === 'GET') return json(res, 200, { campaigns: Object.fromEntries(campaigns) });
     if (url.pathname === '/api/campaigns' && req.method === 'POST') {
-      if (!adminAuthorized(req)) return json(res, 401, { error: 'admin_authorization_required' });
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const body = await readJson(req);
       if (!/^[a-z0-9_-]{2,80}$/i.test(String(body.id || ''))) return json(res, 400, { error: 'valid_id_required' });
       campaigns.set(String(body.id), parseCampaign(String(body.id), body));
@@ -907,7 +1007,7 @@ const server = http.createServer(async (req, res) => {
     }
     const campaignUpdate = url.pathname.match(/^\/api\/campaigns\/([A-Za-z0-9_-]{2,80})$/);
     if (campaignUpdate && req.method === 'PATCH') {
-      if (!adminAuthorized(req)) return json(res, 401, { error: 'admin_authorization_required' });
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const id = campaignUpdate[1];
       if (!campaigns.has(id)) return json(res, 404, { error: 'campaign_not_found' });
       const body = await readJson(req);
@@ -941,7 +1041,7 @@ const server = http.createServer(async (req, res) => {
     // Dedicated streams endpoint: PUT /api/campaigns/:id/streams
     const streamsUpdate = url.pathname.match(/^\/api\/campaigns\/([A-Za-z0-9_-]{2,80})\/streams$/);
     if (streamsUpdate && req.method === 'PUT') {
-      if (!adminAuthorized(req)) return json(res, 401, { error: 'admin_authorization_required' });
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const id = streamsUpdate[1];
       if (!campaigns.has(id)) return json(res, 404, { error: 'campaign_not_found' });
       const body = await readJson(req);

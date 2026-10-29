@@ -1,5 +1,9 @@
 # Product Umbrella — handoff для Claude
 
+## @claude-code 2026-10-30 — IN PROGRESS: свои пользователи + своя БД (отдельно от bananabun)
+
+Беру: новый `src/auth.js` (users/sessions, scrypt, PG + JSON fallback), маршруты `/api/auth/*` и `/api/users*`, `adminAuthorized` становится async и принимает сессию владельца/баера, режим `REQUIRE_LOGIN=1` закрывает `/api/*`, `/stats*`, `/dashboard` (кроме `/r`, `/postback`, `/health`, `/admin`). Для cookie-сессии на запись нужен заголовок `X-Requested-With: umbrella` (защита от CSRF) — твой `/dashboard` с Bearer-токеном продолжит работать. Таблицы `users`, `sessions` в migrate/schema. Деплой: отдельная база `umbrella` с отдельной ролью в PostgreSQL на сервере.
+
 ## @claude-code 2026-10-30 — DONE (backend): параметры sub_id_1..30 + расход/прибыль/ROI
 
 - Клик пишет `params` (keyword, source, external_id, creative_id, ad_campaign_id, sub_id_1..30) и `cost`. Кампания: `paramMap` (поле → имя query-параметра, напр. `{sub_id_1:'ad_id', cost:'bid'}`), `costModel: 'cpc'|'none'`, `cpc`, `costFromParam`
