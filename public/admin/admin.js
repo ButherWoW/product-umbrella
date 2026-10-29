@@ -1519,6 +1519,7 @@ function drawUserBox() {
   const box = document.getElementById('user-box');
   const me = state.me?.user;
   document.querySelectorAll('[data-owner-only]').forEach((el) => { el.hidden = me?.role !== 'owner'; });
+  document.querySelectorAll('[data-user-only]').forEach((el) => { el.hidden = !me; });
   put(box, me ? [h('span', { class: 'muted', title: me.role === 'owner' ? 'Владелец' : 'Баер' }, me.email),
     h('button', { class: 'btn', onclick: async () => { await fetch(BASE + '/api/auth/logout', { method: 'POST', headers: { 'x-requested-with': 'umbrella' } }); state.me = { ...state.me, user: null }; drawUserBox(); state.me.loginRequired ? authScreen() : route(); } }, 'Выйти')]
     : state.me?.setupRequired ? h('button', { class: 'btn', onclick: () => authScreen() }, 'Создать владельца') : []);
@@ -1558,11 +1559,90 @@ async function pageUsers() {
       } }, 'Создать')],
     });
   };
+  const ipBox = h('div', { class: 'card ip-allowlist' }, h('h2', {}, 'Доступ к панели по IP'), h('p', { class: 'muted' }, 'Загрузка…'));
   put(view, h('div', { class: 'page-head' }, h('h1', {}, 'Пользователи'), h('button', { class: 'btn primary', onclick: create }, 'Создать')),
-    h('p', { class: 'muted' }, 'Собственная база пользователей Umbrella, не связанная с другими проектами на домене.'), table);
+    h('p', { class: 'muted' }, 'Собственная база пользователей Umbrella, не связанная с другими проектами на домене.'), table, ipBox);
   async function load() {
     try { table.setRows((await api('/api/users')).users); }
     catch (e) { toast('Не удалось загрузить пользователей: ' + e.message, true); }
+  }
+  // Read-only on purpose: the allowlist lives in ADMIN_ALLOWED_IPS, so nobody can lock the team out from here.
+  async function loadSecurity() {
+    try {
+      const s = await api('/api/security');
+      const rules = s.adminAllowedIps || [];
+      put(ipBox, h('h2', {}, 'Доступ к панели по IP'),
+        rules.length
+          ? [h('p', {}, 'Панель, /api и /stats открываются только с адресов: ', h('code', {}, rules.join(', '))),
+            h('p', { class: 'muted' }, 'Ваш IP: ', h('code', {}, s.clientIp || '—'), '. Клики, лендинги, postback и /health не ограничены.')]
+          : h('p', {}, 'Ограничения нет — панель и API доступны с любого IP (после входа).'),
+        h('p', { class: 'muted' }, 'Меняется только переменной окружения ADMIN_ALLOWED_IPS на сервере (IP или IPv4 CIDR через запятую), из панели — нельзя.'));
+    } catch (e) { put(ipBox, h('h2', {}, 'Доступ к панели по IP'), h('p', { class: 'err' }, 'Не удалось загрузить: ' + e.message)); }
+  }
+  load();
+  loadSecurity();
+  return () => table.detach();
+}
+
+// ---------- API keys ----------
+async function pageKeys() {
+  if (!state.me?.user) { location.hash = '#/dashboard'; return; }
+  const owner = isOwnerView();
+  let showAll = owner && store.get('keys:all', false);
+  const table = dataTable({
+    id: 'api-keys', totals: false, empty: 'Ключей пока нет',
+    columns: [
+      { key: 'name', label: 'Название', fixed: true, cls: 'name' },
+      owner ? { key: 'email', label: 'Пользователь', value: (r) => r.email || userEmail(r.userId) } : null,
+      { key: 'last4', label: 'Ключ', value: (r) => 'umb_…' + r.last4 },
+      { key: 'createdAt', label: 'Создан', render: (r) => dt(r.createdAt) },
+      { key: 'lastUsedAt', label: 'Последнее использование', render: (r) => (r.lastUsedAt ? dt(r.lastUsedAt) : h('span', { class: 'muted' }, 'ещё не использовался')) },
+      { key: 'menu', label: '', sortable: false, value: () => '', render: (r) => h('span', { class: 'row-actions' },
+        h('button', { title: 'Удалить', 'aria-label': 'Удалить ключ ' + r.name, onclick: async (e) => {
+          const b = e.currentTarget;
+          if (!b.dataset.armed) { b.dataset.armed = '1'; b.textContent = 'Удалить?'; setTimeout(() => { if (b.isConnected) { delete b.dataset.armed; b.textContent = '✕'; } }, 3000); return; }
+          try { await api('/api/keys/' + r.id, { method: 'DELETE' }); toast('Ключ удалён'); load(); }
+          catch (e2) { toast('Не удалось: ' + e2.message, true); }
+        } }, '✕')) },
+    ].filter(Boolean),
+  });
+  const showSecret = (secret) => {
+    const close = openModal({
+      title: 'Ключ создан',
+      body: h('div', {},
+        h('p', {}, 'Скопируйте ключ сейчас — он показывается один раз. Umbrella хранит только его хеш, восстановить ключ нельзя: потерянный — удалите и создайте новый.'),
+        field('API-ключ', h('div', { class: 'link-box' }, h('input', { class: 'input', readonly: true, value: secret, 'aria-label': 'API-ключ', onfocus: (e) => e.target.select() }),
+          h('button', { class: 'btn', onclick: async () => {
+            try { await navigator.clipboard.writeText(secret); toast('Ключ скопирован'); }
+            catch { toast('Не удалось скопировать — выделите ключ и скопируйте вручную', true); }
+          } }, 'Копировать')),
+        'Заголовок запроса: Authorization: Bearer <ключ>. Права и кампании — как у вашего аккаунта.')),
+      footer: [h('button', { class: 'btn primary', onclick: () => close() }, 'Готово')],
+    });
+  };
+  const create = () => {
+    let name = '';
+    const err = h('p', { class: 'err' });
+    const submit = async () => {
+      try { const { secret } = await api('/api/keys', { method: 'POST', body: { name } }); close(); showSecret(secret); load(); }
+      catch (e) { err.textContent = ({ invalid_key_name: 'Укажите название до 60 символов.' })[e.message] || 'Ошибка: ' + e.message; }
+    };
+    const close = openModal({
+      title: 'Новый API-ключ',
+      body: h('div', {},
+        field('Название', h('input', { class: 'input', maxlength: 60, autocomplete: 'off', placeholder: 'Например: скрипт отчётов', oninput: (e) => { name = e.target.value; }, onkeydown: (e) => { if (e.key === 'Enter') submit(); } }),
+          'Чтобы потом понять, какой ключ где используется.'),
+        err),
+      footer: [h('button', { class: 'btn', onclick: () => close() }, 'Отмена'), h('button', { class: 'btn primary', onclick: submit }, 'Создать')],
+    });
+  };
+  const allToggle = owner ? h('label', {}, h('input', { type: 'checkbox', checked: showAll, onchange: (e) => { showAll = e.target.checked; store.set('keys:all', showAll); load(); } }), ' Ключи всей команды') : null;
+  put(view, h('div', { class: 'page-head' }, h('h1', {}, 'API-ключи'), h('button', { class: 'btn primary', onclick: create }, 'Создать')),
+    h('p', { class: 'muted' }, 'Личные ключи для скриптов и интеграций: Authorization: Bearer umb_… Ключ действует от вашего имени, с вашей ролью и вашими кампаниями.'),
+    allToggle ? h('div', { class: 'toolbar' }, allToggle) : null, table);
+  async function load() {
+    try { table.setRows((await api('/api/keys' + (showAll ? '?all=1' : ''))).keys); }
+    catch (e) { toast('Не удалось загрузить ключи: ' + e.message, true); }
   }
   load();
   return () => table.detach();
@@ -1729,6 +1809,7 @@ async function route() {
     else if (section === 'botlog') cleanup = pageBotLog(params);
     else if (section === 'sources') cleanup = await pageSources();
     else if (section === 'users') cleanup = await pageUsers();
+    else if (section === 'keys') cleanup = await pageKeys();
     else if (section === 'buyers') cleanup = await pageBuyersReport();
     else cleanup = await pageDashboard();
   } catch (e) { put(view, h('p', { class: 'err' }, 'Ошибка: ' + e.message)); }

@@ -13,7 +13,7 @@
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Authorization: Bearer <ADMIN_TOKEN>"
+        "description": "Authorization: Bearer <ADMIN_TOKEN>, or a personal API key Bearer umb_… that acts as its user (same role and campaign scope)."
       },
       "cookieAuth": {
         "type": "apiKey",
@@ -23,6 +23,18 @@
       }
     },
     "schemas": {
+      "ApiKey": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "name": { "type": "string" },
+          "last4": { "type": "string", "description": "Last 4 characters of the secret" },
+          "userId": { "type": "string", "format": "uuid" },
+          "email": { "type": "string", "description": "Key owner's email (in lists)" },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "lastUsedAt": { "type": ["string", "null"], "format": "date-time", "description": "Updated at most once a minute" }
+        }
+      },
       "Error": {
         "type": "object",
         "required": ["error"],
@@ -1440,6 +1452,98 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/api/keys": {
+      "get": {
+        "summary": "List API keys",
+        "description": "Own keys. The owner (or ADMIN_TOKEN) lists every key with ?all=1. The secret is never returned.",
+        "operationId": "listApiKeys",
+        "tags": ["users"],
+        "security": [{ "bearerAuth": [] }, { "cookieAuth": [] }],
+        "parameters": [
+          { "name": "all", "in": "query", "schema": { "type": "string", "enum": ["1"] } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Keys",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "keys": { "type": "array", "items": { "$ref": "#/components/schemas/ApiKey" } } } } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": {
+            "description": "Owner only (?all=1)",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" }, "example": { "error": "owner_only" } } }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create an API key",
+        "description": "Logged-in user only (not ADMIN_TOKEN, not another API key). The secret umb_… is returned once; only its SHA-256 and last 4 characters are stored.",
+        "operationId": "createApiKey",
+        "tags": ["users"],
+        "security": [{ "cookieAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "required": ["name"], "properties": { "name": { "type": "string", "maxLength": 60 } } } } }
+        },
+        "responses": {
+          "201": {
+            "description": "Key created",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "key": { "$ref": "#/components/schemas/ApiKey" }, "secret": { "type": "string", "pattern": "^umb_" } } } } }
+          },
+          "400": {
+            "description": "Invalid name",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" }, "example": { "error": "invalid_key_name" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": {
+            "description": "API keys cannot create keys",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" }, "example": { "error": "session_required" } } }
+          }
+        }
+      }
+    },
+    "/api/keys/{id}": {
+      "delete": {
+        "summary": "Delete an API key",
+        "description": "Own key; the owner may delete any.",
+        "operationId": "deleteApiKey",
+        "tags": ["users"],
+        "security": [{ "bearerAuth": [] }, { "cookieAuth": [] }],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Key deleted",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "ok": { "type": "boolean" } } } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": {
+            "description": "Not found or not yours",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" }, "example": { "error": "key_not_found" } } }
+          }
+        }
+      }
+    },
+    "/api/security": {
+      "get": {
+        "summary": "Admin IP allowlist (read-only)",
+        "description": "Owner only. Rules from ADMIN_ALLOWED_IPS and the caller's IP as the server sees it. Not editable over the API.",
+        "operationId": "getSecurity",
+        "tags": ["users"],
+        "security": [{ "bearerAuth": [] }, { "cookieAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Current state",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "adminAllowedIps": { "type": "array", "items": { "type": "string" } }, "clientIp": { "type": ["string", "null"] }, "trustProxy": { "type": "integer" } } } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": {
+            "description": "Owner only",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" }, "example": { "error": "owner_only" } } }
           }
         }
       }
