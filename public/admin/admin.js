@@ -619,7 +619,7 @@ async function pageCampaigns() {
       await loadRefs();
       const [s, bots] = await Promise.all([api('/stats' + qs(periodRange())), api('/stats/bots' + qs(periodRange())).catch(() => ({ total: 0, byCampaign: {} }))]);
       let rows = Object.entries(state.campaigns).map(([id, c]) => ({ id, ...c, name: c.name || id, streams: (c.streams || []).length,
-        clicks: s.byCampaign[id]?.clicks || 0, uniqueClicks: s.byCampaign[id]?.uniqueClicks || 0, cost: s.byCampaign[id]?.cost || 0, conversions: s.byCampaign[id]?.conversions || 0, revenue: s.byCampaign[id]?.revenue || 0, bots: bots.byCampaign[id] || 0 }));
+        clicks: s.byCampaign[id]?.clicks || 0, uniqueClicks: s.byCampaign[id]?.uniqueClicks || 0, cost: s.byCampaign[id]?.cost || 0, conversions: s.byCampaign[id]?.conversions || 0, revenue: s.byCampaign[id]?.revenue || 0, leads: s.byCampaign[id]?.leads || 0, sales: s.byCampaign[id]?.sales || 0, rejected: s.byCampaign[id]?.rejected || 0, pendingRevenue: s.byCampaign[id]?.pendingRevenue || 0, bots: bots.byCampaign[id] || 0 }));
       const f = stateFilter.value;
       if (f === 'active') rows = rows.filter((r) => r.active);
       if (f === 'inactive') rows = rows.filter((r) => !r.active);
@@ -1180,7 +1180,7 @@ async function pageOffers() {
     try {
       await loadRefs();
       const s = await api('/stats' + qs(periodRange()));
-      table.setRows(Object.entries(state.offers).map(([id, o]) => ({ id, ...o, clicks: s.byOffer[id]?.clicks || 0, uniqueClicks: s.byOffer[id]?.uniqueClicks || 0, cost: s.byOffer[id]?.cost || 0, conversions: s.byOffer[id]?.conversions || 0, revenue: s.byOffer[id]?.revenue || 0 })));
+      table.setRows(Object.entries(state.offers).map(([id, o]) => ({ id, ...o, clicks: s.byOffer[id]?.clicks || 0, uniqueClicks: s.byOffer[id]?.uniqueClicks || 0, cost: s.byOffer[id]?.cost || 0, conversions: s.byOffer[id]?.conversions || 0, revenue: s.byOffer[id]?.revenue || 0, leads: s.byOffer[id]?.leads || 0, sales: s.byOffer[id]?.sales || 0, rejected: s.byOffer[id]?.rejected || 0, pendingRevenue: s.byOffer[id]?.pendingRevenue || 0 })));
     } catch (e) { toast('Ошибка загрузки офферов: ' + e.message, true); }
   }
   load();
