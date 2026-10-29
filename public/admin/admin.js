@@ -344,6 +344,9 @@ const metricCols = (opts = {}) => [
   { key: 'conversions', label: 'Конв.', title: 'Конверсии', num: true, render: (r) => num(r.conversions), total: (rs) => num(sum(rs, 'conversions')) },
   { key: 'cr', label: 'CR', title: 'CR — коэффициент конверсии', num: true, value: (r) => ratio(r.conversions, r.clicks), render: (r) => pct(ratio(r.conversions, r.clicks)), total: (rs) => pct(ratio(sum(rs, 'conversions'), sum(rs, 'clicks'))) },
   { key: 'revenue', label: 'Доход', num: true, render: (r) => money(r.revenue), total: (rs) => money(sum(rs, 'revenue')) },
+  { key: 'cost', label: 'Расход', num: true, render: (r) => money(r.cost), total: (rs) => money(sum(rs, 'cost')) },
+  { key: 'profit', label: 'Прибыль', num: true, value: (r) => (r.revenue || 0) - (r.cost || 0), render: (r) => { const p = (r.revenue || 0) - (r.cost || 0); return h('span', { class: p >= 0 ? 'pos' : 'neg' }, money(p)); }, total: (rs) => { const p = sum(rs, 'revenue') - sum(rs, 'cost'); return h('span', { class: p >= 0 ? 'pos' : 'neg' }, money(p)); } },
+  { key: 'roi', label: 'ROI', num: true, value: (r) => ratio((r.revenue || 0) - (r.cost || 0), r.cost), render: (r) => pct(ratio((r.revenue || 0) - (r.cost || 0), r.cost)), total: (rs) => pct(ratio(sum(rs, 'revenue') - sum(rs, 'cost'), sum(rs, 'cost'))) },
   { key: 'epc', label: 'EPC', title: 'EPC — доход с клика', num: true, value: (r) => ratio(r.revenue, r.clicks), render: (r) => money4(ratio(r.revenue, r.clicks)), total: (rs) => money4(ratio(sum(rs, 'revenue'), sum(rs, 'clicks'))) },
   { key: 'rpm', label: 'RPM', title: 'RPM — доход на 1000 кликов', num: true, hidden: !opts.rpm, value: (r) => ratio(r.revenue * 1000, r.clicks), render: (r) => money(ratio(r.revenue * 1000, r.clicks)), total: (rs) => money(ratio(sum(rs, 'revenue') * 1000, sum(rs, 'clicks'))) },
   { key: 'leads', label: 'Лиды', title: 'Лиды — конверсии в ожидании', num: true, hidden: true, render: (r) => num(r.leads), total: (rs) => num(sum(rs, 'leads')) },
@@ -439,7 +442,7 @@ async function pageDashboard() {
       }));
       put(body, 
         h('div', { class: 'kpis' }, kpi('Клики', num(s.clicks), 'var(--k1)'), kpi('Уник. клики', num(s.uniqueClicks), 'var(--k2)'), kpi('Конверсии', num(s.conversions), 'var(--k3)'), kpi('CR', pct(ratio(s.conversions, s.clicks)), 'var(--k2)'),
-          kpi('Доход', money(s.revenue), 'var(--k5)'), kpi('Прибыль', h('span', { class: profit >= 0 ? '' : 'neg' }, money(profit)), 'var(--k4)'), earningsTile,
+          kpi('Доход', money(s.revenue), 'var(--k5)'), kpi('Расход', money(s.cost || 0), 'var(--k4)'), kpi('Прибыль', h('span', { class: profit >= 0 ? '' : 'neg' }, money(profit)), 'var(--k8)'), kpi('ROI', pct(ratio(profit, s.cost || 0)), 'var(--k9)'), earningsTile,
           kpi('EPC', money4(ratio(s.revenue, s.clicks)), 'var(--k6)'), kpi('RPM', money(ratio(s.revenue * 1000, s.clicks)), 'var(--k7)')),
         ratesNote(),
         h('div', { class: 'card', style: 'margin-bottom:14px' }, lineChart([
