@@ -10,7 +10,7 @@ import { join } from 'node:path';
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const dataDir = await mkdtemp(join(tmpdir(), 'umbrella-editor-ui-'));
 const child = spawn(process.execPath, ['src/server.js'], { env: { ...process.env, PORT: '4212',
-  DATA_DIR: dataDir, DATABASE_URL: '', GEOIP_DB: '', ADMIN_TOKEN: 'ui-test-token', CLICK_RATE_LIMIT: '0' },
+  DATA_DIR: dataDir, DATABASE_URL: '', GEOIP_DB: '', ADMIN_TOKEN: 'ui-test-token', CLICK_RATE_LIMIT: '0', MONITOR: '0' },
   stdio: ['ignore', 'pipe', 'pipe'] });
 let browser;
 let output = '';

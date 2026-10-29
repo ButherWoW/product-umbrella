@@ -14,6 +14,7 @@ import { createConversionCapCounter, resolveOffer } from './conversion-cap.js';
 import { createJournalGate, filterJournal, campaignPlan, retentionPlan, clearCampaignRows, retentionRows } from './retention.js';
 import { createSourcePostbacks, resolveSourcePostback, parsePostbackUrl, parsePostbackStatuses, journalHasSourcePostback, sendPostback, fillPostbackMacros, stripQuery, allowPrivateFromEnv, SAMPLE_MACROS } from './source-postback.js';
 import { createBindingStore, bindingKey, boundChoice, streamRef, parseBindMode, parseBindTtl } from './visitor-binding.js';
+import { createMonitor, MONITOR_MODES } from './monitor.js';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const dataDir = process.env.DATA_DIR || join(root, 'data');
@@ -123,6 +124,14 @@ const campaigns = new Map([['demo', { name: 'Demo campaign', active: true, strea
 const eventMirror = db ? createEventMirror({ query,
   onError: (type, error) => console.warn(`[db] ${type} insert:`, error.message) }) : null;
 
+// Offer / landing monitoring: MONITOR=0 turns the timer off (POST /api/monitor/check still works).
+// MONITOR_ALLOW_PRIVATE lists private IPs that may be fetched anyway — only for tests against 127.0.0.1.
+const monitorEnabled = process.env.MONITOR !== '0';
+const monitorIntervalMs = Math.max(1000, Number(process.env.MONITOR_INTERVAL_MS) || 600000);
+const monitor = createMonitor({ campaigns, offers, landings: { get: (id) => landings.get(id) },
+  persistCampaign: (id, value) => persistCampaign(id, value), event: (type, payload) => event(type, payload),
+  intervalMs: monitorIntervalMs, allowPrivate: String(process.env.MONITOR_ALLOW_PRIVATE || '').split(',').map((s) => s.trim()).filter(Boolean) });
+
 const OFFER_ID_RE = /^[a-z0-9_-]{2,80}$/i;
 const STREAM_TYPES = ['forced', 'regular', 'fallback'];
 const STREAM_ACTIONS = ['offers', 'url', 'not_found', 'campaign'];
@@ -224,6 +233,8 @@ function parseStreams(raw) {
       }
       // Defaults are omitted so existing stored streams keep their exact shape.
       if (s.enabled === false) stream.enabled = false;
+      // Remembers that the offer monitor (src/monitor.js) switched the stream off, so it may switch it back on.
+      if (s.enabled === false && s.disabledBy === 'monitor') stream.disabledBy = 'monitor';
       if (s.countClicks === false) stream.countClicks = false;
       out.push(stream);
     } else if (OFFER_ID_RE.test(String(s.offerId || '')) && Number(s.weight) > 0) {
@@ -825,6 +836,7 @@ function parseCampaign(id, value) {
     // Campaign override of the source postback; null / [] = use the source's.
     sourcePostbackUrl: parsePostbackUrl(value.sourcePostbackUrl, { allowHttp: sourcePostbackAllowPrivate }),
     sourcePostbackStatuses: parsePostbackStatuses(value.sourcePostbackStatuses, []),
+    monitoring: MONITOR_MODES.includes(value.monitoring) ? value.monitoring : 'notify',
   };
 }
 
@@ -1348,7 +1360,7 @@ function stripRevenue(value, urls) {
 // Paths whose responses are filtered for a hideRevenue user; urls: also drop offer/postback URLs.
 function revenueFilterFor(path) {
   if (path === '/stats' || path.startsWith('/stats/') || path === '/api/conversions') return { urls: false };
-  if (path === '/api/offers' || path.startsWith('/api/offers/') || path === '/api/audit' || path === '/api/simulate') return { urls: true };
+  if (path === '/api/offers' || path.startsWith('/api/offers/') || path === '/api/audit' || path === '/api/simulate' || path === '/api/monitor') return { urls: true };
   return null;
 }
 // offersAccess 'own': ids of offers used in the streams of campaigns the user can see; null = no restriction.
@@ -1902,6 +1914,16 @@ const server = http.createServer(async (req, res) => {
       const entries = await readAudit({ entity, id: entityId, limit: mine ? 2000 : limit });
       return json(res, 200, { entries: mine ? entries.filter((e) => e.actor === req.user.email || (e.entity === 'campaign' && mine.includes(e.entityId))).slice(0, limit) : entries });
     }
+    if (url.pathname === '/api/monitor' && req.method === 'GET') {
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      return json(res, 200, { enabled: monitorEnabled, intervalMs: monitorIntervalMs, targets: monitor.snapshot(scopeCampaigns(req)) });
+    }
+    if (url.pathname === '/api/monitor/check' && req.method === 'POST') {
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      if (restrictedUser(req)) return json(res, 403, { error: 'owner_only' });
+      const result = await monitor.check();
+      return json(res, 200, { ...result, targets: monitor.snapshot() });
+    }
     if (url.pathname === '/api/domains' && req.method === 'GET') return json(res, 200, { primary: primaryHost || null, domains: await trackingDomains() });
     if (url.pathname === '/api/rates' && req.method === 'GET') return json(res, 200, { defaultCurrency: rates.defaultCurrency, ...rates.info() });
     if (url.pathname === '/api/landings' && req.method === 'GET') return json(res, 200, { landings: Object.fromEntries(landings) });
@@ -2109,6 +2131,7 @@ const server = http.createServer(async (req, res) => {
         costFromParam: body.costFromParam === undefined ? cur.costFromParam : body.costFromParam,
         sourcePostbackUrl: body.sourcePostbackUrl === undefined ? cur.sourcePostbackUrl : body.sourcePostbackUrl,
         sourcePostbackStatuses: body.sourcePostbackStatuses === undefined ? cur.sourcePostbackStatuses : body.sourcePostbackStatuses,
+        monitoring: body.monitoring === undefined ? cur.monitoring : body.monitoring,
       }));
       await persistCampaign(id, campaigns.get(id));
       await audit(req, 'update', 'campaign', id, cur, campaigns.get(id));
@@ -2361,7 +2384,8 @@ if (retentionDays > 0) {
   setTimeout(() => { retentionTick(); setInterval(retentionTick, 86400000).unref(); }, firstRunMs).unref();
   console.log(`[retention] enabled: ${retentionDays} days`);
 }
+if (monitorEnabled) monitor.start();
 
-async function shutdown() { await new Promise((resolve) => server.close(resolve)); await eventMirror?.drain(); await closeDb(); process.exit(0); }
+async function shutdown() { monitor.stop(); await new Promise((resolve) => server.close(resolve)); await eventMirror?.drain(); await closeDb(); process.exit(0); }
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
