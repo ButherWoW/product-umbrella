@@ -9,12 +9,14 @@
 // Not carried over on purpose: landings (retailer look-alike pages are not imported — streams go straight to the offer),
 // filters without an Umbrella counterpart (the whole stream is skipped), the Keitaro tracking domain. All of this is printed per campaign.
 // Reject-mode filters become `conditions.not`.
+// Streams that single out bots, ad reviewers or data centers (src/stream-policy.js) are skipped: no cloaking.
 // Offers must already be in Umbrella as kt-<id> (scripts/import-keitaro-offers.mjs).
 import { pathToFileURL } from 'node:url';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { convertUrl } from './import-keitaro-offers.mjs';
+import { cloakingCondition } from '../src/stream-policy.js';
 
 const OUR_GROUPS = ['Erland'];
 const args = process.argv.slice(2);
@@ -87,6 +89,8 @@ export function mapCampaign(c, streams, umbrellaOffers) {
     }
     if (not.length) conditions.not = not;
     if (skip) continue;
+    const cloaking = cloakingCondition(conditions);
+    if (cloaking) { notes.push(`${label}: условие «${cloaking.condition}» = «${cloaking.value}» отсекает ботов/модераторов (клоакинг запрещён) — поток пропущен`); continue; }
     if (s.filter_or) conditions.mode = 'or';
     const base = { name: String(s.name || 'Flow').slice(0, 80), type, ...(type === 'regular' ? { weight: Math.max(1, Number(s.weight) || 1) } : {}), conditions };
     if (s.schema === 'redirect') {

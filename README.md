@@ -41,7 +41,7 @@ http://localhost:4100/r/demo/offer-1?utm_source=facebook&utm_campaign=test
 | Endpoint | Назначение |
 |---|---|
 | `GET /health` | состояние сервера и активное хранилище |
-| `GET /dashboard` | локальная Tiffany-панель |
+| `GET /dashboard` | старая ссылка: `302` на `/admin` (встроенная страница удалена) |
 | `GET /admin` | панель управления в стиле Keitaro |
 | `GET /r/:campaign/:offer` | регистрирует клик и делает redirect |
 | `GET /stats` | сводка кликов и конверсий |
@@ -92,6 +92,7 @@ Tracking URL принимает `utm_source`, `utm_medium`, `utm_campaign`, `utm
   - `userAgents` — часть строки User-Agent, без учёта регистра;
   - `dateFrom` / `dateTo` — `YYYY-MM-DD` включительно, в `conditions.tz` (или UTC).
 - `conditions.not: ["countries", "referrers", …]` — «НЕ» (режим reject в Keitaro): перечисленные условия инвертируются — поток подходит, если посетитель НЕ попал в список. Работает и с «И», и с «ИЛИ». Неизвестное значение (нет GeoIP, нет реферера) под «НЕ» подходит. Например `{"countries":["US"],"not":["countries"]}` — все страны, кроме США.
+- **Без клоакинга** (правило владельца: боты и модераторы получают то же, что и люди). Поток нельзя сохранить (`POST`/`PATCH /api/campaigns`, `PUT …/streams`, импорт из Keitaro) с условием, которое отделяет проверяющих: `connections` с `datacenter` (или `mobile` + `broadband` — то же «кроме дата-центров»), `userAgents` с ботом/краулером/агентом проверки рекламы (`facebookexternalhit`, `googlebot`, `adsbot`, `bingbot`, `bytespider`, `tiktok`… и всё, что ловит фильтр ботов), `isps` с рекламной платформой или облаком (`facebook`, `meta`, `google`, `microsoft`, `amazon`, `tiktok`, `bytedance`, `apple`, `cloudflare`, `digitalocean`, `ovh`, `hetzner`, хостинги…) — прямо или под «НЕ». Ответ `400 { error: "cloaking_condition_not_allowed", stream, condition, value, message }`, редактор потока в `/admin` показывает это сообщение по-русски. Правило одно — `src/stream-policy.js` (панель загружает его как `/admin/stream-policy.js`). Уже сохранённые потоки с таким условием при запуске сервера не удаляются, а выключаются: `enabled: false`, `disabledBy: "policy"`, `disabledReason` (бейдж «Выключен: клоакинг запрещён» в редакторе), в журнале — `disable_stream` от `system`. Кампанию с таким выключенным потоком можно править дальше; включить поток можно только убрав условие. Фильтр ботов кампании (`botFilter`, `datacenterAsBot`) не клоакинг: ботов он не считает в статистике, но отправляет туда же.
 - Условия только выбирают между потоками самой кампании; отдельных «белых/чёрных» страниц для ботов нет.
 - `POST /api/simulate` принимает `referrer` и `query` (с учётом `paramMap`) и объясняет каждое условие: `{condition, expected, actual, ok, not?}`.
 - Кампания: `redirectMethod` — `http` (302, по умолчанию), `meta` (страница с meta refresh) или `js` (location.replace + meta в noscript). URL в странице экранируется.
@@ -248,9 +249,14 @@ Tracking URL принимает `utm_source`, `utm_medium`, `utm_campaign`, `utm
 
 - Роль `viewer` («Только чтение»): видит то же, что баер, — свои кампании (`ownerId`) со статистикой, журналами и офферами; с флагом `viewAll: true` — все кампании команды. Любой не-GET запрос к `/api/*`, `/stats*` → `403 read_only` (в том числе создание API-ключей); вход и выход (`/api/auth/*`) работают. Смены своего пароля в Umbrella пока нет.
 - `hideRevenue: true` («Скрывать доход»): из ответов `/stats*`, `/api/conversions`, `/api/offers`, `/api/audit`, `/api/simulate` сервер **удаляет** (а не обнуляет — нулевая прибыль или ROI были бы ложью) поля дохода: `revenue`, `pendingRevenue`, `profit`, `roi`, `epc`, `uepc`, `rpm`, `payout*`, `*earning*` на любой глубине; из `/api/offers`, `/api/audit` и `/api/simulate` — также `url` и `postbackUrl` офферов. CSV `/stats/export` выгружается без этих колонок (расход `cost` остаётся). `/dashboard` перенаправляет в `/admin`.
+<<<<<<< HEAD
+  Фильтр стоит по умолчанию на **всех** JSON-ответах `/api/*` и `/stats*` (новый эндпоинт не протечёт): например, `revenueCap` кампаний, `dailyRevenueGoal`/`dailyProfitGoal` из `/api/settings`, `landing` (адрес лендинга) из `/api/simulate`. Не фильтруются только `/api/auth/*`, `/api/users*`, `/api/keys*`, `/api/security` (там сами флаги прав) и имена параметров вроде `payoutParam` сети. Записать поля дохода такой пользователь тоже не может: `POST`/`PATCH`/`PUT` с `payout`, `payoutType`, `payoutCurrency`, `revenueCap`, `dailyRevenueGoal`, `dailyProfitGoal` (и любым другим полем дохода, даже `null`) → `403 { error: "revenue_hidden", fields }`; панель такие поля ему не показывает и не отправляет.
+- `offersAccess: 'own'` («Только офферы своих кампаний»): `GET /api/offers` отдаёт только офферы из потоков доступных пользователю кампаний; правка и копирование чужого оффера → `404 offer_not_found`, создание оффера с занятым чужим id → `409 offer_id_taken`. По умолчанию `'all'`.
+=======
 - Владелец записи (`ownerId`) у офферов, лендингов, источников и партнёрок: id создавшего пользователя; созданное владельцем или `ADMIN_TOKEN` — командное (`ownerId: null`, владелец может указать `ownerId` при создании и сменить его через `PATCH`). Баер создаёт свои записи, а правит, архивирует и копирует **только свои**: чужая или командная запись → `403 offer_not_yours` / `landing_not_yours` / `source_not_yours` / `network_not_yours`. `POST` с занятым id → `409 id_taken` для всех, включая владельца (правка — только `PATCH`). В потоки (`POST`/`PATCH /api/campaigns`, `PUT …/streams`) и в `altOfferId` баер ставит только командные и свои офферы и лендинги, иначе `403 offer_not_usable` / `landing_not_usable` (id, которые уже стоят в потоках этой кампании, сохранять можно). Хранение: колонка `owner_id` (`node src/migrate.js`), без БД — поле `ownerId` в JSON.
 - `offersAccess: 'own'` («Только офферы своих кампаний»): `GET /api/offers` отдаёт только свои офферы и офферы из потоков доступных пользователю кампаний (не свои из них — только для чтения); в потоки можно ставить только эти офферы. Правка и копирование невидимого оффера → `404 offer_not_found`. По умолчанию `'all'`.
 - `/r/:campaign/:offer` ведёт только на оффер из потоков этой кампании (иначе `404 offer_not_found`); кампания без потоков с офферами принимает командные офферы и офферы владельца кампании.
+>>>>>>> origin/main
 - API: `PATCH /api/users/:id { role, hideRevenue, offersAccess, viewAll }` (только владелец; свою роль менять нельзя — `409 cannot_change_own_role`, последнего владельца понизить нельзя — `409 last_owner`); те же поля принимает `POST /api/users`. `GET /api/auth/me` и `GET /api/users` отдают их у пользователя. Изменения пишутся в журнал (`entity=user`) и действуют со следующего запроса.
 - Хранение: колонки `hide_revenue`, `offers_access`, `view_all` таблицы `users` (`node src/migrate.js`), без БД — те же поля в `DATA_DIR/users.json`.
 
@@ -262,7 +268,25 @@ Tracking URL принимает `utm_source`, `utm_medium`, `utm_campaign`, `utm
 
 ## Деплой на nespizdili.lol/umbrella
 
-GitHub Actions (`.github/workflows/deploy.yml`): тесты → отдельный systemd-сервис `umbrella` (порт 4110, пользователь `umbrella`) → своя база PostgreSQL `umbrella` со своей ролью (`deploy/setup-db.sh`) → `location /umbrella` в nginx (бэкап конфига, `nginx -t`, откат при ошибке) → демо-данные один раз. Секреты репозитория: `SSH_PRIVATE_KEY`, `UMBRELLA_ADMIN_TOKEN`, `UMBRELLA_POSTBACK_SECRET`.
+GitHub Actions (`.github/workflows/deploy.yml`): тесты → отдельный systemd-сервис `umbrella` (порт 4110, пользователь `umbrella`) → своя база PostgreSQL `umbrella` со своей ролью (`deploy/setup-db.sh`) → `location /umbrella` в nginx (бэкап конфига, `nginx -t`, откат при ошибке) → демо-данные один раз. Секреты репозитория: `SSH_PRIVATE_KEY`, `UMBRELLA_ADMIN_TOKEN`, `UMBRELLA_POSTBACK_SECRET`, `SSH_KNOWN_HOSTS` (рекомендуется).
+
+Job `deploy` запускается только для `refs/heads/main` (push в main или ручной запуск именно на main); PR и ручной запуск на другой ветке только тестируются.
+
+**Задача владельца — закрепить ключ сервера.** Без секрета `SSH_KNOWN_HOSTS` деплой берёт ключ хоста через `ssh-keyscan` при каждом запуске (доверие при первом контакте) и пишет предупреждение. Один раз проверьте ключ на самом сервере (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`), затем возьмите строку `ssh-keyscan -t ed25519 148.230.98.232` с отпечатком, который совпал (`ssh-keygen -lf <(ssh-keyscan -t ed25519 148.230.98.232)`), и сохраните её целиком в секрет репозитория `SSH_KNOWN_HOSTS`. После этого подмена хоста остановит деплой (`StrictHostKeyChecking yes`). При смене ключа сервера обновите секрет.
+
+**Задача владельца — не писать `secret=` в access-лог nginx.** Постбэк `…/postback?secret=…` попадает в `/var/log/nginx/access.log` целиком. `map` и `log_format` разрешены только на уровне `http`, а `deploy/nginx-umbrella.conf` подключается внутрь `server`, поэтому деплой это не делает. Один раз на сервере добавьте файл `/etc/nginx/conf.d/umbrella-log-mask.conf` (проверьте, что `conf.d/*.conf` подключается внутри `http` в `nginx.conf`):
+
+```nginx
+# Masks secret=… in logged URLs: everything after "secret=" up to the next & becomes ***.
+map $request_uri $umbrella_loggable_uri {
+    default                              $request_uri;
+    "~^(?<head>.*[?&]secret=)[^&]*(?<tail>.*)$" "${head}***${tail}";
+}
+log_format umbrella_masked '$remote_addr - $remote_user [$time_local] "$request_method $umbrella_loggable_uri $server_protocol" '
+                           '$status $body_bytes_sent "$http_referer" "$http_user_agent"';
+```
+
+и в блоке `server` сайта nespizdili.lol и в блоках доменов трекинга (`/etc/nginx/sites-available/umbrella-*.conf`) замените `access_log` на `access_log /var/log/nginx/access.log umbrella_masked;`. Затем `nginx -t && systemctl reload nginx`. Старые логи с секретом удалите или смените `POSTBACK_SECRET`.
 
 ## GeoIP
 
@@ -284,7 +308,7 @@ GitHub Actions (`.github/workflows/deploy.yml`): тесты → отдельны
 
 По умолчанию IP посетителя — адрес TCP-соединения, а `X-Forwarded-For` игнорируется: его может прислать любой клиент и обойти списки IP, уникальность и rate limit. Если перед трекером стоит свой прокси (nginx, Caddy, балансировщик), задайте `TRUST_PROXY=1` (или число своих прокси в цепочке). Тогда IP берётся из `X-Forwarded-For` справа — адрес, который дописал ваш прокси, а не тот, что прислал клиент. Без этой настройки за прокси у всех кликов будет IP прокси, и уникальность с rate limit начнут резать нормальный трафик.
 
-В `/dashboard` доступен редактор потоков: выберите кампанию, добавьте потоки, условия и офферы с весами, затем нажмите «Сохранить потоки». Существующие плоские потоки также редактируются. Пустой список отключает stream-маршрут кампании. Если задан `ADMIN_TOKEN`, укажите его в раскрывающемся поле редактора; он хранится только в памяти страницы. Ошибки сохранения показываются рядом с формой.
+Потоки редактируются в панели `/admin` (редактор кампании). Встроенная страница `/dashboard` удалена: она собирала HTML через `innerHTML` без CSP; старая ссылка перенаправляет в `/admin`.
 
 Кампания также может ограничивать всю свою аудиторию через `allowOS` и `allowBrowsers` в POST/PATCH. Например, `{"allowOS":["ios"],"allowBrowsers":["safari"]}`. Пустые массивы снимают ограничения. Правила действуют для обоих tracking-маршрутов.
 
@@ -294,7 +318,7 @@ GitHub Actions (`.github/workflows/deploy.yml`): тесты → отдельны
 
 CR в API — доля (`0.25` = 25%), EPC = revenue / clicks, RPM = revenue × 1000 / clicks. При нуле кликов метрики равны нулю. Статистика периода относится к выбранным кликам и связанным с ними конверсиям. Revenue сохраняет прежнюю семантику: суммы разных валют пока не пересчитываются по курсу.
 
-`npm test` запускает проверки общего расчёта отчётов и HTTP smoke-тест. Дополнительный тест `node test/stream-editor-ui.mjs` проверяет реальную панель в Playwright, если он установлен. Можно указать `PLAYWRIGHT_MODULE` с абсолютным путём существующей установки Playwright. Тест использует отдельный порт 4212 и временные данные.
+`npm test` запускает проверки общего расчёта отчётов и HTTP smoke-тест. Браузерный тест панели — `node test/admin-ui.mjs` (Playwright, см. «Браузерные тесты панели»).
 
 Настройки кампании (POST/PATCH `/api/campaigns`):
 
@@ -338,9 +362,9 @@ CR в API — доля (`0.25` = 25%), EPC = revenue / clicks, RPM = revenue × 
 
 Период, сортировка, видимые колонки и размер страницы запоминаются в браузере. Если задан `ADMIN_TOKEN`, при первой записи откроется окно ввода ключа (кнопка 🔑 в шапке); ключ хранится только в памяти вкладки.
 
-## Журналы в dashboard
+## Журналы кликов и конверсий (API)
 
-Секция «Журнал событий» в `/dashboard` переключается между кликами и конверсиями. Доступны фильтры кампании, оффера, имени потока и дат, страницы по 25/50/100 записей, кнопки следующей/предыдущей страницы и обновление. В клике раскрываются IP, путь, реферер и User-Agent. При заданном `ADMIN_TOKEN` укажите его в поле «Доступ к журналу»: токен передаётся заголовком и хранится только в памяти страницы.
+Журналы смотрятся в `/admin` (разделы кликов и конверсий) или через API `GET /api/clicks` и `GET /api/conversions`.
 
 Оба log API возвращают одинаковые поля в JSONL/PostgreSQL: `clickId`, `campaign`, `offerId`, `stream`, `at` (ISO UTC); для конверсий также `revenue` (число или null), `currency`, `status`, `tid`, `updatedAt`, `revenueIgnored`.
 
@@ -351,8 +375,6 @@ CR в API — доля (`0.25` = 25%), EPC = revenue / clicks, RPM = revenue × 
 `from`/`to` задаются реальными календарными датами `YYYY-MM-DD`; `to` включает весь день по UTC (граница — `< следующий день 00:00`), так же во всех отчётах (`/stats*`, `/stats/export`, `/api/bots`, `/api/postbacks`) и в обоих хранилищах. В журнале конверсий даты относятся к `at` (первый постбэк конверсии), а фильтры campaign/offer/stream — к исходному клику. Это отличается от `/stats`, где период относится к выбранным кликам.
 
 `node test/admin-ui.mjs` — браузерный тест `/admin`: правка потока (прямой URL, «Считать клики: нет»), окно ключа при `ADMIN_TOKEN`, сохранение и отсутствие горизонтальной прокрутки на ширине 390px. Требует Playwright или `PLAYWRIGHT_MODULE`.
-
-`node test/event-logs-ui.mjs` — дополнительный браузерный тест фильтров, пагинации, прав доступа и мобильной таблицы. Требуется установленный Playwright или `PLAYWRIGHT_MODULE` с путём к существующей установке. Тест работает на отдельном порту 4213 с временными событиями.
 
 ## PostgreSQL
 

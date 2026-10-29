@@ -1,4 +1,6 @@
 // Umbrella admin UI — layout and workflows modelled on Keitaro, backed by the existing tracker API.
+// The no-cloaking rule is the server's own module (src/stream-policy.js, served as /admin/stream-policy.js).
+import { cloakingCondition, cloakingMessage, disabledByPolicy } from './stream-policy.js';
 const state = { token: null, offers: {}, campaigns: {}, landings: {}, sources: {}, networks: {}, users: [] };
 // Set by the server when the tracker runs under a path prefix (BASE_PATH, e.g. /umbrella behind nginx).
 const BASE = document.querySelector('meta[name="umbrella-base"]')?.getAttribute('content') || '';
@@ -1168,7 +1170,7 @@ function streamModal(stream, onApply, isNew = false, currentCampaignId = null) {
         h('label', {}, h('input', { type: 'radio', name: 'scount', checked: s.countClicks === false, onchange: () => { s.countClicks = false; } }), 'Нет')),
         'В выключенном состоянии клики через этот поток не попадут в отчёты и логи.'),
       field('Состояние', h('div', { class: 'radios' },
-        h('label', {}, h('input', { type: 'radio', name: 'senabled', checked: s.enabled !== false, onchange: () => { delete s.enabled; } }), 'Включен'),
+        h('label', {}, h('input', { type: 'radio', name: 'senabled', checked: s.enabled !== false, onchange: () => { delete s.enabled; delete s.disabledBy; delete s.disabledReason; } }), 'Включен'),
         h('label', {}, h('input', { type: 'radio', name: 'senabled', checked: s.enabled === false, onchange: () => { s.enabled = false; } }), 'Выключен'))))],
     ['Схема', () => {
       const box = h('div');
@@ -1194,7 +1196,7 @@ function streamModal(stream, onApply, isNew = false, currentCampaignId = null) {
       cfield('browsers', 'Браузеры', checkGroup(COND.browsers, s.conditions.browsers, (v) => { s.conditions.browsers = v; })),
       cfield('languages', 'Языки', h('input', { class: 'input', 'aria-label': 'Языки', value: s.conditions.languages.join(', '), placeholder: 'fr, de', oninput: (e) => { s.conditions.languages = splitList(e.target.value).map((x) => x.toLowerCase()); } }), 'Два первых символа Accept-Language.'),
       cfield('isps', 'Провайдеры', h('input', { class: 'input', 'aria-label': 'Провайдеры', value: s.conditions.isps.join(', '), placeholder: 'orange, free mobile', oninput: (e) => { s.conditions.isps = splitComma(e.target.value).map((x) => x.toLowerCase()); } }), 'Часть названия провайдера, как в отчёте «Провайдер». Без базы провайдеров условие не срабатывает.'),
-      cfield('connections', 'Тип соединения', checkGroup(COND.connections, s.conditions.connections, (v) => { s.conditions.connections = v; }), 'По базе провайдеров (ASN), приблизительно: мобильными считаются только чисто мобильные сети (T-Mobile, Verizon Wireless, Free Mobile…), смешанные операторы (Orange, SFR, Bouygues) — домашний. Без базы условие не срабатывает.'),
+      cfield('connections', 'Тип соединения', checkGroup(COND.connections.filter(([v]) => v !== 'datacenter' || s.conditions.connections.includes(v)), s.conditions.connections, (v) => { s.conditions.connections = v; }), 'По базе провайдеров (ASN), приблизительно: мобильными считаются только чисто мобильные сети (T-Mobile, Verizon Wireless, Free Mobile…), смешанные операторы (Orange, SFR, Bouygues) — домашний. Без базы условие не срабатывает. Отделять дата-центры (ботов и модераторов) нельзя — клоакинг запрещён.'),
       cfield('referrers', 'Реферер', h('input', { class: 'input', 'aria-label': 'Реферер', value: s.conditions.referrers.join(', '), placeholder: 'facebook.com, instagram.com/ads', oninput: (e) => { s.conditions.referrers = splitComma(e.target.value).map((x) => x.toLowerCase()); } }), 'Часть адреса источника перехода (домен и путь), без учёта регистра.'),
       cfield('emptyReferrer', 'Пустой реферер', h('div', { class: 'radios' }, [[undefined, 'Не важно'], [true, 'Пустой'], [false, 'Не пустой']].map(([v, l]) => h('label', {},
         h('input', { type: 'radio', name: 'semptyref', checked: s.conditions.emptyReferrer === v, onchange: () => { if (v === undefined) delete s.conditions.emptyReferrer; else s.conditions.emptyReferrer = v; } }), l)))),
@@ -1224,6 +1226,9 @@ function streamModal(stream, onApply, isNew = false, currentCampaignId = null) {
       if (s.landings.some((l) => !(l.weight > 0))) { err.textContent = 'Веса лендингов должны быть больше нуля.'; return; }
       if (s.action !== 'offers' || !s.landings.length) delete s.landings;
       const cond = s.conditions;
+      // Same rule as the server: bots and ad reviewers must get what people get. Checked before cond is trimmed.
+      const cloaking = disabledByPolicy(s) ? null : cloakingCondition(cond);
+      if (cloaking) { err.textContent = cloakingMessage(s.name, cloaking); return; }
       for (const k of ['referrers', 'keywords', 'ips', 'userAgents']) if (!cond[k].length) delete cond[k];
       if (!Object.keys(cond.params).length) delete cond.params;
       for (const k of ['dateFrom', 'dateTo']) if (!cond[k]) delete cond[k];
@@ -1321,7 +1326,7 @@ async function pageCampaignEditor(id) {
       h('div', { class: 'field-row' },
         field('Дневной кап кликов', h('input', { class: 'input', type: 'number', min: 1, value: d.dailyCap ?? '', placeholder: 'нет', oninput: bind('dailyCap', 'int') })),
         field('Общий кап кликов', h('input', { class: 'input', type: 'number', min: 1, value: d.totalCap ?? '', placeholder: 'нет', oninput: bind('totalCap', 'int') }), 'При достижении кампания встаёт на паузу.')),
-      field(`Дневной кап дохода, ${currency.info?.defaultCurrency || 'EUR'}`, h('input', { class: 'input', type: 'number', min: 0, step: '0.01', value: d.revenueCap ?? '', placeholder: 'нет', oninput: bind('revenueCap', 'float') })),
+      hideRev() ? null : field(`Дневной кап дохода, ${currency.info?.defaultCurrency || 'EUR'}`, h('input', { class: 'input', type: 'number', min: 0, step: '0.01', value: d.revenueCap ?? '', placeholder: 'нет', oninput: bind('revenueCap', 'float') })),
       field('URL при достижении капа', h('input', { class: 'input', type: 'url', value: d.capUrl || '', placeholder: 'https://… (иначе ответ 429)', oninput: bind('capUrl', 'url') })))],
     ['Tracking', () => isNew ? h('p', { class: 'muted' }, 'Ссылка кампании будет доступна после её сохранения.') : h('div', {},
       field('Домен трекинга', h('select', { class: 'select', onchange: (e) => { d.domain = e.target.value || null; mark(); } },
@@ -1359,7 +1364,8 @@ async function pageCampaignEditor(id) {
         h('div', { style: 'min-width:0' },
           h('div', { class: 'title', onclick: () => streamModal(s, (next) => { d.streams[i] = next; mark(); drawStreams(); }, false, d.id) },
             `${i + 1}. ${s.name} `, h('span', { class: 'badge ' + (s.type || 'regular') }, typeLabel[s.type || 'regular']),
-            s.enabled === false ? [' ', h('span', { class: 'badge', title: s.disabledBy === 'monitor' ? 'Оффер или лендинг не отвечает; поток включится сам, когда они снова ответят' : null }, s.disabledBy === 'monitor' ? 'Выключен монитором' : 'Выключен')] : null,
+            s.enabled === false ? [' ', h('span', { class: 'badge', title: s.disabledBy === 'monitor' ? 'Оффер или лендинг не отвечает; поток включится сам, когда они снова ответят' : s.disabledBy === 'policy' ? s.disabledReason || null : null },
+              s.disabledBy === 'monitor' ? 'Выключен монитором' : s.disabledBy === 'policy' ? 'Выключен: клоакинг запрещён' : 'Выключен')] : null,
             s.countClicks === false ? [' ', h('span', { class: 'badge' }, 'Клики не считаются')] : null),
           h('div', { class: 'meta' }, summarizeConditions(s.conditions)),
           h('div', { class: 'meta' }, (s.action === 'url' ? 'Прямой URL: ' + s.url : s.action === 'campaign' ? '→ кампания ' + (state.campaigns[s.campaignId]?.name || s.campaignId) : s.action === 'not_found' ? 'Действие: ошибка 404' : (s.landings?.length ? 'Лендинги: ' + s.landings.map((l) => `${state.landings[l.landingId]?.name || l.landingId} (${l.weight ?? 1})`).join(', ') + ' → ' : '') + 'Офферы: ' + (s.offers || []).map((o) => `${o.offerId} (${o.weight ?? 1})`).join(', ')) + ((s.type || 'regular') === 'regular' ? ` · вес потока ${s.weight ?? 1}` : ''))),
@@ -1387,7 +1393,7 @@ async function pageCampaignEditor(id) {
     for (const k of ['dailyCap', 'totalCap', 'conversionWindowDays']) if (Number.isNaN(d[k]) || (d[k] !== null && d[k] < 1)) { err.textContent = 'Капы и окно конверсии — целые числа больше нуля.'; return; }
     const names = d.streams.map((s) => s.name);
     if (new Set(names).size !== names.length) { err.textContent = 'Названия потоков должны различаться — по ним строится статистика.'; return; }
-    const body = { name: d.name.trim(), group: (d.group || '').trim(), active: d.active, streams: d.streams, dailyCap: d.dailyCap, totalCap: d.totalCap, revenueCap: d.revenueCap, capUrl: d.capUrl, geoCapUrl: d.geoCapUrl,
+    const body = { name: d.name.trim(), group: (d.group || '').trim(), active: d.active, streams: d.streams, dailyCap: d.dailyCap, totalCap: d.totalCap, ...(hideRev() ? {} : { revenueCap: d.revenueCap }), capUrl: d.capUrl, geoCapUrl: d.geoCapUrl,
       allowGeos: d.allowGeos, allowDevices: d.allowDevices, allowOS: d.allowOS, allowBrowsers: d.allowBrowsers, blockedIps: d.blockedIps, allowedIps: d.allowedIps,
       dedupeWindow: d.dedupeWindow || 0, botFilter: d.botFilter, datacenterAsBot: Boolean(d.datacenterAsBot), conversionWindowDays: d.conversionWindowDays, redirectMethod: d.redirectMethod || 'http', domain: d.domain || null, uniquenessHours: d.uniquenessHours ?? 24, streamRotation: d.streamRotation || 'weight', bindVisitors: d.bindVisitors || 'off', bindTtlHours: d.bindTtlHours ?? 24, ...(isOwnerView() ? { ownerId: d.ownerId || null } : {}), paramMap: d.paramMap || {}, costModel: d.costModel || 'none', cpc: d.cpc, costFromParam: d.costFromParam || false, sourceId: d.sourceId || null,
       sourcePostbackUrl: d.sourcePostbackUrl || null, sourcePostbackStatuses: d.sourcePostbackStatuses || [], monitoring: d.monitoring || 'notify' };
@@ -1411,7 +1417,7 @@ async function pageCampaignEditor(id) {
         else if (droppedParams.length) toast('Параметры отклонены сервером: ' + droppedParams.join(', '), true);
         else toast('Сохранено');
       }
-    } catch (e) { err.textContent = 'Не сохранено: ' + e.message; }
+    } catch (e) { err.textContent = 'Не сохранено: ' + (e.data?.message || (e.message === 'revenue_hidden' ? 'поля дохода недоступны вашей роли' : e.message)); }
     finally { saveBtn.disabled = false; }
   }
 
