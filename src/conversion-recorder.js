@@ -100,7 +100,7 @@ export function conversionValues(rawRevenue, rawCurrency) {
 export function createConversionRecorder({ findClick, hasConversion, currentConversion = null, record, windowDaysForClick = () => null,
   defaultRevenue = () => null, onRecorded = () => {}, onDeliveryError = () => {}, now = Date.now }) {
   const lock = createKeyedLock();
-  return async ({ clickId, tid: rawTid = null, revenue: rawRevenue, currency: rawCurrency, status: rawStatus, params = null }) => {
+  return async ({ clickId, tid: rawTid = null, revenue: rawRevenue, currency: rawCurrency, status: rawStatus, params = null, context = null }) => {
     if (!clickId) throw failure(400, 'click_id_required');
     if (typeof clickId !== 'string' || !CLICK_ID.test(clickId)) throw failure(400, 'invalid_click_id');
     const id = clickId.toLowerCase();
@@ -109,6 +109,7 @@ export function createConversionRecorder({ findClick, hasConversion, currentConv
     return lock(`${id}|${tid}`, async () => {
       const click = await findClick(id);
       if (!click) throw failure(404, 'click_not_found');
+      if (context) context.click = click; // lets the caller journal the campaign of the postback
       const status = normalizeStatus(rawStatus);
       const existing = currentConversion ? await currentConversion(id, tid) : ((await hasConversion(id, tid)) ? { status: 'sale' } : null);
       // Same status again is a duplicate; a different status is an update (lead → sale, sale → rejected, …).

@@ -91,6 +91,14 @@ CREATE TABLE IF NOT EXISTS bots (
   user_agent TEXT, ip TEXT, reason TEXT, isp TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS bots_campaign_created_idx ON bots(campaign, created_at);
+-- Postback journals (G7): direction 'in' (incoming /postback) or 'out' (S2S attempt). URLs without credentials.
+CREATE TABLE IF NOT EXISTS postbacks (
+  id BIGSERIAL PRIMARY KEY, direction TEXT NOT NULL, click_id TEXT, campaign TEXT, offer_id TEXT, tid TEXT,
+  status TEXT, revenue TEXT, currency TEXT, url TEXT, status_code INTEGER, error TEXT, attempt INTEGER, ip TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS postbacks_direction_created_idx ON postbacks(direction, created_at);
+CREATE INDEX IF NOT EXISTS postbacks_campaign_created_idx ON postbacks(campaign, created_at);
 
 CREATE INDEX IF NOT EXISTS clicks_campaign_created_idx ON clicks(campaign, created_at);
 CREATE INDEX IF NOT EXISTS clicks_created_idx ON clicks(created_at);

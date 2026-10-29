@@ -125,6 +125,8 @@ export function clearCampaignRows(db, campaign, beforeIso = null) {
     const conversions = await client.query(`DELETE FROM conversions WHERE click_id IN (SELECT click_id FROM clicks WHERE ${where})`, params);
     const clicks = await client.query(`DELETE FROM clicks WHERE ${where} RETURNING lp_clicked_at`, params);
     const bots = await client.query(`DELETE FROM bots WHERE ${where}`, params);
+    // Postback journal rows of the campaign (the JSONL copy goes with the campaign's click ids).
+    await client.query(`DELETE FROM postbacks WHERE ${where}`, params);
     return { clicks: clicks.rowCount, conversions: conversions.rowCount, lpClicks: clicks.rows.filter((r) => r.lp_clicked_at).length, bots: bots.rowCount };
   });
 }
