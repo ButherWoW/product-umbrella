@@ -1,0 +1,74 @@
+// Optional browser check for /admin. Requires Playwright, or PLAYWRIGHT_MODULE pointing at an existing installation.
+import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { startTestServer } from './test-server.mjs';
+
+const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
+const TOKEN = 'admin-ui-token';
+const dataDir = await mkdtemp(join(tmpdir(), 'umbrella-admin-ui-'));
+const server = await startTestServer(dataDir, { ADMIN_TOKEN: TOKEN });
+const api = (path, body, method = 'POST') => fetch(server.url + path, { method, headers: { 'content-type': 'application/json', authorization: 'Bearer ' + TOKEN }, body: JSON.stringify(body) });
+let browser;
+try {
+  await api('/api/campaigns', { id: 'ui-flows', name: 'UI flows', streams: [
+    { name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] },
+    { name: 'Spare', type: 'fallback', offers: [{ offerId: 'offer-1', weight: 1 }] },
+  ] });
+  for (let i = 0; i < 3; i++) await fetch(server.url + '/r/ui-flows', { redirect: 'manual' });
+
+  browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+  const errors = [];
+  page.on('pageerror', (error) => errors.push(error.message));
+
+  await page.goto(server.url + '/admin#/campaigns');
+  await page.locator('table.grid tbody tr', { hasText: 'UI flows' }).waitFor();
+  assert.ok(!(await page.locator('body').innerText()).includes('[object'), 'no stringified DOM nodes');
+
+  await page.goto(server.url + '/admin#/campaigns/ui-flows');
+  await page.locator('.stream .title').first().click();
+  const dialog = page.getByRole('dialog', { name: 'Редактирование потока' });
+  await dialog.getByRole('tab', { name: 'Схема' }).click();
+  await dialog.getByLabel('Прямой URL').check();
+  await dialog.locator('input[type=url]').fill('https://landing.example.net/?c={campaign}');
+  await dialog.getByRole('tab', { name: 'Основные' }).click();
+  await dialog.locator('input[name=scount]').nth(1).check();
+  await dialog.getByRole('button', { name: 'Применить' }).click();
+  await page.locator('.stream', { hasText: 'Прямой URL: https://landing.example.net/' }).waitFor();
+  await page.locator('.stream', { hasText: 'Клики не считаются' }).waitFor();
+
+  // Saving without the key opens the key dialog instead of failing silently.
+  await page.locator('.editor-head .btn.primary').click();
+  const keyDialog = page.getByRole('dialog', { name: 'Ключ администратора' });
+  await keyDialog.waitFor();
+  await keyDialog.locator('input[type=password]').fill(TOKEN);
+  await keyDialog.getByRole('button', { name: 'Сохранить' }).click();
+  await page.locator('.editor-head .btn.primary').click();
+  await page.locator('#toast', { hasText: 'Сохранено' }).waitFor();
+
+  const stored = (await (await fetch(server.url + '/api/campaigns')).json()).campaigns['ui-flows'].streams;
+  assert.equal(stored[0].action, 'url');
+  assert.equal(stored[0].url, 'https://landing.example.net/?c={campaign}');
+  assert.equal(stored[0].countClicks, false);
+  assert.ok(!('offers' in stored[0]));
+  assert.equal(stored[1].name, 'Spare', 'untouched stream is kept');
+
+  // Phone width: no horizontal page scroll on the main screens.
+  await page.setViewportSize({ width: 390, height: 844 });
+  for (const hash of ['#/dashboard', '#/campaigns', '#/campaigns/ui-flows', '#/reports', '#/clicks']) {
+    await page.goto(server.url + '/admin' + hash);
+    await page.waitForTimeout(400);
+    const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+    assert.ok(overflow <= 1, `${hash} overflows by ${overflow}px at 390px`);
+  }
+  await page.screenshot({ path: join(tmpdir(), 'umbrella-admin-mobile.png'), fullPage: true });
+
+  assert.deepEqual(errors, []);
+  console.log('Admin UI browser test passed');
+} finally {
+  await browser?.close();
+  await server.stop();
+  await rm(dataDir, { recursive: true, force: true });
+}

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Umbrella — трекер</title>
+<link rel="stylesheet" href="/admin/admin.css">
+</head>
+<body>
+<header class="topbar">
+  <button class="icon-btn" id="menu-toggle" aria-label="Меню">☰</button>
+  <a class="brand" href="#/dashboard">☂ Umbrella <small>tracker</small></a>
+  <input class="global-search" id="global-search" type="search" placeholder="Поиск по таблице">
+  <button class="icon-btn" id="token-btn" title="Ключ администратора" aria-label="Ключ администратора">🔑</button>
+</header>
+<nav class="sidebar" id="sidebar">
+  <a href="#/dashboard" data-nav="dashboard"><span>◎</span>Дашборд</a>
+  <a href="#/campaigns" data-nav="campaigns"><span>◉</span>Кампании</a>
+  <a href="#/offers" data-nav="offers"><span>◈</span>Офферы</a>
+  <div class="nav-group">
+    <div class="nav-title"><span>▤</span>Отчёты</div>
+    <a href="#/reports" data-nav="reports" class="sub">Создать отчёт</a>
+    <a href="#/clicks" data-nav="clicks" class="sub">Лог кликов</a>
+    <a href="#/conversions" data-nav="conversions" class="sub">Лог конверсий</a>
+  </div>
+</nav>
+<main id="view" class="view">Загрузка…</main>
+<div id="toast" class="toast" role="status" hidden></div>
+<script type="module" src="/admin/admin.js"></script>
+</body>
+</html>

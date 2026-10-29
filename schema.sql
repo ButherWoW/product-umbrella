@@ -1,0 +1,44 @@
+-- Product Umbrella production schema. Kept aligned with src/migrate.js and src/db.js.
+CREATE TABLE IF NOT EXISTS campaigns (
+  id text PRIMARY KEY,
+  name text NOT NULL,
+  active boolean NOT NULL DEFAULT true,
+  streams jsonb NOT NULL DEFAULT '[]'::jsonb,
+  config jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS offers (
+  id text PRIMARY KEY,
+  url text NOT NULL CHECK (url ~ '^https://'),
+  active boolean NOT NULL DEFAULT true,
+  postback_url text,
+  daily_cap integer,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS clicks (
+  click_id uuid PRIMARY KEY,
+  campaign text NOT NULL,
+  offer_id text NOT NULL,
+  path text,
+  referrer text,
+  user_agent text,
+  subid text,
+  country text,
+  ip text,
+  stream text,
+  params jsonb,
+  cost numeric(12,6) NOT NULL DEFAULT 0,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS conversions (
+  click_id uuid PRIMARY KEY REFERENCES clicks(click_id),
+  revenue numeric(12,4),
+  currency text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS clicks_campaign_created_idx ON clicks(campaign, created_at);
+CREATE INDEX IF NOT EXISTS clicks_created_idx ON clicks(created_at);
