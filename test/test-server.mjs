@@ -4,10 +4,13 @@ import { once } from 'node:events';
 export async function startTestServer(dataDir, environment = {}) {
   const child = spawn(process.execPath, ['src/server.js'], { env: { ...process.env,
     DATABASE_URL: '', ADMIN_TOKEN: '', GEOIP_DB: '', CLICK_RATE_LIMIT: '0', FX_REFRESH: '0', MONITOR: '0',
-    PORT: '0', DATA_DIR: dataDir, POSTBACK_SECRET: 'conversion-test-secret', RETENTION_DAYS: '', ...environment },
+    PORT: '0', DATA_DIR: dataDir, POSTBACK_SECRET: 'conversion-test-secret', RETENTION_DAYS: '', RECONCILE_INTERVAL_MS: '0', ...environment },
     stdio: ['ignore', 'pipe', 'pipe'] });
   let diagnostics = '', output = '';
   child.stderr.on('data', (chunk) => { diagnostics += chunk; });
+  let all = '';
+  child.stdout.on('data', (chunk) => { all += chunk; });
+  child.stderr.on('data', (chunk) => { all += chunk; });
   async function stop() {
     if (child.exitCode !== null || child.signalCode !== null) return;
     const exited = once(child, 'exit');
@@ -27,6 +30,6 @@ export async function startTestServer(dataDir, environment = {}) {
       child.once('error', (error) => { clearTimeout(timer); reject(error); });
       child.once('exit', (code) => { clearTimeout(timer); reject(new Error(`Test server exit ${code}: ${diagnostics}`)); });
     });
-    return { url, stop };
+    return { url, stop, logs: () => all };
   } catch (error) { await stop(); throw error; }
 }
