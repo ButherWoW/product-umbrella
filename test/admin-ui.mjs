@@ -1,6 +1,6 @@
 // Optional browser check for /admin. Requires Playwright, or PLAYWRIGHT_MODULE pointing at an existing installation.
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startTestServer } from './test-server.mjs';
@@ -364,6 +364,19 @@ try {
   const lpHeaders = await page.locator('table.grid thead th').allInnerTexts();
   assert.ok(lpHeaders.some((h) => h === 'LP CTR'), `landing report should have LP CTR column, got: ${lpHeaders.join(', ')}`);
   assert.ok(lpHeaders.some((h) => h.includes('CR (LP)')), `landing report should have CR (LP) column`);
+  // D17: CSV export from reports
+  await page.goto(server.url + '/admin#/reports?group=campaign');
+  await page.getByRole('heading', { name: 'Отчёт' }).waitFor();
+  await page.locator('table.grid').waitFor({ timeout: 5000 });
+  const [download] = await Promise.all([
+    page.waitForEvent('download'),
+    page.locator('button[aria-label="CSV"]').click(),
+  ]);
+  assert.ok(download.suggestedFilename().endsWith('.csv'), `download filename should end with .csv, got: ${download.suggestedFilename()}`);
+  const csvPath = await download.path();
+  const csvContent = await readFile(csvPath, 'utf8');
+  assert.ok(/Клики|clicks/i.test(csvContent), `CSV should contain headers, got: ${csvContent.slice(0, 200)}`);
+  assert.ok(/UI flows|ui-flows/i.test(csvContent), `CSV should contain campaign data`);
 
   assert.deepEqual(errors, []);
 
