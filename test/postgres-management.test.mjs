@@ -24,10 +24,12 @@ test('PostgreSQL: sources, networks, clones, archive and groups survive a restar
   const call = (path, body, method = body ? 'POST' : 'GET') => fetch(server.url + path, {
     method, headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
   try {
-    assert.equal((await call('/api/sources', { id: ids.source, name: 'FB', costModel: 'cpc', cpc: 0.1, costFromParam: true, paramMap: { sub_id_1: 'ad_id' } })).status, 201);
+    assert.equal((await call('/api/sources', { id: ids.source, name: 'FB', costModel: 'cpc', cpc: 0.1, costFromParam: true, paramMap: { sub_id_1: 'ad_id' },
+      postbackUrl: 'https://pb.example.com/c?id={external_id}&s={status}', postbackStatuses: ['lead', 'sale'] })).status, 201);
     assert.equal((await call('/api/networks', { id: ids.network, name: 'Net', offerParams: 'sub1={click_id}', clickIdParam: '{sub1}', payoutParam: '{payout}' })).status, 201);
     assert.equal((await call('/api/offers', { id: ids.offer, url: 'https://example.com/o', networkId: ids.network, group: 'Kitchen' })).status, 201);
-    assert.equal((await call('/api/campaigns', { id: ids.campaign, name: 'C', sourceId: ids.source, group: 'FR', streams: [{ name: 'm', offers: [{ offerId: ids.offer }] }] })).status, 201);
+    assert.equal((await call('/api/campaigns', { id: ids.campaign, name: 'C', sourceId: ids.source, group: 'FR', streams: [{ name: 'm', offers: [{ offerId: ids.offer }] }],
+      sourcePostbackUrl: 'https://pb.example.com/camp?s={status}', sourcePostbackStatuses: ['trash'] })).status, 201);
     const clone = await (await call(`/api/campaigns/${ids.campaign}/clone`, {})).json();
     assert.equal(clone.id, `${ids.campaign}-copy`);
     const offerClone = await (await call(`/api/offers/${ids.offer}/clone`, {})).json();
@@ -39,6 +41,7 @@ test('PostgreSQL: sources, networks, clones, archive and groups survive a restar
   try {
     const { sources } = await (await call('/api/sources')).json();
     assert.deepEqual([sources[ids.source]?.cpc, sources[ids.source]?.costFromParam, sources[ids.source]?.paramMap], [0.1, true, { sub_id_1: 'ad_id' }]);
+    assert.deepEqual([sources[ids.source]?.postbackUrl, sources[ids.source]?.postbackStatuses], ['https://pb.example.com/c?id={external_id}&s={status}', ['lead', 'sale']], 'source postback stored in PostgreSQL');
     const { networks } = await (await call('/api/networks')).json();
     assert.equal(networks[ids.network]?.clickIdParam, '{sub1}');
     const { offers } = await (await call('/api/offers')).json();
@@ -48,6 +51,7 @@ test('PostgreSQL: sources, networks, clones, archive and groups survive a restar
     const c = campaigns[ids.campaign];
     assert.deepEqual([c?.sourceId, c?.group, c?.costModel, c?.cpc, c?.costFromParam, c?.paramMap], [ids.source, 'FR', 'cpc', 0.1, true, { sub_id_1: 'ad_id' }], 'source defaults applied and stored');
     assert.equal(campaigns[`${ids.campaign}-copy`]?.active, false, 'clone starts disabled');
+    assert.deepEqual([c?.sourcePostbackUrl, c?.sourcePostbackStatuses], ['https://pb.example.com/camp?s={status}', ['trash']], 'campaign postback override stored');
   } finally { await server.stop(); }
 });
 
@@ -142,5 +146,49 @@ test('PostgreSQL: API keys survive a restart, only their hash is stored', { skip
     assert.ok(keys.some((k) => k.id === keyId && k.email === email && k.lastUsedAt));
     assert.equal((await call(`/api/keys/${keyId}`, { method: 'DELETE' })).status, 200);
     assert.equal((await call('/api/campaigns', { bearer: secret })).status, 401);
+  } finally { await server.stop(); }
+});
+
+test('PostgreSQL: viewer role and permission flags survive a restart', { skip: !databaseUrl && 'set TEST_DATABASE_URL to run', timeout: 30000 }, async (t) => {
+  const dirs = [];
+  const start = async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'umbrella-pgp-')); dirs.push(dir);
+    return startTestServer(dir, { DATABASE_URL: databaseUrl, REQUIRE_POSTGRES: '1', ADMIN_TOKEN: TOKEN, REQUIRE_LOGIN: '1' });
+  };
+  t.after(async () => { for (const dir of dirs) await rm(dir, { recursive: true, force: true }); });
+  const run = Date.now().toString(36);
+  const viewerEmail = `viewer-${run}@example.com`, buyerEmail = `hidden-${run}@example.com`;
+  let server = await start();
+  const call = (path, { method = 'GET', body, bearer = TOKEN, cookie } = {}) => fetch(server.url + path, { method,
+    headers: { 'content-type': 'application/json', 'x-requested-with': 'umbrella', ...(bearer ? { authorization: `Bearer ${bearer}` } : {}), ...(cookie ? { cookie } : {}) },
+    body: body ? JSON.stringify(body) : undefined });
+  let viewerId, buyerId;
+  try {
+    const viewer = await (await call('/api/users', { method: 'POST', body: { email: viewerEmail, password: 'viewer-password-pg', role: 'viewer', viewAll: true } })).json();
+    viewerId = viewer.user.id;
+    assert.deepEqual([viewer.user.role, viewer.user.viewAll], ['viewer', true]);
+    buyerId = (await (await call('/api/users', { method: 'POST', body: { email: buyerEmail, password: 'buyer-password-pg' } })).json()).user.id;
+    const patched = await (await call(`/api/users/${buyerId}`, { method: 'PATCH', body: { hideRevenue: true, offersAccess: 'own' } })).json();
+    assert.deepEqual([patched.user.hideRevenue, patched.user.offersAccess], [true, 'own']);
+  } finally { await server.stop(); }
+
+  const { default: pg } = await import('pg');
+  const client = new pg.Client({ connectionString: databaseUrl });
+  await client.connect();
+  try {
+    const { rows } = await client.query('SELECT id, role, hide_revenue, offers_access, view_all FROM users WHERE id = ANY($1) ORDER BY email DESC', [[viewerId, buyerId]]);
+    assert.deepEqual(rows.map((r) => [r.role, r.hide_revenue, r.offers_access, r.view_all]), [['viewer', false, 'all', true], ['buyer', true, 'own', false]]);
+  } finally { await client.end(); }
+
+  server = await start();
+  try {
+    const list = (await (await call('/api/users')).json()).users;
+    const v = list.find((u) => u.id === viewerId), b = list.find((u) => u.id === buyerId);
+    assert.deepEqual([v.role, v.viewAll, b.hideRevenue, b.offersAccess], ['viewer', true, true, 'own'], 'flags come back from PostgreSQL');
+    const login = await call('/api/auth/login', { method: 'POST', bearer: null, body: { email: viewerEmail, password: 'viewer-password-pg' } });
+    const cookie = (login.headers.get('set-cookie').match(/umb_session=[^;]*/) || [])[0];
+    const write = await call('/api/campaigns', { method: 'POST', bearer: null, cookie, body: { id: `pgv-${run}`, name: 'x' } });
+    assert.deepEqual([write.status, (await write.json()).error], [403, 'read_only'], 'viewer stays read-only after a restart');
+    assert.equal((await call('/api/campaigns', { bearer: null, cookie })).status, 200);
   } finally { await server.stop(); }
 });
