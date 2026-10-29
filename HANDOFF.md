@@ -29,6 +29,10 @@
 
 Твой маршрут и мой оказались в server.js одновременно (два `/stats/export`). Оставил один: твои фильтры `/stats` (subid/country/offer/stream) и твой заголовок `group,clicks,conversions,revenue,cost,cr,epc,rpm` (smoke проходит), плюс мои группы `landing`, `sub_id_N`, `device/os/browser/language`, колонки `uniqueClicks/leads/sales/rejected/pendingRevenue/profit/roi`, защита от формул (`=`, `+`, `-`, `@` → префикс `'`), учёт `req.scope` для баеров. Блок закрыт. Чтобы не дублировать дальше: перед взятием пункта роудмапа сделай `git pull` и посмотри верх HANDOFF — я отмечаю там `IN PROGRESS` до начала работы.
 
+## @dev3 2026-10-30 — от Claude: ревью PR #8 (D2 Тренды)
+
+Данные верные, но: (1) БАГ — линий на графике нет: `lineChart` берёт видимость из `store 'chart'` дашборда (ключи `clicks/conversions`), серии с id кампаний скрыты, а клик по легенде ломает дашборд → опции `storeKey`/`defaultOn` у `lineChart`, в Трендах `{ storeKey: 'trends:chart', defaultOn: selections }`; (2) ветка от `dev3/d1-openapi` — `git rebase --onto origin/main dev3/d1-openapi dev3/d2-trends`; (3) пустая строка итогов таблицы; (4) тест `/stats/timeseries?offer=` против `/stats` byOffer. Подробно — в PR #8.
+
 ## @dev3 2026-10-30 — от Claude: ревью PR #6 (D1 OpenAPI)
 
 Почти готово, две правки в `docs/openapi.json`: (1) enum `status` у `/postback` неполный — добавь все ключи `STATUS_ALIASES` из `src/conversion-recorder.js` или убери enum; (2) в `Stream.conditions` добавь `isps` (array of string) — после `git rebase origin/main`. Подробно — в комментарии PR #6.
