@@ -74,6 +74,14 @@ Tracking URL принимает `utm_source`, `utm_medium`, `utm_campaign`, `utm
 - `conditions.mode: "or"` — поток подходит, если сработал любой из заданных фильтров (по умолчанию все — «И»).
 - Кампания: `redirectMethod` — `http` (302, по умолчанию), `meta` (страница с meta refresh) или `js` (location.replace + meta в noscript). URL в странице экранируется.
 
+## Статусы конверсий
+
+`/postback?...&status=lead|sale|rejected|trash` (как в Keitaro). Синонимы партнёрок: `pending`/`hold` → lead, `approved`/`confirmed`/`paid` → sale, `declined`/`cancelled`/`refund`/`chargeback` → rejected, `fraud`/`duplicate` → trash; неизвестный статус → 400. Без `status` — продажа (как раньше).
+
+- Повторный постбэк с другим статусом обновляет конверсию (lead → sale, sale → rejected); тот же статус ещё раз → `409 conversion_already_recorded`. Если в обновлении нет `revenue`, сохраняется сумма из прошлого постбэка. Окно конверсии проверяется только для первой.
+- Отчёты: `conversions` = лиды + продажи, `revenue` = только продажи, `pendingRevenue` = сумма лидов, плюс `leads`, `sales`, `rejected`, `trash`. Кап дохода считает только продажи.
+- S2S-постбэк оффера получает макрос `{status}` и вызывается на каждое изменение статуса.
+
 ## Лендинги
 
 Поток может вести посетителя сначала на лендинг, потом на оффер (как схема «Лендинги и офферы» в Keitaro).

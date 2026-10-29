@@ -40,6 +40,8 @@ CREATE TABLE IF NOT EXISTS conversions (
   click_id uuid PRIMARY KEY REFERENCES clicks(click_id),
   revenue numeric(12,4),
   currency text,
+  status text NOT NULL DEFAULT 'sale' CHECK (status IN ('lead', 'sale', 'rejected', 'trash')),
+  updated_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 

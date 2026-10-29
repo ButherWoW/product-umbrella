@@ -62,7 +62,7 @@ function normalizeConversion(item, click = item) {
   const at = iso(item.at ?? item.created_at);
   const revenue = item.revenue === null || item.revenue === undefined ? null : Number(item.revenue);
   return { type: 'conversion', clickId, campaign: click.campaign ?? null,
-    offerId, at, stream: click.stream || 'default', revenue: Number.isFinite(revenue) ? revenue : null,
+    offerId, at, stream: click.stream || 'default', revenue: Number.isFinite(revenue) ? revenue : null, status: item.status || 'sale',
     currency: item.currency ?? null, click_id: clickId, offer_id: offerId, created_at: at };
 }
 
@@ -117,7 +117,7 @@ async function fromPostgres(kind, query, db) {
   params.push(query.limit + 1, query.offset);
   const fields = kind === 'clicks'
     ? 'c.click_id, c.campaign, c.offer_id, c.stream, c.path, c.referrer, c.user_agent, c.subid, c.country, c.ip, c.params, c.cost, c.landing_id, c.created_at'
-    : 'cv.click_id, c.campaign, c.offer_id, c.stream, cv.revenue, cv.currency, cv.created_at';
+    : 'cv.click_id, c.campaign, c.offer_id, c.stream, cv.revenue, cv.currency, cv.status, cv.created_at';
   const source = kind === 'clicks' ? 'clicks c' : 'conversions cv JOIN clicks c USING (click_id)';
   const { rows } = await db.query(`SELECT ${fields} FROM ${source}
     ${conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''}

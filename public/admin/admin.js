@@ -290,9 +290,14 @@ const metricCols = (opts = {}) => [
   { key: 'revenue', label: 'Доход', num: true, render: (r) => money(r.revenue), total: (rs) => money(sum(rs, 'revenue')) },
   { key: 'epc', label: 'EPC', title: 'EPC — доход с клика', num: true, value: (r) => ratio(r.revenue, r.clicks), render: (r) => money4(ratio(r.revenue, r.clicks)), total: (rs) => money4(ratio(sum(rs, 'revenue'), sum(rs, 'clicks'))) },
   { key: 'rpm', label: 'RPM', title: 'RPM — доход на 1000 кликов', num: true, hidden: !opts.rpm, value: (r) => ratio(r.revenue * 1000, r.clicks), render: (r) => money(ratio(r.revenue * 1000, r.clicks)), total: (rs) => money(ratio(sum(rs, 'revenue') * 1000, sum(rs, 'clicks'))) },
+  { key: 'leads', label: 'Лиды', title: 'Лиды — конверсии в ожидании', num: true, hidden: true, render: (r) => num(r.leads), total: (rs) => num(sum(rs, 'leads')) },
+  { key: 'sales', label: 'Продажи', title: 'Продажи — подтверждённые конверсии', num: true, hidden: true, render: (r) => num(r.sales), total: (rs) => num(sum(rs, 'sales')) },
+  { key: 'rejected', label: 'Отклонённые', num: true, hidden: true, render: (r) => num(r.rejected), total: (rs) => num(sum(rs, 'rejected')) },
+  { key: 'pendingRevenue', label: 'Доход (ожидаемый)', title: 'Сумма по лидам, ещё не подтверждённым', num: true, hidden: true, render: (r) => money(r.pendingRevenue), total: (rs) => money(sum(rs, 'pendingRevenue')) },
 ];
 const sum = (rows, key) => rows.reduce((s, r) => s + (Number(r[key]) || 0), 0);
-const groupRows = (obj) => Object.entries(obj || {}).map(([id, v]) => ({ id, clicks: v.clicks || 0, conversions: v.conversions || 0, revenue: v.revenue || 0, cost: v.cost || 0, lpClicks: v.lpClicks || 0 }));
+const groupRows = (obj) => Object.entries(obj || {}).map(([id, v]) => ({ id, clicks: v.clicks || 0, conversions: v.conversions || 0, revenue: v.revenue || 0, cost: v.cost || 0, lpClicks: v.lpClicks || 0,
+  leads: v.leads || 0, sales: v.sales || 0, rejected: v.rejected || 0, pendingRevenue: v.pendingRevenue || 0 }));
 const trackingUrl = (id) => `${location.origin}${BASE}/r/${encodeURIComponent(id)}`;
 const typeLabel = { regular: 'Обычный', fallback: 'Замыкающий', forced: 'Перехватывающий' };
 
@@ -620,7 +625,7 @@ async function pageCampaignEditor(id) {
     ['Tracking', () => isNew ? h('p', { class: 'muted' }, 'Ссылка кампании будет доступна после её сохранения.') : h('div', {},
       field('Ссылка кампании', h('div', { class: 'link-box' }, h('input', { class: 'input', readonly: true, value: trackingUrl(d.id) }), h('button', { class: 'btn', onclick: () => copyText(trackingUrl(d.id)) }, 'Копировать')), 'Добавьте ?subid=… и utm-метки, они передадутся в оффер.'),
       field('Ссылка на конкретный оффер', h('input', { class: 'input', readonly: true, value: trackingUrl(d.id) + '/{offer_id}' })),
-      field('S2S постбэк для партнёрки', h('input', { class: 'input', readonly: true, value: `${location.origin}${BASE}/postback?click_id={click_id}&secret=POSTBACK_SECRET&revenue={payout}&currency=EUR` }), 'Замените POSTBACK_SECRET и макросы партнёрки на свои.'),
+      field('S2S постбэк для партнёрки', h('input', { class: 'input', readonly: true, value: `${location.origin}${BASE}/postback?click_id={click_id}&secret=POSTBACK_SECRET&revenue={payout}&currency=EUR&status={status}` }), 'Замените POSTBACK_SECRET и макросы партнёрки на свои. status: lead / sale / rejected / trash (понимает и approved, pending, declined…); повторный постбэк с другим статусом обновляет конверсию.'),
       h('p', { class: 'muted' }, 'Макросы в URL оффера: {click_id} {subid} {campaign} {offer_id} {device} {country}.'))],
   ]);
 
@@ -913,7 +918,8 @@ function pageLog(kind, params) {
     { key: 'id', label: 'Click ID', cls: 'mono', render: (r) => h('span', { title: r.id }, r.id.slice(0, 13) + '…') },
     { key: 'campaign', label: 'Кампания', cls: 'name', render: (r) => h('a', { href: '#/campaigns/' + encodeURIComponent(r.campaign) }, state.campaigns[r.campaign]?.name || r.campaign) },
     { key: 'stream', label: 'Поток' }, { key: 'offerId', label: 'Оффер' },
-    { key: 'revenue', label: 'Доход', num: true, render: (r) => (r.revenue == null ? '—' : money(r.revenue)), total: (rs) => money(sum(rs, 'revenue')) },
+    { key: 'status', label: 'Статус', value: (r) => ({ lead: 'Лид', sale: 'Продажа', rejected: 'Отклонена', trash: 'Мусор' })[r.status] || r.status || 'Продажа' },
+    { key: 'revenue', label: 'Доход', num: true, render: (r) => (r.revenue == null ? '—' : money(r.revenue)), total: () => '' },
     { key: 'currency', label: 'Валюта' },
   ];
   const paging = {

@@ -6,6 +6,40 @@ function failure(statusCode, message, extra = {}) {
   return Object.assign(new Error(message), { statusCode, ...extra });
 }
 
+// Keitaro-style conversion statuses. Networks use many words; unknown ones are rejected rather than guessed.
+const STATUS_ALIASES = {
+  lead: 'lead', pending: 'lead', hold: 'lead', new: 'lead', processing: 'lead', waiting: 'lead',
+  sale: 'sale', approved: 'sale', approve: 'sale', confirmed: 'sale', paid: 'sale', success: 'sale', accepted: 'sale',
+  rejected: 'rejected', reject: 'rejected', declined: 'rejected', decline: 'rejected', cancel: 'rejected', canceled: 'rejected', cancelled: 'rejected', refund: 'rejected', chargeback: 'rejected',
+  trash: 'trash', fraud: 'trash', invalid: 'trash', duplicate: 'trash', spam: 'trash',
+};
+export const CONVERSION_STATUSES = ['lead', 'sale', 'rejected', 'trash'];
+
+export function normalizeStatus(raw) {
+  if (raw === null || raw === undefined || raw === '') return 'sale';
+  const status = STATUS_ALIASES[String(raw).trim().toLowerCase()];
+  if (!status) throw failure(400, 'invalid_status');
+  return status;
+}
+
+// Latest conversion of a click ({ status, revenue, currency }) or null. Rows written before statuses existed are sales.
+export async function findRecordedConversion({ clickId, eventsFile, db = null, onFallback = () => {} }) {
+  if (db) {
+    try {
+      const { rows } = await db.query('SELECT status, revenue, currency FROM conversions WHERE click_id = $1', [clickId]);
+      if (rows.length) return { status: rows[0].status || 'sale', revenue: rows[0].revenue === null ? null : Number(rows[0].revenue), currency: rows[0].currency };
+    } catch (error) { onFallback(error); }
+  }
+  let latest = null;
+  try {
+    for (const line of (await readFile(eventsFile, 'utf8')).split('\n')) {
+      if (!line.includes(clickId)) continue;
+      try { const item = JSON.parse(line); if (item?.type === 'conversion' && item.clickId === clickId) latest = item; } catch { /* skip */ }
+    }
+  } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  return latest ? { status: latest.status || 'sale', revenue: latest.revenue ?? null, currency: latest.currency ?? null } : null;
+}
+
 export async function hasRecordedConversion({ clickId, eventsFile, db = null, onFallback = () => {} }) {
   if (db) {
     try {
@@ -56,18 +90,21 @@ export function conversionValues(rawRevenue, rawCurrency) {
   return { revenue, currency };
 }
 
-export function createConversionRecorder({ findClick, hasConversion, record, windowDaysForClick = () => null,
+export function createConversionRecorder({ findClick, hasConversion, currentConversion = null, record, windowDaysForClick = () => null,
   onRecorded = () => {}, onDeliveryError = () => {}, now = Date.now }) {
   const lock = createKeyedLock();
-  return async ({ clickId, revenue: rawRevenue, currency: rawCurrency }) => {
+  return async ({ clickId, revenue: rawRevenue, currency: rawCurrency, status: rawStatus }) => {
     if (!clickId) throw failure(400, 'click_id_required');
     if (typeof clickId !== 'string' || !CLICK_ID.test(clickId)) throw failure(400, 'invalid_click_id');
     const id = clickId.toLowerCase();
     return lock(id, async () => {
       const click = await findClick(id);
       if (!click) throw failure(404, 'click_not_found');
-      if (await hasConversion(id)) throw failure(409, 'conversion_already_recorded');
-      const windowDays = windowDaysForClick(click);
+      const status = normalizeStatus(rawStatus);
+      const existing = currentConversion ? await currentConversion(id) : ((await hasConversion(id)) ? { status: 'sale' } : null);
+      // Same status again is a duplicate; a different status is an update (lead → sale, sale → rejected, …).
+      if (existing && (existing.status || 'sale') === status) throw failure(409, 'conversion_already_recorded');
+      const windowDays = existing ? null : windowDaysForClick(click);
       if (windowDays) {
         const clickedAt = Date.parse(click.at);
         if (!Number.isFinite(clickedAt)) throw failure(409, 'click_timestamp_invalid');
@@ -75,13 +112,21 @@ export function createConversionRecorder({ findClick, hasConversion, record, win
           throw failure(409, 'conversion_window_expired', { conversionWindowDays: windowDays });
       }
       const values = conversionValues(rawRevenue, rawCurrency);
-      const payload = { clickId: id, ...values };
+      // A status-only update (no amount) keeps the amount reported earlier.
+      if (values.revenue === null && existing?.revenue !== null && existing?.revenue !== undefined) {
+        values.revenue = existing.revenue;
+        values.currency = values.currency ?? existing.currency ?? null;
+      }
+      // Without an explicit status a first conversion is written exactly as before statuses existed (implicitly a sale).
+      const explicit = rawStatus !== null && rawStatus !== undefined && rawStatus !== '';
+      const payload = { clickId: id, ...values, ...(explicit || existing ? { status } : {}), ...(existing ? { previousStatus: existing.status || 'sale' } : {}) };
       // Duplicate check and successful JSONL append are inside the same lock.
       // Record failures release the lock and leave the click retryable.
       await record(payload);
       try { await onRecorded({ ...payload, click }); }
       catch (error) { onDeliveryError(error); }
-      return { ok: true };
+      if (existing) return { ok: true, status, updated: true };
+      return explicit ? { ok: true, status } : { ok: true };
     });
   };
 }

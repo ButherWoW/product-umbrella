@@ -27,7 +27,7 @@ test('mirror keeps click before conversion while independent clicks run concurre
   release(); await draining;
   assert.equal(calls.length, 3);
   assert.ok(calls[2].sql.includes('INTO conversions'));
-  assert.deepEqual(calls[2].values, ['first', 0, 'USD', at]);
+  assert.deepEqual(calls[2].values, ['first', 0, 'USD', 'sale', at], 'no status in the event = sale');
   assert.equal(calls[0].values.at(-1), at, 'mirror preserves source event timestamp');
 });
 

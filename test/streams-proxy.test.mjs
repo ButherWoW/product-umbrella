@@ -213,3 +213,33 @@ test('GeoIP: country streams, campaign geo filter and country stats', { timeout:
     assert.equal(s.byCountry.US.clicks, 1);
   });
 });
+
+test('postback statuses: lead → sale → rejected, duplicates, aliases, amounts carried over', { timeout: 15000 }, async (t) => {
+  await withServer(t, {}, async ({ url, hit }) => {
+    const pb = (q) => fetch(`${url}/postback?secret=conversion-test-secret&${q}`);
+    const cid = new URL((await hit('/r/demo/offer-1')).headers.get('location')).searchParams.get('click_id');
+    const stats = async () => (await fetch(url + '/stats?campaign=demo')).json();
+
+    const lead = await pb(`click_id=${cid}&status=pending&revenue=20&currency=EUR`);
+    assert.deepEqual(await lead.json(), { ok: true, status: 'lead' }, 'alias pending → lead');
+    let s = await stats();
+    assert.deepEqual([s.conversions, s.leads, s.sales, s.revenue, s.pendingRevenue], [1, 1, 0, 0, 20], 'lead is pending revenue, not revenue');
+    assert.equal((await pb(`click_id=${cid}&status=lead`)).status, 409, 'same status again is a duplicate');
+
+    const sale = await pb(`click_id=${cid}&status=approved`);
+    assert.deepEqual(await sale.json(), { ok: true, status: 'sale', updated: true });
+    s = await stats();
+    assert.deepEqual([s.conversions, s.leads, s.sales, s.revenue, s.pendingRevenue], [1, 0, 1, 20, 0], 'amount carried over from the lead');
+
+    assert.equal((await pb(`click_id=${cid}&status=chargeback`)).status, 200);
+    s = await stats();
+    assert.deepEqual([s.conversions, s.rejected, s.revenue], [0, 1, 0], 'rejected is neither a conversion nor revenue');
+    assert.equal((await pb(`click_id=${cid}&status=maybe`)).status, 400);
+
+    const cid2 = new URL((await hit('/r/demo/offer-1')).headers.get('location')).searchParams.get('click_id');
+    assert.deepEqual(await (await pb(`click_id=${cid2}&revenue=7`)).json(), { ok: true }, 'no status = sale, response unchanged');
+    assert.equal((await stats()).revenue, 7);
+    const log = (await (await fetch(url + '/api/conversions?campaign=demo&limit=10')).json()).conversions;
+    assert.ok(log.some((c) => c.clickId === cid && c.status === 'rejected'));
+  });
+});

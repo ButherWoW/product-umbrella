@@ -7,7 +7,7 @@ import { db, query, closeDb } from './db.js';
 import { reportFromRows, reportFromEvents, metrics } from './stats-report.js';
 import { createUserStore, readCookie, SESSION_TTL_MS } from './auth.js';
 import { readEventLog } from './event-logs.js';
-import { createConversionRecorder, hasRecordedConversion } from './conversion-recorder.js';
+import { createConversionRecorder, hasRecordedConversion, findRecordedConversion } from './conversion-recorder.js';
 import { createEventMirror } from './event-mirror.js';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -222,7 +222,7 @@ function parseParamMap(raw) {
   return out;
 }
 
-const MACRO_RE = new RegExp(`\\{(click_id|subid|campaign|offer_id|device|country|revenue|currency|cost|lp_click_url|${TRACK_FIELDS.join('|')})\\}`, 'g');
+const MACRO_RE = new RegExp(`\\{(click_id|subid|campaign|offer_id|device|country|revenue|currency|status|cost|lp_click_url|${TRACK_FIELDS.join('|')})\\}`, 'g');
 // Values are URL-encoded: they come from visitors' query strings and must not inject extra parameters.
 function applyMacros(template, vars) {
   return template.replace(MACRO_RE, (_, k) => encodeURIComponent(vars[k] ?? ''));
@@ -337,12 +337,24 @@ async function isDuplicateClick(campaign, ip, windowMinutes) {
 }
 
 // Sum revenue from conversions today for a campaign. Non-fatal — returns 0 on error.
+// Conversions with statuses: a click's latest conversion event wins. Events written before statuses existed are sales.
+// "Conversions" = lead + sale; revenue counts only sales (lead amounts are pending revenue).
+function latestConversions(lines) {
+  const latest = new Map();
+  for (const item of lines) if (item?.type === 'conversion') latest.set(item.clickId, item);
+  return latest;
+}
+const conversionCounts = (cv) => ['lead', 'sale'].includes(cv?.status || 'sale');
+const saleRevenue = (cv) => ((cv?.status || 'sale') === 'sale' ? Number(cv.revenue) || 0 : 0);
+const SQL_CONVERSIONS = "COUNT(cv.click_id) FILTER (WHERE cv.status IN ('lead', 'sale'))";
+const SQL_REVENUE = "COALESCE(SUM(cv.revenue) FILTER (WHERE cv.status = 'sale'), 0)";
+
 async function todayRevenue(campaign) {
   const today = new Date().toISOString().slice(0, 10);
   if (db) {
     try {
       const { rows } = await db.query(
-        `SELECT COALESCE(SUM(cv.revenue),0)::float AS rev
+        `SELECT ${SQL_REVENUE}::float AS rev
          FROM conversions cv
          JOIN clicks c USING (click_id)
          WHERE c.campaign = $1 AND cv.created_at >= $2`,
@@ -358,9 +370,9 @@ async function todayRevenue(campaign) {
       lines.filter((item) => item.type === 'click' && item.campaign === campaign && Date.parse(item.at) >= todayMs)
            .map((item) => item.clickId),
     );
-    return lines
-      .filter((item) => item.type === 'conversion' && clickIds.has(item.clickId))
-      .reduce((sum, item) => sum + (item.revenue != null ? Number(item.revenue) || 0 : 0), 0);
+    return [...latestConversions(lines).values()]
+      .filter((item) => clickIds.has(item.clickId))
+      .reduce((sum, item) => sum + saleRevenue(item), 0);
   } catch { return 0; }
 }
 
@@ -504,8 +516,13 @@ async function stats({ campaign = null, from = null, to = null, subid = null, co
           c.landing_id,
           COUNT(c.lp_clicked_at)::int             AS lp_clicks,
           COUNT(c.click_id)::int                  AS clicks,
-          COUNT(cv.click_id)::int                 AS conversions,
-          COALESCE(SUM(cv.revenue), 0)::float     AS revenue,
+          ${SQL_CONVERSIONS}::int                 AS conversions,
+          ${SQL_REVENUE}::float                   AS revenue,
+          COUNT(cv.click_id) FILTER (WHERE cv.status = 'lead')::int     AS leads,
+          COUNT(cv.click_id) FILTER (WHERE cv.status = 'sale')::int     AS sales,
+          COUNT(cv.click_id) FILTER (WHERE cv.status = 'rejected')::int AS rejected,
+          COUNT(cv.click_id) FILTER (WHERE cv.status = 'trash')::int    AS trash,
+          COALESCE(SUM(cv.revenue) FILTER (WHERE cv.status = 'lead'), 0)::float AS pending_revenue,
           COALESCE(SUM(c.cost), 0)::float         AS cost
         FROM clicks c
         LEFT JOIN conversions cv USING (click_id)
@@ -536,7 +553,7 @@ async function stats({ campaign = null, from = null, to = null, subid = null, co
       return true;
     });
     const visibleClickIds = new Set(clicks.map((c) => c.clickId));
-    const conversions = lines.filter((item) => item.type === 'conversion' && visibleClickIds.has(item.clickId));
+    const conversions = [...latestConversions(lines).values()].filter((item) => visibleClickIds.has(item.clickId));
     const lpClicked = new Set(lines.filter((item) => item.type === 'lp_click').map((item) => item.clickId));
     return reportFromEvents(clicks.map((c) => (lpClicked.has(c.clickId) ? { ...c, lpClicked: true } : c)), conversions);
   } catch (error) {
@@ -554,8 +571,8 @@ async function paramReport({ field, campaign, from, to }) {
       if (from) { values.push(`${from}T00:00:00Z`); conditions.push(`c.created_at >= $${values.length}`); }
       if (to) { values.push(`${to}T23:59:59Z`); conditions.push(`c.created_at <= $${values.length}`); }
       const { rows } = await db.query(`
-        SELECT COALESCE(c.params->>$1, '') AS value, COUNT(c.click_id)::int AS clicks, COUNT(cv.click_id)::int AS conversions,
-          COALESCE(SUM(cv.revenue), 0)::float AS revenue, COALESCE(SUM(c.cost), 0)::float AS cost
+        SELECT COALESCE(c.params->>$1, '') AS value, COUNT(c.click_id)::int AS clicks, ${SQL_CONVERSIONS}::int AS conversions,
+          ${SQL_REVENUE}::float AS revenue, COALESCE(SUM(c.cost), 0)::float AS cost
         FROM clicks c LEFT JOIN conversions cv USING (click_id)
         ${conditions.length ? 'WHERE ' + conditions.join(' AND ') : ''}
         GROUP BY 1 ORDER BY clicks DESC LIMIT 500`, values);
@@ -567,7 +584,7 @@ async function paramReport({ field, campaign, from, to }) {
   catch (error) { if (error.code !== 'ENOENT') throw error; }
   const fromMs = from ? Date.parse(`${from}T00:00:00Z`) : null;
   const toMs = to ? Date.parse(`${to}T23:59:59Z`) : null;
-  const conv = new Map(lines.filter((i) => i.type === 'conversion').map((i) => [i.clickId, i]));
+  const conv = latestConversions(lines);
   const groups = new Map();
   for (const click of lines) {
     if (click.type !== 'click' || (campaign && click.campaign !== campaign)) continue;
@@ -577,7 +594,7 @@ async function paramReport({ field, campaign, from, to }) {
     const g = groups.get(key) || { value: key, clicks: 0, conversions: 0, revenue: 0, cost: 0 };
     const cv = conv.get(click.clickId);
     g.clicks += 1; g.cost += Number(click.cost) || 0;
-    if (cv) { g.conversions += 1; g.revenue += Number(cv.revenue) || 0; }
+    if (cv && conversionCounts(cv)) { g.conversions += 1; g.revenue += saleRevenue(cv); }
     groups.set(key, g);
   }
   return [...groups.values()].sort((a, b) => b.clicks - a.clicks).slice(0, 500).map(metrics);
@@ -663,12 +680,14 @@ const recordPostback = createConversionRecorder({
   findClick: getClickData,
   hasConversion: (clickId) => hasRecordedConversion({ clickId, eventsFile, db,
     onFallback: (error) => console.warn('[db] hasConversion fallback:', error.message) }),
+  currentConversion: (clickId) => findRecordedConversion({ clickId, eventsFile, db,
+    onFallback: (error) => console.warn('[db] currentConversion fallback:', error.message) }),
   windowDaysForClick: (click) => campaigns.get(click.campaign)?.conversionWindowDays,
   record: (payload) => event('conversion', payload),
-  onRecorded: ({ click, clickId, revenue, currency }) => {
+  onRecorded: ({ click, clickId, revenue, currency, status }) => {
     const offer = offers.get(click.offerId);
     if (!offer?.postbackUrl) return;
-    const s2sUrl = applyMacros(offer.postbackUrl, { click_id: clickId, revenue: revenue ?? '', currency: currency ?? '' });
+    const s2sUrl = applyMacros(offer.postbackUrl, { click_id: clickId, revenue: revenue ?? '', currency: currency ?? '', status: status || 'sale' });
     fetch(s2sUrl, { signal: AbortSignal.timeout(10000) })
       .then(async (response) => {
         await response.body?.cancel();
@@ -1033,7 +1052,7 @@ const server = http.createServer(async (req, res) => {
       if (postbackSecret && url.searchParams.get('secret') !== postbackSecret) return json(res, 401, { error: 'invalid_postback_secret' });
       try {
         const result = await recordPostback({ clickId: url.searchParams.get('click_id'),
-          revenue: url.searchParams.get('revenue'), currency: url.searchParams.get('currency') });
+          revenue: url.searchParams.get('revenue'), currency: url.searchParams.get('currency'), status: url.searchParams.get('status') });
         return json(res, 200, result);
       } catch (error) {
         if (!error.statusCode) throw error;
@@ -1216,8 +1235,8 @@ const server = http.createServer(async (req, res) => {
             SELECT
               DATE_TRUNC('${trunc}', c.created_at) AS bucket,
               COUNT(c.click_id)::int                AS clicks,
-              COUNT(cv.click_id)::int               AS conversions,
-              COALESCE(SUM(cv.revenue), 0)::float   AS revenue
+              ${SQL_CONVERSIONS}::int               AS conversions,
+              ${SQL_REVENUE}::float                 AS revenue
             FROM clicks c
             LEFT JOIN conversions cv USING (click_id)
             ${where}
@@ -1240,7 +1259,7 @@ const server = http.createServer(async (req, res) => {
           return true;
         });
         const visibleClickIds = new Set(clicks.map((c) => c.clickId));
-        const convs = lines.filter((item) => item.type === 'conversion' && visibleClickIds.has(item.clickId));
+        const convs = [...latestConversions(lines).values()].filter((item) => visibleClickIds.has(item.clickId) && conversionCounts(item));
         const clickBucket = new Map(clicks.map((c) => [c.clickId, (c.at || '').slice(0, granularity === 'hour' ? 13 : 10)]));
         const buckets = {};
         for (const click of clicks) {
@@ -1253,7 +1272,7 @@ const server = http.createServer(async (req, res) => {
           if (!b) continue;
           buckets[b] ||= { clicks: 0, conversions: 0, revenue: 0 };
           buckets[b].conversions += 1;
-          buckets[b].revenue += conv.revenue != null ? Number(conv.revenue) || 0 : 0;
+          buckets[b].revenue += saleRevenue(conv);
         }
         const series = Object.entries(buckets).sort(([a], [b]) => a.localeCompare(b)).map(([date, v]) => ({ date, ...v }));
         return json(res, 200, { granularity, series });

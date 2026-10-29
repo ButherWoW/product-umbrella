@@ -1,5 +1,13 @@
 # Product Umbrella — handoff для Claude
 
+## @claude-code 2026-10-30 — DONE: статусы конверсий (lead / sale / rejected / trash)
+
+- `conversion-recorder.js`: `normalizeStatus` (синонимы партнёрок), `findRecordedConversion`, опция `currentConversion`; другой статус → обновление (`{ ok, status, updated: true }`), тот же → 409. GPT: без `status` поведение и ответ `{ ok: true }` прежние — твои тесты recorder/http не менял
+- `stats-report.js`: leads/sales/rejected/trash/pendingRevenue; conversions = lead+sale, revenue = sale. Последнее событие клика побеждает
+- server.js: `latestConversions()` + `SQL_CONVERSIONS`/`SQL_REVENUE` во всех агрегатах (stats, timeseries, /stats/params, todayRevenue) — раньше JSONL суммировал каждое событие конверсии
+- `event-mirror.js`: UPSERT конверсии со статусом. ИЗМЕНЁН твой тест `event-mirror.test.mjs`: в значениях INSERT теперь есть status ('sale' по умолчанию) перед created_at
+- PG: `conversions.status` (DEFAULT 'sale'), `updated_at`
+- /admin: скрытые колонки Лиды/Продажи/Отклонённые/Доход (ожидаемый), статус в логе конверсий, шаблон постбэка с `&status={status}`
 ## @claude-code 2026-10-30 — DONE: GeoIP на проде
 
 - Зависимость `@maxmind/geoip2-node@7.1.0` (точная версия), база DB-IP Country Lite (CC BY 4.0) скачивается деплоем в `/opt/umbrella/geo/country.mmdb`, обновление раз в 30 дней, `GEOIP_DB` в .env. `/health` → `geo: true`

@@ -21,9 +21,11 @@ export function createEventMirror({ query, onError = () => {} }) {
         // First landing click wins; repeats keep the original time.
         await query('UPDATE clicks SET lp_clicked_at = COALESCE(lp_clicked_at, $2) WHERE click_id = $1', [payload.clickId, at]);
       } else {
-        await query(`INSERT INTO conversions (click_id, revenue, currency, created_at)
-          VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING`,
-        [payload.clickId, payload.revenue ?? null, payload.currency ?? null, at]);
+        // Status updates (lead → sale → rejected) overwrite the row; the keyed lock keeps journal order.
+        await query(`INSERT INTO conversions (click_id, revenue, currency, status, created_at)
+          VALUES ($1,$2,$3,$4,$5) ON CONFLICT (click_id) DO UPDATE
+          SET revenue = EXCLUDED.revenue, currency = EXCLUDED.currency, status = EXCLUDED.status, updated_at = now()`,
+        [payload.clickId, payload.revenue ?? null, payload.currency ?? null, payload.status || 'sale', at]);
       }
     }).catch((error) => { onError(type, error); });
     // A logging callback must not cause an unhandled rejected mirror promise.
