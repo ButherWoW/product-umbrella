@@ -229,6 +229,13 @@ test('ISP: provider stored on click, data-center traffic counted as bots when en
     await hit('/r/demo/offer-1', AWS);
     const isp = await (await fetch(url + '/stats/params?field=isp&campaign=demo')).json();
     assert.match(isp.rows[0].value, /amazon/i, 'ISP recorded when the option is off');
+    await post('/api/offers', { id: 'aws-offer', url: 'https://aws.example.net/' });
+    await post('/api/campaigns', { id: 'isp-flow', name: 'ISP', streams: [
+      { name: 'aws', conditions: { isps: ['AMAZON'] }, offers: [{ offerId: 'aws-offer' }] },
+      { name: 'rest', type: 'fallback', offers: [{ offerId: 'offer-1' }] },
+    ] });
+    assert.equal(new URL((await hit('/r/isp-flow', AWS)).headers.get('location')).host, 'aws.example.net', 'ISP condition, case-insensitive');
+    assert.equal(new URL((await hit('/r/isp-flow', HOME)).headers.get('location')).host, 'example.com');
   });
 });
 

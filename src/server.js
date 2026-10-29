@@ -131,6 +131,8 @@ function parseConditions(raw = {}) {
     os: parseList(raw.os, lower, (o) => ['android', 'ios', 'windows', 'macos', 'linux', 'other'].includes(o)),
     browsers: parseList(raw.browsers, lower, (b) => ['chrome', 'safari', 'firefox', 'edge', 'opera', 'samsung', 'other'].includes(b)),
     languages: parseList(raw.languages, (l) => String(l).toLowerCase().slice(0, 2), (l) => /^[a-z]{2}$/.test(l)),
+    // Provider name fragments, e.g. "orange", "free mobile"; matched case-insensitively against the visitor's ISP.
+    isps: parseList(raw.isps, (i) => String(i).trim().toLowerCase().slice(0, 40), (i) => i.length >= 2).slice(0, 50),
     ...(raw.mode === 'or' ? { mode: 'or' } : {}),
     ...scheduleConditions(raw),
   };
@@ -215,6 +217,8 @@ function streamMatches(stream, visitor) {
     [c.days, local.day], [c.hours, local.hour]]
     .filter(([values]) => values?.length)
     .map(([values, actual]) => values.includes(actual));
+  // Unknown ISP (no GEOIP_ASN_DB) never matches, like an unknown country.
+  if (c.isps?.length) checks.push(Boolean(visitor.isp) && c.isps.some((i) => visitor.isp.toLowerCase().includes(i)));
   if (!checks.length) return true;
   return c.mode === 'or' ? checks.some(Boolean) : checks.every(Boolean);
 }
@@ -268,7 +272,8 @@ function detectBrowser(ua) {
 function visitorProfile(req) {
   const ua = req.headers['user-agent'] || '';
   const lang = String(req.headers['accept-language'] || '').trim().slice(0, 2).toLowerCase();
-  return { device: detectDevice(ua), os: detectOS(ua), browser: detectBrowser(ua), language: /^[a-z]{2}$/.test(lang) ? lang : null, country: lookupCountry(clientIp(req)) };
+  return { device: detectDevice(ua), os: detectOS(ua), browser: detectBrowser(ua), language: /^[a-z]{2}$/.test(lang) ? lang : null, country: lookupCountry(clientIp(req)),
+    isp: lookupAsn(normalizeIp(clientIp(req)))?.isp || null };
 }
 
 // Replace known macros in URL templates (offer URLs and S2S postback URLs).

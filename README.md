@@ -63,7 +63,7 @@ Tracking URL принимает `utm_source`, `utm_medium`, `utm_campaign`, `utm
 ]}
 ```
 
-Порядок выбора: первый подходящий `forced` → взвешенный выбор среди подходящих `regular` → первый подходящий `fallback`; ничего не подошло — `404 no_matching_stream`. Условия: `countries`, `devices` (mobile/tablet/desktop), `os` (android/ios/windows/macos/linux/other), `browsers` (chrome/safari/firefox/edge/opera/samsung/other), `languages` (2 буквы из Accept-Language). Без `GEOIP_DB` страна неизвестна, и поток с `countries` не срабатывает. Имя выбранного потока пишется в клик (`stream`).
+Порядок выбора: первый подходящий `forced` → взвешенный выбор среди подходящих `regular` → первый подходящий `fallback`; ничего не подошло — `404 no_matching_stream`. Условия: `countries`, `devices` (mobile/tablet/desktop), `os` (android/ios/windows/macos/linux/other), `browsers` (chrome/safari/firefox/edge/opera/samsung/other), `languages` (2 буквы из Accept-Language), `isps` (часть названия провайдера без учёта регистра, нужна база `GEOIP_ASN_DB`). Без `GEOIP_DB` страна неизвестна, и поток с `countries` не срабатывает. Имя выбранного потока пишется в клик (`stream`).
 
 Дополнительные поля потока (как в Keitaro):
 
