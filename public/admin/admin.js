@@ -624,7 +624,45 @@ async function pageCampaigns() {
     const n = table.selected().length;
     put(bulk, n ? [h('span', { class: 'muted' }, `Выбрано: ${n}`),
       h('button', { class: 'btn', onclick: () => setActive(table.selected(), true) }, 'Включить'),
-      h('button', { class: 'btn', onclick: () => setActive(table.selected(), false) }, 'Выключить')] : []);
+      h('button', { class: 'btn', onclick: () => setActive(table.selected(), false) }, 'Выключить'),
+      n === 2 ? h('button', { class: 'btn', onclick: () => compareModal(table.selected()) }, 'Сравнить') : null] : []);
+  }
+  async function compareModal(ids) {
+    const [id1, id2] = ids;
+    const { from, to } = periodRange();
+    try {
+      const [s1, s2] = await Promise.all([api('/stats' + qs({ campaign: id1, from, to })), api('/stats' + qs({ campaign: id2, from, to }))]);
+      const n1 = state.campaigns[id1]?.name || id1, n2 = state.campaigns[id2]?.name || id2;
+      const p1 = (s1.revenue || 0) - (s1.cost || 0), p2 = (s2.revenue || 0) - (s2.cost || 0);
+      const mrows = [
+        ['Клики', s1.clicks || 0, s2.clicks || 0, num, false],
+        ['Уник. клики', s1.uniqueClicks || 0, s2.uniqueClicks || 0, num, false],
+        ['Конверсии', s1.conversions || 0, s2.conversions || 0, num, false],
+        ['CR', ratio(s1.conversions, s1.clicks), ratio(s2.conversions, s2.clicks), pct, false],
+        ['Доход', s1.revenue || 0, s2.revenue || 0, money, false],
+        ['Расход', s1.cost || 0, s2.cost || 0, money, true],
+        ['Прибыль', p1, p2, money, false],
+        ['ROI', ratio(p1, s1.cost || 0), ratio(p2, s2.cost || 0), pct, false],
+        ['EPC', ratio(s1.revenue, s1.clicks), ratio(s2.revenue, s2.clicks), money4, false],
+      ];
+      const diffCell = (v1, v2, fmt, lb) => {
+        if (v1 == null || v2 == null) return h('td', {}, '—');
+        const abs = v2 - v1, sign = abs >= 0 ? '+' : '';
+        const rel = v1 !== 0 ? abs / Math.abs(v1) : null;
+        const cls = abs === 0 ? '' : ((abs > 0) !== lb ? 'pos' : 'neg');
+        return h('td', { class: cls }, `${sign}${fmt(abs)}${rel != null ? ` (${sign}${pct(rel)})` : ''}`);
+      };
+      let close;
+      close = openModal({
+        title: 'Сравнение кампаний',
+        body: h('div', { style: 'overflow-x:auto' },
+          h('table', { class: 'grid', style: 'width:100%' },
+            h('thead', {}, h('tr', {}, h('th', {}, 'Метрика'), h('th', {}, n1), h('th', {}, n2), h('th', {}, 'Разница'))),
+            h('tbody', {}, ...mrows.map(([label, v1, v2, fmt, lb]) =>
+              h('tr', {}, h('td', {}, label), h('td', {}, v1 != null ? fmt(v1) : '—'), h('td', {}, v2 != null ? fmt(v2) : '—'), diffCell(v1, v2, fmt, lb)))))),
+        footer: [h('button', { class: 'btn', onclick: () => close() }, 'Закрыть')],
+      });
+    } catch (e) { toast('Ошибка сравнения: ' + e.message, true); }
   }
   async function setActive(ids, active) {
     try {
