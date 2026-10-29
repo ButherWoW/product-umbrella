@@ -588,7 +588,8 @@ function shareModal(current, onSaved) {
 
 async function pageCampaigns() {
   const stateFilter = h('select', { class: 'select', 'aria-label': 'Состояние', onchange: () => load() },
-    [['', 'Все состояния'], ['active', 'Активные'], ['inactive', 'Неактивные'], ['clicks', 'С кликами']].map(([v, l]) => h('option', { value: v }, l)));
+    [['', 'Все состояния'], ['active', 'Активные'], ['inactive', 'Неактивные'], ['clicks', 'С кликами'], ['archived', 'Архив']].map(([v, l]) => h('option', { value: v }, l)));
+  const groupSel = groupFilter(() => load());
   const bulk = h('span', { class: 'toolbar', style: 'margin:0' });
   const table = dataTable({
     id: 'campaigns', selectable: true, pageSize: 250,
@@ -602,6 +603,7 @@ async function pageCampaigns() {
         h('a', { href: '#/reports' + qs({ group: 'stream', campaign: r.id }), title: 'Отчёт', 'aria-label': 'Отчёт' }, '▥'),
         h('a', { href: '#/clicks' + qs({ campaign: r.id }), title: 'Лог кликов', 'aria-label': 'Лог кликов' }, '☰'),
         h('button', { title: r.active ? 'Выключить' : 'Включить', 'aria-label': r.active ? 'Выключить' : 'Включить', onclick: () => setActive([r.id], !r.active) }, r.active ? '⏸' : '▶')) },
+      { key: 'group', label: 'Группа', value: (r) => r.group || '', render: (r) => r.group || '—' },
       { key: 'owner', label: 'Баер', hidden: !isOwnerView(), value: (r) => (r.ownerId ? userEmail(r.ownerId) : '—') },
       { key: 'streams', label: 'Потоки', num: true, render: (r) => h('a', { href: '#/campaigns/' + encodeURIComponent(r.id) }, r.streams), total: (rs) => num(sum(rs, 'streams')) },
       ...metricCols(),
@@ -631,17 +633,20 @@ async function pageCampaigns() {
   }
   put(view, 
     h('div', { class: 'toolbar' }, h('a', { class: 'btn primary', href: '#/campaigns/new' }, 'Создать'), bulk),
-    h('div', { class: 'toolbar' }, stateFilter, periodControl(() => load()), currencyControl(() => load()),
+    h('div', { class: 'toolbar' }, stateFilter, groupSel, periodControl(() => load()), currencyControl(() => load()),
       h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'),
       h('button', { class: 'btn square', title: 'Колонки', 'aria-label': 'Колонки', onclick: () => table.chooser() }, '⚙')),
     table);
   async function load() {
     try {
       await loadRefs();
+      groupSel.refresh(state.campaigns);
       const [s, bots] = await Promise.all([api('/stats' + qs(periodRange())), api('/stats/bots' + qs(periodRange())).catch(() => ({ total: 0, byCampaign: {} }))]);
       let rows = Object.entries(state.campaigns).map(([id, c]) => ({ id, ...c, name: c.name || id, streams: (c.streams || []).length,
         clicks: s.byCampaign[id]?.clicks || 0, uniqueClicks: s.byCampaign[id]?.uniqueClicks || 0, cost: s.byCampaign[id]?.cost || 0, conversions: s.byCampaign[id]?.conversions || 0, revenue: s.byCampaign[id]?.revenue || 0, leads: s.byCampaign[id]?.leads || 0, sales: s.byCampaign[id]?.sales || 0, rejected: s.byCampaign[id]?.rejected || 0, pendingRevenue: s.byCampaign[id]?.pendingRevenue || 0, bots: bots.byCampaign[id] || 0 }));
       const f = stateFilter.value;
+      rows = rows.filter((r) => (f === 'archived') === Boolean(r.archived));
+      if (groupSel.value) rows = rows.filter((r) => (r.group || '') === groupSel.value);
       if (f === 'active') rows = rows.filter((r) => r.active);
       if (f === 'inactive') rows = rows.filter((r) => !r.active);
       if (f === 'clicks') rows = rows.filter((r) => r.clicks > 0);
@@ -668,6 +673,24 @@ function checkGroup(options, values, onChange) {
 }
 const field = (label, control, hint) => h('label', { class: 'field' }, h('span', {}, label), control, hint ? h('span', { class: 'hint' }, hint) : null);
 const intOrNull = (v) => (v === '' || v === null ? null : Number.isInteger(Number(v)) ? Number(v) : NaN);
+// Groups of campaigns/offers: free text up to 60 chars; existing values feed the datalist and the «Все группы» filter.
+const groupsOf = (items) => [...new Set(Object.values(items || {}).map((x) => x.group || '').filter(Boolean))].sort((a, b) => a.localeCompare(b, 'ru'));
+let groupListSeq = 0;
+function groupInput(items, value, onInput) {
+  const listId = 'group-list-' + (++groupListSeq);
+  return h('span', {}, h('input', { class: 'input', value: value || '', maxlength: 60, list: listId, placeholder: 'без группы', 'aria-label': 'Группа', oninput: (e) => onInput(e.target.value) }),
+    h('datalist', { id: listId }, groupsOf(items).map((g) => h('option', { value: g }))));
+}
+function groupFilter(onChange) {
+  const sel = h('select', { class: 'select', 'aria-label': 'Фильтр по группе', onchange: onChange });
+  sel.refresh = (items) => {
+    const cur = sel.value; const groups = groupsOf(items);
+    put(sel, h('option', { value: '' }, 'Все группы'), groups.map((g) => h('option', { value: g }, g)));
+    sel.value = groups.includes(cur) ? cur : '';
+  };
+  sel.refresh({});
+  return sel;
+}
 
 const TIME_ZONES = ['Europe/Paris', 'Europe/Berlin', 'Europe/London', 'Europe/Madrid', 'Europe/Rome', 'Europe/Warsaw', 'Europe/Kyiv', 'Europe/Moscow', 'Asia/Dubai', 'Asia/Bahrain', 'America/New_York', 'America/Chicago', 'America/Los_Angeles', 'UTC'];
 function parseHours(text) {
@@ -830,6 +853,7 @@ async function pageCampaignEditor(id) {
         field('Состояние', h('div', { class: 'radios' },
           h('label', {}, h('input', { type: 'radio', name: 'cstate', checked: d.active, onchange: () => { d.active = true; mark(); } }), 'Включена'),
           h('label', {}, h('input', { type: 'radio', name: 'cstate', checked: !d.active, onchange: () => { d.active = false; mark(); } }), 'Выключена'))),
+        field('Группа', groupInput(state.campaigns, d.group, (v) => { d.group = v; mark(); }), 'Для фильтра «Все группы» в списке кампаний. Можно выбрать существующую или ввести новую.'),
         isOwnerView() ? field('Баер', h('select', { class: 'select', onchange: (e) => { d.ownerId = e.target.value || null; mark(); } },
           h('option', { value: '' }, 'Не назначен'), state.users.map((u) => h('option', { value: u.id, selected: d.ownerId === u.id }, `${u.email}${u.role === 'owner' ? ' (владелец)' : ''}`))),
           'Баер видит и правит только свои кампании; его заработок считается по ним.') : null,
@@ -936,7 +960,7 @@ async function pageCampaignEditor(id) {
     for (const k of ['dailyCap', 'totalCap', 'conversionWindowDays']) if (Number.isNaN(d[k]) || (d[k] !== null && d[k] < 1)) { err.textContent = 'Капы и окно конверсии — целые числа больше нуля.'; return; }
     const names = d.streams.map((s) => s.name);
     if (new Set(names).size !== names.length) { err.textContent = 'Названия потоков должны различаться — по ним строится статистика.'; return; }
-    const body = { name: d.name.trim(), active: d.active, streams: d.streams, dailyCap: d.dailyCap, totalCap: d.totalCap, revenueCap: d.revenueCap, capUrl: d.capUrl, geoCapUrl: d.geoCapUrl,
+    const body = { name: d.name.trim(), group: (d.group || '').trim(), active: d.active, streams: d.streams, dailyCap: d.dailyCap, totalCap: d.totalCap, revenueCap: d.revenueCap, capUrl: d.capUrl, geoCapUrl: d.geoCapUrl,
       allowGeos: d.allowGeos, allowDevices: d.allowDevices, allowOS: d.allowOS, allowBrowsers: d.allowBrowsers, blockedIps: d.blockedIps, allowedIps: d.allowedIps,
       dedupeWindow: d.dedupeWindow || 0, botFilter: d.botFilter, datacenterAsBot: Boolean(d.datacenterAsBot), conversionWindowDays: d.conversionWindowDays, redirectMethod: d.redirectMethod || 'http', domain: d.domain || null, uniquenessHours: d.uniquenessHours ?? 24, streamRotation: d.streamRotation || 'weight', ...(isOwnerView() ? { ownerId: d.ownerId || null } : {}), paramMap: d.paramMap || {}, costModel: d.costModel || 'none', cpc: d.cpc, costFromParam: d.costFromParam || false, sourceId: d.sourceId || null };
     saveBtn.disabled = true;
@@ -1063,9 +1087,9 @@ async function pageSources() {
 
 function offerModal(id, onSaved) {
   const isNew = !id;
-  const o = isNew ? { id: '', name: '', url: '', postbackUrl: '', dailyCap: '', conversionCap: '', capTz: 'UTC', altOfferId: '' }
+  const o = isNew ? { id: '', name: '', url: '', postbackUrl: '', dailyCap: '', conversionCap: '', capTz: 'UTC', altOfferId: '', group: '' }
     : { id, ...state.offers[id], name: state.offers[id].name || '', postbackUrl: state.offers[id].postbackUrl || '', dailyCap: state.offers[id].dailyCap ?? '',
-      conversionCap: state.offers[id].conversionCap ?? '', capTz: state.offers[id].capTz || 'UTC', altOfferId: state.offers[id].altOfferId || '' };
+      conversionCap: state.offers[id].conversionCap ?? '', capTz: state.offers[id].capTz || 'UTC', altOfferId: state.offers[id].altOfferId || '', group: state.offers[id].group || '' };
   const zones = TIME_ZONES.includes(o.capTz) ? ['UTC', ...TIME_ZONES.filter((z) => z !== 'UTC')] : [o.capTz, 'UTC', ...TIME_ZONES.filter((z) => z !== 'UTC')];
   const others = Object.keys(state.offers || {}).filter((k) => k !== id && (!state.offers[k].archived || k === o.altOfferId)).sort();
   const err = h('p', { class: 'err' });
@@ -1073,6 +1097,7 @@ function offerModal(id, onSaved) {
     ['Основные', () => h('div', {},
       field('ID оффера', h('input', { class: 'input', value: o.id, readonly: !isNew, oninput: (e) => { o.id = e.target.value.trim(); } }), isNew ? 'Латиница, цифры, - и _.' : null),
       field('Название', h('input', { class: 'input', value: o.name, maxlength: 200, oninput: (e) => { o.name = e.target.value; } })),
+      field('Группа', groupInput(state.offers, o.group, (v) => { o.group = v; }), 'Можно выбрать существующую или ввести новую.'),
       field('URL', h('input', { class: 'input', type: 'url', value: o.url, placeholder: 'https://…', oninput: (e) => { o.url = e.target.value.trim(); } }), 'Макросы: {click_id} {subid} {campaign} {offer_id} {device} {country}. Если {click_id} нет — click_id добавится параметром.'))],
     ['Настройки', () => h('div', {},
       field('Дневной кап кликов', h('input', { class: 'input', type: 'number', min: 1, value: o.dailyCap, placeholder: 'нет', oninput: (e) => { o.dailyCap = e.target.value; } }), 'Считается по всем кампаниям; в потоках капнутый оффер пропускается.'),
@@ -1097,7 +1122,7 @@ function offerModal(id, onSaved) {
       if (Number.isNaN(convCap) || (convCap !== null && convCap < 1)) { err.textContent = 'Кап конверсий — целое число больше нуля.'; return; }
       if (isNew && state.offers[o.id]) { err.textContent = 'Оффер с таким ID уже есть.'; return; }
       try {
-        const body2 = { name: o.name.trim() || null, url: o.url, postbackUrl: o.postbackUrl || null, dailyCap: cap, conversionCap: convCap, capTz: o.capTz, altOfferId: o.altOfferId || null };
+        const body2 = { name: o.name.trim() || null, group: o.group.trim(), url: o.url, postbackUrl: o.postbackUrl || null, dailyCap: cap, conversionCap: convCap, capTz: o.capTz, altOfferId: o.altOfferId || null };
         await (isNew ? api('/api/offers', { method: 'POST', body: { id: o.id, ...body2 } }) : api('/api/offers/' + encodeURIComponent(o.id), { method: 'PATCH', body: body2 }));
         toast(isNew ? 'Оффер создан' : 'Сохранено'); close(); onSaved();
       } catch (e) { err.textContent = 'Не сохранено: ' + e.message; }
@@ -1188,8 +1213,13 @@ async function pageNetworks() {
 }
 
 async function pageOffers() {
+  const stateFilter = h('select', { class: 'select', 'aria-label': 'Состояние', onchange: () => { table.clearSelection(); drawBulk(); load(); } },
+    [['', 'Все состояния'], ['clicks', 'С кликами'], ['archived', 'Архив']].map(([v, l]) => h('option', { value: v }, l)));
+  const groupSel = groupFilter(() => load());
+  const bulk = h('span', { class: 'toolbar', style: 'margin:0' });
+  const bulkErrors = h('div');
   const table = dataTable({
-    id: 'offers', pageSize: 250,
+    id: 'offers', selectable: true, pageSize: 250,
     columns: [
       { key: 'id', label: 'ID', fixed: true, render: (r) => h('a', { href: '#/offers', onclick: (e) => { e.preventDefault(); offerModal(r.id, load); } }, r.id) },
       { key: 'menu', label: '', title: 'Меню', sortable: false, value: () => '', render: (r) => h('span', { class: 'row-actions' },
@@ -1197,6 +1227,7 @@ async function pageOffers() {
         h('a', { href: '#/reports' + qs({ group: 'country', offer: r.id }), title: 'Отчёт', 'aria-label': 'Отчёт' }, '▥'),
         h('a', { href: '#/clicks' + qs({ offer: r.id }), title: 'Лог кликов', 'aria-label': 'Лог кликов' }, '☰')) },
       { key: 'name', label: 'Название', cls: 'name', value: (r) => r.name || '', render: (r) => h('span', { title: r.name || '' }, r.name || '—') },
+      { key: 'group', label: 'Группа', value: (r) => r.group || '', render: (r) => r.group || '—' },
       { key: 'url', label: 'URL', cls: 'name', hidden: true, render: (r) => h('span', { title: r.url }, r.url) },
       { key: 's2s', label: 'S2S', value: (r) => (r.postbackUrl ? 'да' : 'нет') },
       { key: 'dailyCap', label: 'Дневной кап', num: true, render: (r) => r.dailyCap ?? '—' },
@@ -1204,17 +1235,73 @@ async function pageOffers() {
       ...metricCols(),
     ],
   });
-  put(view, 
-    h('div', { class: 'toolbar' }, h('button', { class: 'btn primary', onclick: () => offerModal(null, load) }, 'Создать')),
-    h('div', { class: 'toolbar' }, periodControl(() => load()), currencyControl(() => load()),
+  table.addEventListener('selection', () => drawBulk());
+  function drawBulk() {
+    const ids = table.selected();
+    const inArchive = stateFilter.value === 'archived';
+    put(bulk, ids.length ? [h('span', { class: 'muted' }, `Выбрано: ${ids.length}`),
+      // Archiving asks for a second click on the same button instead of confirm().
+      h('button', { class: 'btn', onclick: (e) => {
+        const b = e.currentTarget;
+        if (b.dataset.armed) return bulkPatch(ids, { archived: !inArchive }, inArchive ? 'Восстановлено' : 'В архиве');
+        b.dataset.armed = '1'; b.textContent = `${inArchive ? 'Восстановить' : 'В архив'} ${ids.length}? Нажмите ещё раз`;
+        setTimeout(() => { if (b.isConnected) { delete b.dataset.armed; b.textContent = inArchive ? 'Из архива' : 'В архив'; } }, 4000);
+      } }, inArchive ? 'Из архива' : 'В архив'),
+      h('button', { class: 'btn', onclick: () => capModal(ids) }, 'Задать дневной кап…'),
+      h('button', { class: 'btn', onclick: () => bulkGroupModal(ids) }, 'Сменить группу…')] : []);
+  }
+  // PATCH every selected offer; successes are applied, failures are listed per offer under the toolbar.
+  async function bulkPatch(ids, body, label) {
+    const results = await Promise.allSettled(ids.map((id) => api('/api/offers/' + encodeURIComponent(id), { method: 'PATCH', body })));
+    const failed = results.map((r, i) => [ids[i], r]).filter(([, r]) => r.status === 'rejected');
+    put(bulkErrors, failed.length ? h('div', { class: 'err', role: 'alert' }, `Не применено к ${failed.length} из ${ids.length}:`,
+      h('ul', {}, failed.map(([id, r]) => h('li', {}, `${id}: ${r.reason?.message || 'ошибка'}`)))) : []);
+    if (ids.length > failed.length) toast(`${label}: ${ids.length - failed.length}`);
+    else toast('Не применено ни к одному офферу', true);
+    table.clearSelection(); drawBulk(); load();
+    return failed.length === 0;
+  }
+  function capModal(ids) {
+    const input = h('input', { class: 'input', type: 'number', min: 1, placeholder: 'пусто — без капа', 'aria-label': 'Дневной кап кликов' });
+    const err = h('p', { class: 'err' });
+    const close = openModal({
+      title: 'Дневной кап для офферов',
+      body: h('div', {}, h('p', { class: 'muted' }, `Выбрано офферов: ${ids.length}`), field('Дневной кап кликов', input, 'Пустое поле снимает кап.'), err),
+      footer: [h('button', { class: 'btn', onclick: () => close() }, 'Отмена'), h('button', { class: 'btn primary', onclick: async () => {
+        const cap = intOrNull(input.value.trim());
+        if (Number.isNaN(cap) || (cap !== null && cap < 1)) { err.textContent = 'Дневной кап — целое число больше нуля.'; return; }
+        close(); await bulkPatch(ids, { dailyCap: cap }, 'Кап задан');
+      } }, 'Применить')],
+    });
+  }
+  function bulkGroupModal(ids) {
+    let group = '';
+    const close = openModal({
+      title: 'Группа для офферов',
+      body: h('div', {}, h('p', { class: 'muted' }, `Выбрано офферов: ${ids.length}`), field('Группа', groupInput(state.offers, '', (v) => { group = v; }), 'Пустое поле убирает группу.')),
+      footer: [h('button', { class: 'btn', onclick: () => close() }, 'Отмена'), h('button', { class: 'btn primary', onclick: async () => {
+        close(); await bulkPatch(ids, { group: group.trim() }, 'Группа изменена');
+      } }, 'Применить')],
+    });
+  }
+  put(view,
+    h('div', { class: 'toolbar' }, h('button', { class: 'btn primary', onclick: () => offerModal(null, load) }, 'Создать'), bulk),
+    bulkErrors,
+    h('div', { class: 'toolbar' }, stateFilter, groupSel, periodControl(() => load()), currencyControl(() => load()),
       h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'),
       h('button', { class: 'btn square', title: 'Колонки', 'aria-label': 'Колонки', onclick: () => table.chooser() }, '⚙')),
     table);
   async function load() {
     try {
       await loadRefs();
+      groupSel.refresh(state.offers);
       const s = await api('/stats' + qs(periodRange()));
-      table.setRows(Object.entries(state.offers).map(([id, o]) => ({ id, ...o, clicks: s.byOffer[id]?.clicks || 0, uniqueClicks: s.byOffer[id]?.uniqueClicks || 0, cost: s.byOffer[id]?.cost || 0, conversions: s.byOffer[id]?.conversions || 0, revenue: s.byOffer[id]?.revenue || 0, leads: s.byOffer[id]?.leads || 0, sales: s.byOffer[id]?.sales || 0, rejected: s.byOffer[id]?.rejected || 0, pendingRevenue: s.byOffer[id]?.pendingRevenue || 0 })));
+      const f = stateFilter.value;
+      let rows = Object.entries(state.offers).map(([id, o]) => ({ id, ...o, clicks: s.byOffer[id]?.clicks || 0, uniqueClicks: s.byOffer[id]?.uniqueClicks || 0, cost: s.byOffer[id]?.cost || 0, conversions: s.byOffer[id]?.conversions || 0, revenue: s.byOffer[id]?.revenue || 0, leads: s.byOffer[id]?.leads || 0, sales: s.byOffer[id]?.sales || 0, rejected: s.byOffer[id]?.rejected || 0, pendingRevenue: s.byOffer[id]?.pendingRevenue || 0 }));
+      rows = rows.filter((r) => (f === 'archived') === Boolean(r.archived));
+      if (groupSel.value) rows = rows.filter((r) => (r.group || '') === groupSel.value);
+      if (f === 'clicks') rows = rows.filter((r) => r.clicks > 0);
+      table.setRows(rows);
     } catch (e) { toast('Ошибка загрузки офферов: ' + e.message, true); }
   }
   load();

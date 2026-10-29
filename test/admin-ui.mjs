@@ -416,6 +416,95 @@ try {
   assert.ok(await page.getByRole('checkbox', { name: 'Сравнить с предыдущим периодом' }).isDisabled(), 'compare disabled for day grouping');
   await page.evaluate(() => localStorage.removeItem('umbrella:reports:compare'));
 
+  // Task 7: groups of campaigns and offers (editor + offer modal with datalist, «Группа» column and filter), archive hidden by default.
+  await page.setViewportSize({ width: 1280, height: 900 });
+  const t7Stream = [{ name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] }];
+  await api('/api/campaigns', { id: 't7-camp-a', name: 'T7 Camp A', group: 'T7-old', streams: t7Stream });
+  await api('/api/campaigns', { id: 't7-camp-b', name: 'T7 Camp B', streams: t7Stream });
+  for (const id of ['t10-o1', 't10-o2', 't10-o3']) await api('/api/offers', { id, url: `https://example.com/${id}`, group: 'T10' });
+  await page.goto(server.url + '/admin#/campaigns/t7-camp-b');
+  await page.reload(); // the key from earlier steps was lost on reload; enter it explicitly
+  await page.locator('#token-btn').click();
+  const t7Key = page.getByRole('dialog', { name: 'Ключ администратора' });
+  await t7Key.locator('input[type=password]').fill(TOKEN);
+  await t7Key.getByRole('button', { name: 'Сохранить' }).click();
+  const t7GroupInput = page.locator('.editor').getByRole('combobox', { name: 'Группа' });
+  await t7GroupInput.waitFor();
+  const t7Datalist = await t7GroupInput.evaluate((el) => [...el.list.options].map((o) => o.value));
+  assert.ok(t7Datalist.includes('T7-old'), `campaign datalist offers existing groups, got: ${t7Datalist}`);
+  await t7GroupInput.fill('T7-new');
+  await page.locator('.editor-head .btn.primary').click();
+  await page.locator('#toast', { hasText: 'Сохранено' }).waitFor();
+  assert.equal((await (await fetch(server.url + '/api/campaigns')).json()).campaigns['t7-camp-b'].group, 'T7-new', 'campaign group saved from the editor');
+  await page.goto(server.url + '/admin#/campaigns');
+  await page.locator('table.grid tbody tr', { hasText: 'T7 Camp B' }).filter({ hasText: 'T7-new' }).waitFor();
+  const campGroupSel = page.getByLabel('Фильтр по группе');
+  await campGroupSel.locator('option[value="T7-new"]').waitFor({ state: 'attached' });
+  await campGroupSel.selectOption('T7-new');
+  await page.locator('table.grid tbody tr', { hasText: 'T7 Camp A' }).waitFor({ state: 'detached' });
+  assert.deepEqual(await page.locator('table.grid tbody tr td:nth-child(3)').allInnerTexts(), ['t7-camp-b'], 'group filter leaves only the campaigns of that group');
+  await campGroupSel.selectOption('');
+  await api('/api/campaigns/t7-camp-a', { archived: true }, 'PATCH');
+  await page.getByRole('button', { name: 'Обновить', exact: true }).click();
+  await page.locator('table.grid tbody tr', { hasText: 'T7 Camp B' }).waitFor();
+  await page.locator('table.grid tbody tr', { hasText: 'T7 Camp A' }).waitFor({ state: 'detached' });
+  await page.getByLabel('Состояние').selectOption('archived');
+  await page.locator('table.grid tbody tr', { hasText: 'T7 Camp A' }).waitFor();
+  assert.equal(await page.locator('table.grid tbody tr', { hasText: 'T7 Camp B' }).count(), 0, 'archive view shows only archived campaigns');
+  // Offer modal: group field with existing groups, value sent on save.
+  await page.goto(server.url + '/admin#/offers');
+  await page.locator('table.grid tbody tr', { hasText: 't10-o3' }).getByRole('button', { name: 'Изменить' }).click();
+  const t7OfferDlg = page.getByRole('dialog', { name: 'Редактирование оффера' });
+  const t7OfferGroup = t7OfferDlg.getByRole('combobox', { name: 'Группа' });
+  assert.equal(await t7OfferGroup.inputValue(), 'T10');
+  assert.ok((await t7OfferGroup.evaluate((el) => [...el.list.options].map((o) => o.value))).includes('T10'), 'offer datalist offers existing groups');
+  await t7OfferGroup.fill('T10-solo');
+  await t7OfferDlg.getByRole('button', { name: 'Сохранить' }).click();
+  await t7OfferDlg.waitFor({ state: 'detached' });
+  assert.equal((await (await fetch(server.url + '/api/offers')).json()).offers['t10-o3'].group, 'T10-solo', 'offer group saved from the modal');
+
+  // Task 10: bulk actions with selected offers — daily cap, group, archive (with in-page confirmation).
+  const offerRow = (id) => page.locator('table.grid tbody tr').filter({ has: page.getByRole('link', { name: id, exact: true }) });
+  const offersGroupSel = page.getByLabel('Фильтр по группе');
+  await offersGroupSel.locator('option[value="T10"]').waitFor({ state: 'attached' });
+  await offersGroupSel.selectOption('T10');
+  await offerRow('t10-o3').waitFor({ state: 'detached' });
+  assert.equal(await page.locator('table.grid tbody tr').count(), 2, 'offers group filter leaves the two T10 offers');
+  const selectT10 = async () => { for (const id of ['t10-o1', 't10-o2']) await offerRow(id).getByRole('checkbox', { name: 'Выбрать' }).check(); };
+  await selectT10();
+  await page.getByRole('button', { name: 'Задать дневной кап…' }).click();
+  const capDlg = page.getByRole('dialog', { name: 'Дневной кап для офферов' });
+  await capDlg.getByLabel('Дневной кап кликов').fill('7');
+  await capDlg.getByRole('button', { name: 'Применить' }).click();
+  await page.locator('#toast', { hasText: 'Кап задан: 2' }).waitFor();
+  let t10Offers = (await (await fetch(server.url + '/api/offers')).json()).offers;
+  assert.deepEqual([t10Offers['t10-o1'].dailyCap, t10Offers['t10-o2'].dailyCap, t10Offers['t10-o3'].dailyCap], [7, 7, null], 'bulk cap applied to the selected offers only');
+  await selectT10();
+  await page.getByRole('button', { name: 'Сменить группу…' }).click();
+  const grpDlg = page.getByRole('dialog', { name: 'Группа для офферов' });
+  await grpDlg.getByRole('combobox', { name: 'Группа' }).fill('T10-bulk');
+  await grpDlg.getByRole('button', { name: 'Применить' }).click();
+  await page.locator('#toast', { hasText: 'Группа изменена: 2' }).waitFor();
+  t10Offers = (await (await fetch(server.url + '/api/offers')).json()).offers;
+  assert.deepEqual([t10Offers['t10-o1'].group, t10Offers['t10-o2'].group], ['T10-bulk', 'T10-bulk']);
+  await offersGroupSel.locator('option[value="T10-bulk"]').waitFor({ state: 'attached' });
+  await offersGroupSel.selectOption('T10-bulk');
+  await offerRow('t10-o3').waitFor({ state: 'detached' });
+  await selectT10();
+  await page.getByRole('button', { name: 'В архив', exact: true }).click();
+  assert.ok(!(await t10OffersArchived()), 'first click only asks for confirmation');
+  await page.getByRole('button', { name: /В архив 2\? Нажмите ещё раз/ }).click();
+  await page.locator('#toast', { hasText: 'В архиве: 2' }).waitFor();
+  await offerRow('t10-o1').waitFor({ state: 'detached' });
+  assert.equal(await offerRow('t10-o2').count(), 0, 'archived offers are hidden from the list');
+  assert.ok(await t10OffersArchived(), 'bulk archive stored');
+  await page.getByLabel('Состояние').selectOption('archived');
+  await offerRow('t10-o1').waitFor();
+  await offerRow('t10-o2').waitFor();
+  assert.equal(await page.locator('#view .err[role=alert]').count(), 0, 'no per-offer errors');
+  assert.ok(!(await page.locator('body').innerText()).includes('[object'), 'no stringified DOM nodes on offers page');
+  async function t10OffersArchived() { const o = (await (await fetch(server.url + '/api/offers')).json()).offers; return o['t10-o1'].archived && o['t10-o2'].archived; }
+
   assert.deepEqual(errors, []);
   console.log('Admin UI browser test passed');
 } finally {
