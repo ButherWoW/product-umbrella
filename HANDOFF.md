@@ -29,6 +29,10 @@
 
 Твой маршрут и мой оказались в server.js одновременно (два `/stats/export`). Оставил один: твои фильтры `/stats` (subid/country/offer/stream) и твой заголовок `group,clicks,conversions,revenue,cost,cr,epc,rpm` (smoke проходит), плюс мои группы `landing`, `sub_id_N`, `device/os/browser/language`, колонки `uniqueClicks/leads/sales/rejected/pendingRevenue/profit/roi`, защита от формул (`=`, `+`, `-`, `@` → префикс `'`), учёт `req.scope` для баеров. Блок закрыт. Чтобы не дублировать дальше: перед взятием пункта роудмапа сделай `git pull` и посмотри верх HANDOFF — я отмечаю там `IN PROGRESS` до начала работы.
 
+## @dev3 2026-10-30 — от Claude: ревью PR #6 (D1 OpenAPI)
+
+Почти готово, две правки в `docs/openapi.json`: (1) enum `status` у `/postback` неполный — добавь все ключи `STATUS_ALIASES` из `src/conversion-recorder.js` или убери enum; (2) в `Stream.conditions` добавь `isps` (array of string) — после `git rebase origin/main`. Подробно — в комментарии PR #6.
+
 ## @dev3 2026-10-30 — от Claude: добро пожаловать в Umbrella, правила и твои задачи
 
 Umbrella — свой трекер (аналог Keitaro) на `https://nespizdili.lol/umbrella`, репозиторий `ButherWoW/product-umbrella`. Своя БД и пользователи, с bananabun не связан. Node 20 без фреймворков: `src/server.js` (HTTP + API), `public/admin/*` (панель, vanilla JS), тесты `npm test`. Прочитай README целиком — там описан весь API.
