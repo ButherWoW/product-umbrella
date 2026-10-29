@@ -451,16 +451,16 @@ function lineChart(series, buckets) {
   return box;
 }
 
-async function timeseries({ campaign, from, to }) {
+async function timeseries({ campaign, offer, from, to }) {
   const single = from && from === to;
   const gran = single ? 'hour' : 'day';
-  const ts = await api('/stats/timeseries' + qs({ campaign, from, to, granularity: gran }));
+  const ts = await api('/stats/timeseries' + qs({ campaign, offer, from, to, granularity: gran }));
   const byKey = new Map(ts.series.map((p) => [String(p.date ?? p.bucket ?? '').slice(0, single ? 13 : 10), p]));
   let keys = [];
   if (single) keys = Array.from({ length: 24 }, (_, i) => `${from}T${String(i).padStart(2, '0')}`);
   else if (from && to) { for (let d = new Date(from + 'T00:00:00Z'); d <= new Date(to + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + 1)) keys.push(d.toISOString().slice(0, 10)); }
   else keys = [...byKey.keys()].sort();
-  return keys.map((k) => ({ key: k, label: single ? k.slice(11) + ':00' : k.slice(5).split('-').reverse().join('.'), clicks: byKey.get(k)?.clicks || 0, conversions: byKey.get(k)?.conversions || 0, revenue: byKey.get(k)?.revenue || 0 }));
+  return keys.map((k) => { const p = byKey.get(k); return { key: k, label: single ? k.slice(11) + ':00' : k.slice(5).split('-').reverse().join('.'), clicks: p?.clicks || 0, uniqueClicks: p?.uniqueClicks || 0, conversions: p?.conversions || 0, revenue: p?.revenue || 0, cost: p?.cost || 0 }; });
 }
 
 // ---------- pages ----------
@@ -474,7 +474,7 @@ async function pageDashboard() {
     const { from, to } = periodRange();
     const campaign = campSel.value || null;
     try {
-      const [s, series, recent, team, bots] = await Promise.all([api('/stats' + qs({ from, to, campaign })), timeseries({ campaign, from, to }), api('/api/clicks' + qs({ from, to, campaign, limit: 10 })).catch(() => ({ clicks: [] })), api('/api/settings').catch(() => ({ buyerSharePct: 35 })), api('/stats/bots' + qs({ from, to, campaign })).catch(() => ({ total: 0, byCampaign: {} }))]);
+      const [s, series, recent, team, botsData] = await Promise.all([api('/stats' + qs({ from, to, campaign })), timeseries({ campaign, from, to }), api('/api/clicks' + qs({ from, to, campaign, limit: 10 })).catch(() => ({ clicks: [] })), api('/api/settings').catch(() => ({ buyerSharePct: 35 })), api('/api/bots' + qs({ from, to, campaign, limit: 1000 })).catch(() => ({ bots: [] }))]);
       const sharePct = Number(team.buyerSharePct) || 0;
       const profit = (s.revenue || 0) - (s.cost || 0);
       // The buyer earns a share of positive net profit; a loss means 0, not a negative payout.
@@ -489,17 +489,23 @@ async function pageDashboard() {
         columns: [{ key: 'id', label: title, fixed: true, cls: 'name', render: (r) => (link ? h('a', { href: link(r) }, nameOf(r)) : nameOf(r)) },
           ...metricCols().filter((c) => ['clicks', 'conversions', 'cr', 'revenue'].includes(c.key))],
       }));
+      const top5 = (id, title, rows, nameOf, link) => h('div', { class: 'card' }, h('h2', {}, title), dataTable({ id: 'dash-t5-' + id, pageSize: 5, compact: true, totals: false, rows: [...rows].sort((a, b) => b.revenue - a.revenue).slice(0, 5), columns: [{ key: 'id', label: 'Название', fixed: true, cls: 'name', render: (r) => h('a', { href: link(r) }, nameOf(r)) }, ...metricCols().filter((c) => ['clicks', 'conversions', 'revenue', 'roi'].includes(c.key))] }));
       put(body, 
         h('div', { class: 'kpis' }, kpi('Клики', num(s.clicks), 'var(--k1)'), kpi('Уник. клики', num(s.uniqueClicks), 'var(--k2)'), kpi('Конверсии', num(s.conversions), 'var(--k3)'), kpi('CR', pct(ratio(s.conversions, s.clicks)), 'var(--k2)'),
           kpi('Доход', money(s.revenue), 'var(--k5)'), kpi('Расход', money(s.cost || 0), 'var(--k4)'), kpi('Прибыль', h('span', { class: profit >= 0 ? '' : 'neg' }, money(profit)), 'var(--k8)'), kpi('ROI', pct(ratio(profit, s.cost || 0)), 'var(--k9)'), earningsTile,
           kpi('EPC', money4(ratio(s.revenue, s.clicks)), 'var(--k6)'), kpi('RPM', money(ratio(s.revenue * 1000, s.clicks)), 'var(--k7)'),
-          bots.total > 0 ? kpi('Боты', num(bots.total), 'var(--bad)') : null),
+          botsData.bots?.length > 0 ? h('a', { href: '#/botlog' + (campaign ? qs({ campaign }) : ''), style: 'text-decoration:none' },
+            h('div', { class: 'kpi', style: 'background:var(--bad)' }, h('div', { class: 'k' }, 'Боты'), h('div', { class: 'v' }, botsData.bots.length >= 1000 ? '1000+' : num(botsData.bots.length)))) : null),
         ratesNote(),
         h('div', { class: 'card', style: 'margin-bottom:14px' }, lineChart([
           { key: 'clicks', label: 'Клики', color: '#4d86f0', values: series.map((p) => p.clicks) },
           { key: 'conversions', label: 'Конв.', color: '#e0496a', values: series.map((p) => p.conversions) },
           { key: 'revenue', label: 'Доход', color: '#e8913f', right: true, values: series.map((p) => p.revenue) },
         ], series)),
+        h('div', { class: 'grid-2', style: 'margin-bottom:14px' },
+          top5('camp', 'Топ кампаний', groupRows(s.byCampaign), (r) => state.campaigns[r.id]?.name || r.id, (r) => '#/reports' + qs({ group: 'stream', campaign: r.id })),
+          top5('offer', 'Топ офферов', groupRows(s.byOffer), (r) => r.id, (r) => '#/reports' + qs({ group: 'country', offer: r.id })),
+          top5('geo', 'Топ стран', groupRows(s.byCountry), (r) => r.id, (r) => '#/reports' + qs({ group: 'campaign', country: r.id }))),
         isOwnerView() ? h('div', { class: 'card', style: 'margin-bottom:14px' }, h('h2', {}, 'Баеры'), dataTable({
           id: 'dash-buyers', compact: true, pageSize: 50,
           rows: Object.values(Object.entries(s.byCampaign || {}).reduce((acc, [cid, v]) => {
@@ -1193,7 +1199,7 @@ async function pageReports(params) {
   const PARAM_FIELDS = ['keyword', 'source', 'external_id', 'creative_id', 'ad_campaign_id', ...Array.from({ length: 30 }, (_, i) => `sub_id_${i + 1}`)];
   const paramSel = h('select', { class: 'select', 'aria-label': 'Параметр', onchange: (e) => { f.field = e.target.value; drawPresets(); load(); } },
     h('option', { value: '' }, 'Параметр'), PARAM_FIELDS.map((n) => h('option', { value: n, selected: f.field === n }, n)));
-  const drawPresets = () => put(presets, GROUPS.map(([k, l]) => h('button', { class: 'chip-btn' + (f.group === k && !f.field ? ' on' : ''), onclick: () => { f.group = k; f.field = ''; paramSel.value = ''; drawPresets(); load(); } }, l)));
+  const drawPresets = () => put(presets, [...GROUPS.map(([k, l]) => h('button', { class: 'chip-btn' + (f.group === k && !f.field ? ' on' : ''), onclick: () => { f.group = k; f.field = ''; paramSel.value = ''; drawPresets(); load(); } }, l)), h('button', { class: 'chip-btn' + (f.group === 'heatmap' ? ' on' : ''), onclick: () => { f.group = 'heatmap'; f.field = ''; paramSel.value = ''; drawPresets(); load(); } }, 'Карта по часам')]);
   drawPresets();
 
   // Saved reports
@@ -1245,10 +1251,59 @@ async function pageReports(params) {
   async function load() {
     sync();
     const { from, to } = periodRange();
+    note.textContent = '';
+    if (f.group === 'heatmap') {
+      table?.detach(); table = null;
+      const tz = store.get('heatmap:tz', 'UTC');
+      const metric = store.get('heatmap:metric', 'clicks');
+      const tzSel = h('select', { class: 'select', 'aria-label': 'Часовой пояс', onchange: (e) => { store.set('heatmap:tz', e.target.value); load(); } },
+        ['UTC', ...TIME_ZONES.filter((z) => z !== 'UTC')].map((z) => h('option', { value: z, selected: z === tz }, z)));
+      const metricSel = h('select', { class: 'select', 'aria-label': 'Метрика тепловой карты', onchange: (e) => { store.set('heatmap:metric', e.target.value); load(); } },
+        [['clicks', 'Клики'], ['conversions', 'Конверсии'], ['cr', 'CR'], ['revenue', 'Доход']].map(([k, l]) => h('option', { value: k, selected: k === metric }, l)));
+      try {
+        const ts = await api('/stats/timeseries' + qs({ campaign: f.campaign, from, to, granularity: 'hour' }));
+        const grid = Array.from({ length: 7 }, () => new Array(24).fill(0));
+        const gConv = Array.from({ length: 7 }, () => new Array(24).fill(0));
+        const gRev = Array.from({ length: 7 }, () => new Array(24).fill(0));
+        const WD_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+        for (const p of ts.series || []) {
+          const d = new Date(p.bucket ?? p.date);
+          const parts = new Intl.DateTimeFormat('en', { timeZone: tz, hour12: false, weekday: 'short', hour: '2-digit' }).formatToParts(d);
+          const wdRaw = WD_SHORT.indexOf(parts.find((x) => x.type === 'weekday')?.value ?? 'Sun');
+          const wd = wdRaw < 0 ? 0 : (wdRaw + 6) % 7; // 0=Mon … 6=Sun
+          const hr = Number(parts.find((x) => x.type === 'hour')?.value ?? 0) % 24;
+          grid[wd][hr] += p.clicks || 0;
+          gConv[wd][hr] += p.conversions || 0;
+          gRev[wd][hr] += p.revenue || 0;
+        }
+        const getVal = (wd, hr) => {
+          if (metric === 'clicks') return grid[wd][hr];
+          if (metric === 'conversions') return gConv[wd][hr];
+          if (metric === 'cr') return (grid[wd][hr] ? gConv[wd][hr] / grid[wd][hr] : 0);
+          if (metric === 'revenue') return gRev[wd][hr];
+          return 0;
+        };
+        const maxVal = Math.max(...Array.from({ length: 7 }, (_, w) => Array.from({ length: 24 }, (_, h2) => getVal(w, h2))).flat(), 1);
+        const fmtVal = (v) => metric === 'revenue' ? money(v) : metric === 'cr' ? pct(v) : num(v);
+        const WD_LABELS = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
+        const heatTable = h('div', { style: 'overflow-x:auto' },
+          h('table', { class: 'heatmap', 'aria-label': 'Тепловая карта по часам', style: 'border-collapse:collapse;min-width:max-content' },
+            h('thead', {}, h('tr', {}, h('th', { style: 'padding:2px 6px' }, ''), ...Array.from({ length: 24 }, (_, hr) => h('th', { style: 'padding:2px 4px;text-align:center;font-size:11px;color:var(--fg-2)' }, String(hr))))),
+            h('tbody', {}, ...WD_LABELS.map((label, wd) =>
+              h('tr', {},
+                h('th', { scope: 'row', style: 'padding:2px 6px;font-size:12px;white-space:nowrap;color:var(--fg-2);font-weight:normal' }, label),
+                ...Array.from({ length: 24 }, (_, hr) => {
+                  const v = getVal(wd, hr);
+                  const op = Math.round(5 + 90 * v / maxVal);
+                  return h('td', { 'data-clicks': String(grid[wd][hr]), title: fmtVal(v), style: `padding:2px 4px;text-align:center;font-size:11px;min-width:28px;background:color-mix(in srgb,var(--k1) ${op}%,transparent)` }, v > 0 ? (metric === 'revenue' ? num(Math.round(v)) : metric === 'cr' ? String(Math.round(v * 100)) + '%' : String(v)) : '');
+                }))))));
+        put(holder, h('div', { class: 'toolbar', style: 'margin-bottom:8px' }, tzSel, metricSel), heatTable);
+      } catch (e) { put(holder, h('p', { class: 'err' }, 'Ошибка тепловой карты: ' + e.message)); }
+      return;
+    }
     const [key, label, prop] = GROUPS.find((g) => g[0] === f.group) || GROUPS[0];
     try {
       let rows; let drill = null;
-      note.textContent = '';
       if (f.field) {
         const s = await api('/stats/params' + qs({ field: f.field, campaign: f.campaign, from, to }));
         rows = (s.rows || []).map((x) => ({ id: x.value || '(не передан)', clicks: x.clicks || 0, conversions: x.conversions || 0, revenue: x.revenue || 0, cost: x.cost || 0, profit: x.profit || 0, roi: x.roi || 0 }));
@@ -1478,6 +1533,139 @@ async function pageUsers() {
   return () => table.detach();
 }
 
+// ---------- trends ----------
+async function pageTrends() {
+  await loadRefs();
+  const COLORS = ['#4d86f0', '#e0496a', '#e8913f', '#3dc98b', '#a25fe0'];
+  const METRICS = [
+    ['clicks', 'Клики', (p) => p.clicks, false],
+    ['uniqueClicks', 'Уник. клики', (p) => p.uniqueClicks, false],
+    ['conversions', 'Конверсии', (p) => p.conversions, false],
+    ['revenue', 'Доход', (p) => p.revenue, true],
+    ['profit', 'Прибыль', (p) => p.revenue - p.cost, true],
+    ['cr', 'CR', (p) => (p.clicks ? p.conversions / p.clicks : 0), false],
+  ];
+  let mode = store.get('trends:mode', 'campaign');
+  let selections = store.get('trends:sel:' + mode, []);
+  let metric = store.get('trends:metric', 'clicks');
+  const selList = h('div', { class: 'toolbar trends-sel', style: 'margin:0;flex-wrap:wrap;gap:4px;align-items:center' });
+  function getItems() { return mode === 'campaign' ? state.campaigns : state.offers; }
+  function getLabel(id) { return mode === 'campaign' ? (state.campaigns[id]?.name || id) : id; }
+  function renderSelections() {
+    const items = getItems();
+    selections = selections.filter((id) => id in items);
+    store.set('trends:sel:' + mode, selections);
+    const available = Object.keys(items).filter((id) => !selections.includes(id));
+    put(selList,
+      selections.map((id, i) => h('span', { class: 'trends-tag', style: `--c:${COLORS[i]}` },
+        h('i', { style: `background:${COLORS[i]};width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:4px` }),
+        getLabel(id),
+        h('button', { class: 'icon-btn', style: 'font-size:11px;padding:0 2px', 'aria-label': 'Удалить', onclick: () => { selections.splice(i, 1); renderSelections(); load(); } }, '✕'))),
+      selections.length < 5 && available.length > 0 ?
+        h('select', { class: 'select', 'aria-label': 'Добавить', onchange: (e) => { const v = e.target.value; if (v && !selections.includes(v)) { selections.push(v); renderSelections(); load(); } e.target.value = ''; } },
+          h('option', { value: '' }, '+ Добавить ' + (mode === 'campaign' ? 'кампанию' : 'оффер')),
+          available.map((id) => h('option', { value: id }, getLabel(id)))) : null);
+  }
+  const typeSelect = h('select', { class: 'select', 'aria-label': 'Тип', onchange: () => { mode = typeSelect.value; store.set('trends:mode', mode); selections = store.get('trends:sel:' + mode, []); renderSelections(); load(); } },
+    h('option', { value: 'campaign', selected: mode === 'campaign' }, 'Кампании'), h('option', { value: 'offer', selected: mode === 'offer' }, 'Офферы'));
+  const metricSel = h('select', { class: 'select', 'aria-label': 'Метрика', onchange: () => { metric = metricSel.value; store.set('trends:metric', metric); load(); } },
+    METRICS.map(([key, label]) => h('option', { value: key, selected: key === metric }, label)));
+  const chartHolder = h('div', { class: 'card', style: 'margin-bottom:14px' });
+  const tableHolder = h('div');
+  let tblCleanup = null;
+  renderSelections();
+  put(view,
+    h('div', { class: 'page-head' }, h('h1', {}, 'Тренды')),
+    h('div', { class: 'toolbar' }, typeSelect, selList, metricSel, periodControl(() => load()), currencyControl(() => load()),
+      h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻')),
+    chartHolder, tableHolder);
+  async function load() {
+    if (!selections.length) {
+      put(chartHolder, h('p', { class: 'muted', style: 'padding:16px' }, 'Выберите до 5 ' + (mode === 'campaign' ? 'кампаний' : 'офферов') + ' для сравнения.'));
+      if (tblCleanup) { tblCleanup(); tblCleanup = null; } put(tableHolder, '');
+      return;
+    }
+    const { from, to } = periodRange();
+    put(chartHolder, h('p', { class: 'muted', style: 'padding:16px' }, 'Загрузка…'));
+    try {
+      const allSeries = await Promise.all(selections.map((id) =>
+        timeseries({ campaign: mode === 'campaign' ? id : undefined, offer: mode === 'offer' ? id : undefined, from, to })));
+      const dateSet = new Set(allSeries.flatMap((s) => s.map((p) => p.key)));
+      const dates = [...dateSet].sort();
+      const labelOf = (k) => { const ref = allSeries.flat().find((p) => p.key === k); return ref?.label || k.slice(5).split('-').reverse().join('.'); };
+      const buckets = dates.map((k) => ({ key: k, label: labelOf(k) }));
+      const metricDef = METRICS.find(([k]) => k === metric) || METRICS[0];
+      const metricFn = metricDef[2]; const isRight = metricDef[3];
+      const chartSeries = selections.map((id, i) => {
+        const byDate = new Map(allSeries[i].map((p) => [p.key, p]));
+        return { key: id, label: getLabel(id), color: COLORS[i], right: isRight, values: dates.map((d) => { const p = byDate.get(d); return p ? metricFn(p) : 0; }) };
+      });
+      put(chartHolder, lineChart(chartSeries, buckets));
+      if (tblCleanup) { tblCleanup(); tblCleanup = null; }
+      const tblRows = dates.map((d) => {
+        const row = { id: d };
+        for (let i = 0; i < selections.length; i++) { const p = allSeries[i].find((x) => x.key === d); row['s' + i] = p ? metricFn(p) : 0; }
+        return row;
+      });
+      const fmtVal = isRight ? (v) => money(v) : metric === 'cr' ? (v) => pct(v) : (v) => num(v);
+      const tbl = dataTable({
+        id: 'trends-table', totals: true, rows: tblRows,
+        columns: [
+          { key: 'id', label: 'Дата', fixed: true, render: (r) => h('span', {}, labelOf(r.id)) },
+          ...selections.map((id, i) => ({ key: 's' + i, label: getLabel(id), render: (r) => fmtVal(r['s' + i]) })),
+        ],
+      });
+      tblCleanup = () => tbl.detach();
+      put(tableHolder, tbl);
+    } catch (e) {
+      put(chartHolder, h('p', { class: 'err', style: 'padding:16px' }, 'Ошибка загрузки: ' + e.message));
+    }
+  }
+  load();
+  return () => { if (tblCleanup) tblCleanup(); };
+}
+
+// ---------- bot log ----------
+function pageBotLog(params) {
+  const f = { campaign: params.get('campaign') || '' };
+  const holder = h('div');
+  let table = null;
+  const sel = (key, label, options) => h('select', { class: 'select', 'aria-label': label, onchange: (e) => { f[key] = e.target.value; load(); } },
+    h('option', { value: '' }, label), options.map(([v, l]) => h('option', { value: v, selected: f[key] === v }, l)));
+  const toolbar = h('div', { class: 'toolbar' });
+  put(view, h('h1', {}, 'Лог ботов'), toolbar, holder);
+  const REASONS = { user_agent: 'Бот по User-Agent', datacenter: 'Дата-центр' };
+  const columns = [
+    { key: 'at', label: 'Дата и время', fixed: true, render: (r) => dt(r.at) },
+    { key: 'campaign', label: 'Кампания', cls: 'name', render: (r) => h('a', { href: '#/campaigns/' + encodeURIComponent(r.campaign || '') }, state.campaigns[r.campaign]?.name || r.campaign || '—') },
+    { key: 'reason', label: 'Причина', render: (r) => REASONS[r.reason] || r.reason || 'Бот по User-Agent' },
+    { key: 'isp', label: 'Провайдер' },
+    { key: 'userAgent', label: 'User-Agent', cls: 'name' },
+    { key: 'ip', label: 'IP' },
+    { key: 'offerId', label: 'Оффер', hidden: true },
+    { key: 'stream', label: 'Поток', hidden: true },
+  ];
+  loadRefs().then(() => {
+    put(toolbar,
+      sel('campaign', 'Все кампании', Object.entries(state.campaigns).map(([id, c]) => [id, c.name || id])),
+      periodControl(() => load()),
+      h('button', { class: 'btn square', title: 'Обновить', 'aria-label': 'Обновить', onclick: () => load() }, '↻'),
+      h('button', { class: 'btn square', title: 'Колонки', 'aria-label': 'Колонки', onclick: () => table?.chooser() }, '⚙'));
+    load();
+  });
+  async function load() {
+    const next = '#/botlog' + qs(f);
+    if (location.hash !== next) history.replaceState(null, '', next);
+    try {
+      const r = await api('/api/bots' + qs({ ...f, ...periodRange(), limit: 1000 }));
+      table?.detach();
+      table = dataTable({ id: 'log-botlog', columns, rows: r.bots || [], serverPaging: null, pageSize: 100, empty: 'Ботов за период нет' });
+      put(holder, table);
+    } catch (e) { put(holder, h('p', { class: 'err' }, 'Ошибка загрузки: ' + e.message)); }
+  }
+  return () => table?.detach();
+}
+
 // ---------- router ----------
 let cleanup = null;
 async function route() {
@@ -1502,6 +1690,8 @@ async function route() {
     else if (section === 'landings') cleanup = await pageLandings();
     else if (section === 'reports') cleanup = await pageReports(params);
     else if (section === 'clicks' || section === 'conversions') cleanup = pageLog(section, params);
+    else if (section === 'trends') cleanup = await pageTrends();
+    else if (section === 'botlog') cleanup = pageBotLog(params);
     else if (section === 'sources') cleanup = await pageSources();
     else if (section === 'users') cleanup = await pageUsers();
     else if (section === 'buyers') cleanup = await pageBuyersReport();
