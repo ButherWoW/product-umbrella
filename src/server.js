@@ -19,6 +19,7 @@ const landingsFile = join(dataDir, 'landings.json');
 const settingsFile = join(dataDir, 'settings.json');
 const campaignsFile = join(dataDir, 'campaigns.json');
 const sourcesFile = join(dataDir, 'sources.json');
+const networksFile = join(dataDir, 'networks.json');
 const port = Number(process.env.PORT || 4100);
 // Public path prefix when served behind a proxy under a subpath (nginx strips it before proxying).
 const basePath = /^\/[A-Za-z0-9_-]{1,40}$/.test(process.env.BASE_PATH || '') ? process.env.BASE_PATH : '';
@@ -47,6 +48,7 @@ const SESSION_COOKIE = 'umb_session';
 const loginFailures = new Map();
 const postbackSecret = process.env.POSTBACK_SECRET || '';
 const adminToken = process.env.ADMIN_TOKEN || '';
+const requirePostgres = /^(1|true|yes)$/i.test(process.env.REQUIRE_POSTGRES || '');
 const clickRateLimit = Math.max(0, Number(process.env.CLICK_RATE_LIMIT || 120));
 const clickRateWindowMs = Math.max(1000, Number(process.env.CLICK_RATE_WINDOW_MS || 60000));
 const rateBuckets = new Map();
@@ -243,87 +245,6 @@ function pickStream(streams, visitor = {}, excluded = new Set(), rotation = 'wei
   return { stream, offerId, landingId };
 }
 
-// Traffic simulation (Keitaro «Симуляция трафика»): where would this visitor go and why. Records nothing.
-const CONDITION_LABELS = { countries: 'страна', devices: 'устройство', os: 'ОС', browsers: 'браузер', languages: 'язык', isps: 'провайдер', days: 'день недели', hours: 'час' };
-function explainStream(stream, visitor) {
-  const c = stream.conditions || {};
-  const local = c.days?.length || c.hours?.length ? localDayHour(c.tz || 'UTC', visitor.now || new Date()) : {};
-  const actual = { countries: visitor.country, devices: visitor.device, os: visitor.os, browsers: visitor.browser, languages: visitor.language, isps: visitor.isp, days: local.day, hours: local.hour };
-  const checks = Object.keys(CONDITION_LABELS).filter((k) => c[k]?.length).map((k) => ({
-    condition: CONDITION_LABELS[k], expected: c[k], actual: actual[k] ?? null,
-    ok: k === 'isps' ? Boolean(visitor.isp) && c.isps.some((i) => visitor.isp.toLowerCase().includes(i)) : c[k].includes(actual[k]) }));
-  return { checks, matches: streamMatches(stream, visitor), mode: c.mode === 'or' ? 'or' : 'and' };
-}
-
-async function simulateClick(input, canSee) {
-  const ip = normalizeIp(String(input.ip || '').trim()) || null;
-  const ua = String(input.userAgent || '');
-  const network = ip ? lookupAsn(ip) : null;
-  const lang = String(input.language || '').trim().slice(0, 2).toLowerCase();
-  const at = input.at ? new Date(input.at) : new Date();
-  if (Number.isNaN(at.getTime())) return { error: 'invalid_at' };
-  const visitor = { device: detectDevice(ua), os: detectOS(ua), browser: detectBrowser(ua), language: /^[a-z]{2}$/.test(lang) ? lang : null,
-    country: /^[A-Za-z]{2}$/.test(input.country || '') ? input.country.toUpperCase() : (ip ? lookupCountry(ip) : null),
-    isp: input.isp ? String(input.isp).slice(0, 120) : network?.isp || null, now: at };
-  const query = new URLSearchParams(String(input.query || '').replace(/^\?/, ''));
-  const steps = [];
-  const finish = (result) => ({ visitor: { ...visitor, now: at.toISOString(), datacenter: network?.datacenter ?? null }, steps, result });
-  let campaignId = String(input.campaign || '');
-  const visited = [];
-  for (;;) {
-    const c = campaigns.get(campaignId);
-    if (!c || !canSee(c)) return finish({ outcome: 'error', status: 404, reason: `кампания ${campaignId} не найдена` });
-    const step = { campaign: campaignId, name: c.name, checks: [] };
-    steps.push(step);
-    if (!c.active) step.checks.push({ check: 'кампания включена', ok: false, note: 'на живом трафике будет 404' });
-    if (ip && c.blockedIps?.some((r) => ipMatches(ip, r))) return finish({ outcome: 'blocked', status: 403, reason: 'IP в чёрном списке кампании' });
-    if (ip && c.allowedIps?.length && !c.allowedIps.some((r) => ipMatches(ip, r))) return finish({ outcome: 'blocked', status: 403, reason: 'IP не в белом списке кампании' });
-    if (c.allowDevices?.length && !c.allowDevices.includes(visitor.device)) return finish({ outcome: 'blocked', status: 403, reason: `устройство ${visitor.device} не разрешено кампанией` });
-    if (c.allowOS?.length && !c.allowOS.includes(visitor.os)) return finish({ outcome: 'blocked', status: 403, reason: `ОС ${visitor.os} не разрешена кампанией` });
-    if (c.allowBrowsers?.length && !c.allowBrowsers.includes(visitor.browser)) return finish({ outcome: 'blocked', status: 403, reason: `браузер ${visitor.browser} не разрешён кампанией` });
-    if (c.allowGeos?.length && visitor.country && !c.allowGeos.includes(visitor.country)) {
-      return finish(c.geoCapUrl ? { outcome: 'redirect', status: 302, url: c.geoCapUrl, reason: `страна ${visitor.country} не разрешена → URL для чужого гео` }
-        : { outcome: 'blocked', status: 403, reason: `страна ${visitor.country} не разрешена кампанией` });
-    }
-    const capped = await cappedOffers(c.streams || []);
-    step.streams = (c.streams || []).map((st) => ({ name: st.name, type: st.type || 'regular', enabled: st.enabled !== false, ...explainStream(st, visitor),
-      cappedOffers: (st.offers || []).filter((o) => capped.has(o.offerId)).map((o) => o.offerId) }));
-    const matching = (c.streams || []).filter((st) => st.enabled !== false && streamMatches(st, visitor)
-      && (st.action || (st.offers ? st.offers.some((o) => !capped.has(o.offerId)) : !capped.has(st.offerId))));
-    const typeOf = (st) => st.type || 'regular';
-    const forced = matching.find((st) => typeOf(st) === 'forced');
-    const regular = matching.filter((st) => typeOf(st) === 'regular');
-    let candidates;
-    if (forced) candidates = [{ stream: forced, share: 1 }];
-    else if (regular.length) {
-      if (c.streamRotation === 'position') candidates = [{ stream: regular[0], share: 1 }];
-      else { const total = regular.reduce((t, st) => t + (st.weight || 1), 0); candidates = regular.map((st) => ({ stream: st, share: (st.weight || 1) / total })); }
-    } else { const fb = matching.find((st) => typeOf(st) === 'fallback'); candidates = fb ? [{ stream: fb, share: 1 }] : []; }
-    if (!candidates.length) return finish({ outcome: 'no_stream', status: 404, reason: 'ни один поток не подошёл (no_matching_stream)' });
-    step.chosen = candidates.map(({ stream: st, share }) => ({ stream: st.name, share: Math.round(share * 1000) / 10 }));
-    const top = candidates.sort((a, b) => b.share - a.share)[0].stream;
-    if (top.action === 'campaign') {
-      visited.push(campaignId);
-      if (visited.length > MAX_CAMPAIGN_HOPS || visited.includes(top.campaignId)) return finish({ outcome: 'error', status: 508, reason: 'зацикливание кампаний' });
-      campaignId = top.campaignId;
-      continue;
-    }
-    if (top.action === 'not_found') return finish({ outcome: 'not_found', status: 404, reason: `поток «${top.name}» отвечает 404` });
-    const bot = (c.botFilter && isBot(ua)) || (c.datacenterAsBot && network?.datacenter);
-    const params = {};
-    for (const field of TRACK_FIELDS) { const v = query.get(c.paramMap?.[field] || field); if (v) params[field] = v.slice(0, 255); }
-    const destinations = top.action === 'url' ? [{ url: top.url, share: 100 }]
-      : (() => { const live = (top.offers || [{ offerId: top.offerId, weight: 1 }]).filter((o) => !capped.has(o.offerId)); const total = live.reduce((t, o) => t + (o.weight || 1), 0);
-        return live.map((o) => ({ offerId: o.offerId, share: Math.round((o.weight || 1) / total * 1000) / 10, url: offers.get(o.offerId)?.url || null })); })();
-    const landing = top.landings?.length ? top.landings.map((l) => landings.get(l.landingId)?.url).filter(Boolean)[0] : null;
-    const vars = { ...params, click_id: 'SIMULATION', subid: query.get('subid') || '', campaign: campaignId, device: visitor.device, country: visitor.country || '', cost: '' };
-    return finish({ outcome: bot ? 'bot' : 'click', status: 302, stream: top.name,
-      ...(bot ? { reason: 'User-Agent бота или дата-центр при включённом фильтре' } : {}),
-      ...(landing ? { landing: applyMacros(landing, vars) } : {}),
-      destinations: destinations.map((d) => ({ ...d, url: d.url ? applyMacros(d.url, { ...vars, offer_id: d.offerId || '' }) : null })) });
-  }
-}
-
 const BOT_UA_RE = /bot\b|bot\/|crawl|spider|slurp|facebookexternalhit|headless|phantomjs|selenium|puppeteer|playwright|lighthouse|pingdom|uptimerobot|scrapy|curl\/|wget\/|python-requests|python-urllib|aiohttp|go-http-client|java\/|okhttp|apache-httpclient|libwww-perl/i;
 
 function isBot(ua) {
@@ -439,7 +360,7 @@ async function cappedOffers(streams) {
   const capped = new Set();
   for (const id of ids) {
     const cap = offers.get(id)?.dailyCap;
-    if (cap && await countClicks({ offerId: id, since: todayStart() }) >= cap) capped.add(id);
+    if (offers.get(id)?.archived || (cap && await countClicks({ offerId: id, since: todayStart() }) >= cap)) capped.add(id);
   }
   return capped;
 }
@@ -549,14 +470,15 @@ function parseOffer(raw) {
   const postbackUrl = raw?.postbackUrl && /^https:\/\//i.test(String(raw.postbackUrl)) ? String(raw.postbackUrl).slice(0, 2048) : null;
   const dailyCap = Number.isInteger(raw?.dailyCap) && raw.dailyCap > 0 ? raw.dailyCap : null;
   const name = typeof raw?.name === 'string' && raw.name.trim() ? raw.name.trim().slice(0, 200) : null;
-  return { url: urlStr, postbackUrl, dailyCap, name };
+  const networkId = OFFER_ID_RE.test(String(raw?.networkId || '')) ? String(raw.networkId) : null;
+  return { url: urlStr, postbackUrl, dailyCap, name, networkId, archived: raw?.archived === true, group: typeof raw?.group === 'string' ? raw.group.trim().slice(0, 60) : '' };
 }
 
 async function loadOffers() {
   if (db) {
     try {
-      const { rows } = await db.query('SELECT id, url, postback_url, daily_cap, name FROM offers');
-      for (const row of rows) if (/^[a-z0-9_-]{2,80}$/i.test(row.id) && /^https:\/\//i.test(row.url)) offers.set(row.id, parseOffer({ url: row.url, postbackUrl: row.postback_url, dailyCap: row.daily_cap, name: row.name }));
+      const { rows } = await db.query('SELECT id, url, postback_url, daily_cap, name, network_id, "group", archived FROM offers');
+      for (const row of rows) if (/^[a-z0-9_-]{2,80}$/i.test(row.id) && /^https:\/\//i.test(row.url)) offers.set(row.id, parseOffer({ url: row.url, postbackUrl: row.postback_url, dailyCap: row.daily_cap, name: row.name, networkId: row.network_id, group: row.group, archived: row.archived === true }));
       return;
     } catch (error) { console.warn('[db] offers load fallback:', error.message); }
   }
@@ -577,11 +499,12 @@ async function saveOffers() {
 
 async function persistOffer(id, value) {
   const offer = typeof value === 'string' ? { url: value, postbackUrl: null } : value;
-  if (db) await db.query('INSERT INTO offers (id, url, postback_url, daily_cap, name) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO UPDATE SET url = EXCLUDED.url, postback_url = EXCLUDED.postback_url, daily_cap = EXCLUDED.daily_cap, name = EXCLUDED.name', [id, offer.url, offer.postbackUrl, offer.dailyCap ?? null, offer.name ?? null]);
+  if (db) await db.query('INSERT INTO offers (id, url, postback_url, daily_cap, name, network_id, "group", archived) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (id) DO UPDATE SET url = EXCLUDED.url, postback_url = EXCLUDED.postback_url, daily_cap = EXCLUDED.daily_cap, name = EXCLUDED.name, network_id = EXCLUDED.network_id, "group" = EXCLUDED."group", archived = EXCLUDED.archived', [id, offer.url, offer.postbackUrl, offer.dailyCap ?? null, offer.name ?? null, offer.networkId ?? null, offer.group ?? '', offer.archived === true]);
   else await saveOffers();
 }
 
 const sources = new Map();
+const networks = new Map();
 
 function parseSource(raw) {
   if (!raw || typeof raw !== 'object') return null;
@@ -626,10 +549,24 @@ async function persistSource(id, value) {
   else await saveSources();
 }
 
+function parseNetwork(raw) {
+  const name = typeof raw?.name === 'string' ? raw.name.trim().slice(0, 120) : '';
+  if (!name) return null;
+  return { name, offerParams: typeof raw?.offerParams === 'string' ? raw.offerParams.trim().slice(0, 1000) : '', clickIdParam: typeof raw?.clickIdParam === 'string' ? raw.clickIdParam.trim().slice(0, 80) : 'sub1', payoutParam: typeof raw?.payoutParam === 'string' ? raw.payoutParam.trim().slice(0, 80) : 'payout', notes: typeof raw?.notes === 'string' ? raw.notes.slice(0, 2000) : '' };
+}
+async function loadNetworks() {
+  if (db) { try { const { rows } = await db.query('SELECT id,name,offer_params,click_id_param,payout_param,notes FROM networks'); for (const r of rows) { const n=parseNetwork({name:r.name,offerParams:r.offer_params,clickIdParam:r.click_id_param,payoutParam:r.payout_param,notes:r.notes}); if(n) networks.set(r.id,n); } return; } catch (e) { console.warn('[db] networks load fallback:', e.message); } }
+  try { const saved=JSON.parse(await readFile(networksFile,'utf8')); for (const [id,raw] of Object.entries(saved||{})) if (OFFER_ID_RE.test(id) && parseNetwork(raw)) networks.set(id,parseNetwork(raw)); } catch (e) { if(e.code!=='ENOENT') console.warn('[networks] invalid config ignored'); }
+}
+async function saveNetworks() { await mkdir(dataDir,{recursive:true}); await writeFile(networksFile,JSON.stringify(Object.fromEntries(networks),null,2)+'\n'); }
+async function persistNetwork(id,v) { if(db) await db.query('INSERT INTO networks (id,name,offer_params,click_id_param,payout_param,notes) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,offer_params=EXCLUDED.offer_params,click_id_param=EXCLUDED.click_id_param,payout_param=EXCLUDED.payout_param,notes=EXCLUDED.notes',[id,v.name,v.offerParams,v.clickIdParam,v.payoutParam,v.notes]); else await saveNetworks(); }
+
 function parseCampaign(id, value) {
   return {
     name: String(value.name || id).slice(0, 120),
-    active: value.active !== false,
+    group: typeof value.group === 'string' ? value.group.trim().slice(0, 60) : '',
+    active: value.archived === true ? false : value.active !== false,
+    archived: value.archived === true,
     streams: parseStreams(value.streams),
     dailyCap: Number.isInteger(value.dailyCap) && value.dailyCap > 0 ? value.dailyCap : null,
     capUrl: value.capUrl && /^https:\/\//i.test(String(value.capUrl)) ? String(value.capUrl).slice(0, 2048) : null,
@@ -1384,7 +1321,7 @@ const server = http.createServer(async (req, res) => {
     if (match && req.method === 'GET') {
       const [, campaignId, offerId] = match;
       const offer = offers.get(offerId);
-      if (!offer) return json(res, 404, { error: 'offer_not_found' });
+      if (!offer || offer.archived) return json(res, 404, { error: 'offer_not_found' });
       return await handleClick(campaignId, offerId, offer.url);
     }
     if (url.pathname === '/postback' && req.method === 'GET') {
@@ -1488,11 +1425,6 @@ const server = http.createServer(async (req, res) => {
       await audit(req, 'update', 'settings', 'team', before, settings);
       return json(res, 200, settings);
     }
-    if (url.pathname === '/api/simulate' && req.method === 'POST') {
-      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
-      const result = await simulateClick(await readJson(req), (c) => canEditCampaign(req, c));
-      return json(res, result.error ? 400 : 200, result);
-    }
     if (url.pathname === '/api/audit' && req.method === 'GET') {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const entity = url.searchParams.get('entity') || null;
@@ -1537,7 +1469,8 @@ const server = http.createServer(async (req, res) => {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const body = await readJson(req);
       if (!/^[a-z0-9_-]{2,80}$/i.test(String(body.id || '')) || !/^https:\/\//i.test(String(body.url || ''))) return json(res, 400, { error: 'id_and_https_url_required' });
-      const offer = parseOffer({ url: String(body.url), postbackUrl: body.postbackUrl, dailyCap: body.dailyCap, name: body.name });
+      if (body.networkId !== undefined && body.networkId !== null && !networks.has(String(body.networkId))) return json(res, 400, { error: 'network_not_found' });
+      const offer = parseOffer({ url: String(body.url), postbackUrl: body.postbackUrl, dailyCap: body.dailyCap, name: body.name, networkId: body.networkId, archived: body.archived, group: body.group });
       if (!offer) return json(res, 400, { error: 'id_and_https_url_required' });
       offers.set(String(body.id), offer);
       await persistOffer(String(body.id), offer);
@@ -1545,6 +1478,13 @@ const server = http.createServer(async (req, res) => {
       return json(res, 201, { id: body.id, ...offer });
     }
     const offerUpdate = url.pathname.match(/^\/api\/offers\/([A-Za-z0-9_-]{2,80})$/);
+    const offerClone = url.pathname.match(/^\/api\/offers\/([A-Za-z0-9_-]{2,80})\/clone$/);
+    if (offerClone && req.method === 'POST') {
+      if (!(await adminAuthorized(req))) return json(res,401,{error:'admin_authorization_required'});
+      const id=offerClone[1],cur=offers.get(id); if(!cur) return json(res,404,{error:'offer_not_found'});
+      let nextId=`${id}-copy`, n=2; while(offers.has(nextId)) nextId=`${id}-copy${n++}`;
+      const copy=parseOffer({...cur,name:`${cur.name||id} (копия)`,archived:false}); offers.set(nextId,copy); await persistOffer(nextId,copy); await audit(req,'create','offer',nextId,null,copy); return json(res,201,{id:nextId,...copy});
+    }
     if (offerUpdate && req.method === 'PATCH') {
       const id = offerUpdate[1];
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
@@ -1554,7 +1494,8 @@ const server = http.createServer(async (req, res) => {
       const newUrl = body.url !== undefined ? String(body.url) : cur.url;
       const newPostbackUrl = body.postbackUrl !== undefined ? body.postbackUrl : cur.postbackUrl;
       const newDailyCap = body.dailyCap !== undefined ? body.dailyCap : cur.dailyCap;
-      const updated = parseOffer({ url: newUrl, postbackUrl: newPostbackUrl, dailyCap: newDailyCap, name: body.name !== undefined ? body.name : cur.name });
+      if (body.networkId !== undefined && body.networkId !== null && !networks.has(String(body.networkId))) return json(res, 400, { error: 'network_not_found' });
+      const updated = parseOffer({ url: newUrl, postbackUrl: newPostbackUrl, dailyCap: newDailyCap, name: body.name !== undefined ? body.name : cur.name, networkId: body.networkId !== undefined ? body.networkId : cur.networkId, archived: body.archived !== undefined ? body.archived : cur.archived, group: body.group !== undefined ? body.group : cur.group });
       if (!updated) return json(res, 400, { error: 'invalid_url' });
       offers.set(id, updated);
       await persistOffer(id, updated);
@@ -1590,6 +1531,15 @@ const server = http.createServer(async (req, res) => {
       await persistSource(id, updated);
       return json(res, 200, { id, ...updated });
     }
+    if (url.pathname === '/api/networks' && req.method === 'GET') return json(res, 200, { networks: Object.fromEntries(networks) });
+    if (url.pathname === '/api/networks' && req.method === 'POST') {
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      const body=await readJson(req), id=String(body.id||''), network=parseNetwork(body);
+      if(!OFFER_ID_RE.test(id)) return json(res,400,{error:'valid_id_required'}); if(!network) return json(res,400,{error:'name_required'}); if(networks.has(id)) return json(res,409,{error:'network_exists'});
+      networks.set(id,network); await persistNetwork(id,network); await audit(req,'create','network',id,null,network); return json(res,201,{id,...network});
+    }
+    const networkUpdate=url.pathname.match(/^\/api\/networks\/([A-Za-z0-9_-]{2,80})$/);
+    if(networkUpdate && req.method==='PATCH') { if(!(await adminAuthorized(req))) return json(res,401,{error:'admin_authorization_required'}); const id=networkUpdate[1],cur=networks.get(id); if(!cur) return json(res,404,{error:'network_not_found'}); const next=parseNetwork({...cur,...await readJson(req)}); if(!next) return json(res,400,{error:'name_required'}); networks.set(id,next); await persistNetwork(id,next); await audit(req,'update','network',id,cur,next); return json(res,200,{id,...next}); }
     if (url.pathname === '/api/campaigns' && req.method === 'GET') {
       const allowed = scopeCampaigns(req);
       return json(res, 200, { campaigns: Object.fromEntries([...campaigns].filter(([id]) => !allowed || allowed.includes(id))) });
@@ -1598,25 +1548,38 @@ const server = http.createServer(async (req, res) => {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const body = await readJson(req);
       if (!/^[a-z0-9_-]{2,80}$/i.test(String(body.id || ''))) return json(res, 400, { error: 'valid_id_required' });
+      if (body.sourceId !== undefined && body.sourceId !== null && !sources.has(String(body.sourceId))) return json(res, 400, { error: 'source_not_found' });
       if (campaigns.has(String(body.id)) && !canEditCampaign(req, campaigns.get(String(body.id)))) return json(res, 403, { error: 'campaign_not_yours' });
       // A buyer's new campaign is always theirs; the owner may assign it to someone.
       const ownerId = isBuyer(req) ? req.user.id : (body.ownerId ?? req.user?.id ?? null);
-      campaigns.set(String(body.id), parseCampaign(String(body.id), { ...body, ownerId }));
+      const sourceDefaults = body.sourceId ? sources.get(String(body.sourceId)) : null;
+      campaigns.set(String(body.id), parseCampaign(String(body.id), { ...body, ownerId,
+        ...(sourceDefaults ? { paramMap: body.paramMap ?? sourceDefaults.paramMap, costModel: body.costModel ?? sourceDefaults.costModel, cpc: body.cpc ?? sourceDefaults.cpc, costFromParam: body.costFromParam ?? sourceDefaults.costFromParam } : {}) }));
       await persistCampaign(String(body.id), campaigns.get(String(body.id)));
       await audit(req, 'create', 'campaign', String(body.id), null, campaigns.get(String(body.id)));
       return json(res, 201, { id: body.id, ...campaigns.get(String(body.id)) });
     }
     const campaignUpdate = url.pathname.match(/^\/api\/campaigns\/([A-Za-z0-9_-]{2,80})$/);
+    const campaignClone = url.pathname.match(/^\/api\/campaigns\/([A-Za-z0-9_-]{2,80})\/clone$/);
+    if (campaignClone && req.method === 'POST') {
+      if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
+      const id=campaignClone[1], cur=campaigns.get(id); if(!cur) return json(res,404,{error:'campaign_not_found'}); if(!canEditCampaign(req,cur)) return json(res,403,{error:'campaign_not_yours'});
+      let nextId=`${id}-copy`, n=2; while(campaigns.has(nextId)) nextId=`${id}-copy${n++}`;
+      const copy=parseCampaign(nextId,{...cur,name:`${cur.name} (копия)`,active:false,archived:false}); campaigns.set(nextId,copy); await persistCampaign(nextId,copy); await audit(req,'create','campaign',nextId,null,copy); return json(res,201,{id:nextId,...copy});
+    }
     if (campaignUpdate && req.method === 'PATCH') {
       if (!(await adminAuthorized(req))) return json(res, 401, { error: 'admin_authorization_required' });
       const id = campaignUpdate[1];
       if (!campaigns.has(id)) return json(res, 404, { error: 'campaign_not_found' });
       if (!canEditCampaign(req, campaigns.get(id))) return json(res, 403, { error: 'campaign_not_yours' });
       const body = await readJson(req);
+      if (body.sourceId !== undefined && body.sourceId !== null && !sources.has(String(body.sourceId))) return json(res, 400, { error: 'source_not_found' });
       const cur = campaigns.get(id);
       campaigns.set(id, parseCampaign(id, {
         name: body.name === undefined ? cur.name : body.name,
-        active: body.active === undefined ? cur.active : body.active,
+        group: body.group === undefined ? cur.group : body.group,
+        active: body.archived === true ? false : (body.active === undefined ? cur.active : body.active),
+        archived: body.archived === undefined ? cur.archived : body.archived,
         streams: body.streams === undefined ? cur.streams : body.streams,
         dailyCap: body.dailyCap === undefined ? cur.dailyCap : body.dailyCap,
         capUrl: body.capUrl === undefined ? cur.capUrl : body.capUrl,
@@ -1633,6 +1596,7 @@ const server = http.createServer(async (req, res) => {
         streamRotation: body.streamRotation === undefined ? cur.streamRotation : body.streamRotation,
         uniquenessHours: body.uniquenessHours === undefined ? cur.uniquenessHours : body.uniquenessHours,
         ownerId: body.ownerId === undefined || req.user?.role === 'buyer' ? cur.ownerId : body.ownerId,
+        sourceId: body.sourceId === undefined ? cur.sourceId : body.sourceId,
         redirectMethod: body.redirectMethod === undefined ? cur.redirectMethod : body.redirectMethod,
         blockedIps: body.blockedIps === undefined ? cur.blockedIps : body.blockedIps,
         allowedIps: body.allowedIps === undefined ? cur.allowedIps : body.allowedIps,
@@ -1642,7 +1606,6 @@ const server = http.createServer(async (req, res) => {
         costModel: body.costModel === undefined ? cur.costModel : body.costModel,
         cpc: body.cpc === undefined ? cur.cpc : body.cpc,
         costFromParam: body.costFromParam === undefined ? cur.costFromParam : body.costFromParam,
-        sourceId: body.sourceId === undefined ? cur.sourceId : (OFFER_ID_RE.test(String(body.sourceId || '')) ? String(body.sourceId) : null),
       }));
       await persistCampaign(id, campaigns.get(id));
       await audit(req, 'update', 'campaign', id, cur, campaigns.get(id));
@@ -1782,6 +1745,21 @@ const server = http.createServer(async (req, res) => {
       const pCurrency = reportCurrency(url.searchParams.get('currency'));
       return json(res, 200, { field, currency: pCurrency, rows: await paramReport({ field, campaign: pCampaign, allowed: req.scope?.allowed || null, from: pFrom, to: pTo, currency: pCurrency }) });
     }
+    if (url.pathname === '/stats/bots' && req.method === 'GET') {
+      const campaign = url.searchParams.get('campaign') || null;
+      const from = url.searchParams.get('from') || null; const to = url.searchParams.get('to') || null;
+      if ((from && !/^\d{4}-\d{2}-\d{2}$/.test(from)) || (to && !/^\d{4}-\d{2}-\d{2}$/.test(to))) return json(res, 400, { error: 'invalid_date' });
+      const fromMs = from ? Date.parse(`${from}T00:00:00Z`) : -Infinity; const toMs = to ? Date.parse(`${to}T23:59:59Z`) : Infinity;
+      try {
+        const lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map(JSON.parse);
+        const byCampaign = {};
+        for (const item of lines) if (item.type === 'bot' && (!campaign || item.campaign === campaign) && (!req.scope?.allowed || req.scope.allowed.includes(item.campaign))) {
+          const at = Date.parse(item.at || item.created_at || ''); if (at < fromMs || at > toMs) continue;
+          byCampaign[item.campaign] = (byCampaign[item.campaign] || 0) + 1;
+        }
+        return json(res, 200, { total: Object.values(byCampaign).reduce((a, b) => a + b, 0), byCampaign });
+      } catch (error) { if (error.code === 'ENOENT') return json(res, 200, { total: 0, byCampaign: {} }); throw error; }
+    }
     if (url.pathname === '/stats/paths' && req.method === 'GET') {
       const pathCampaign = url.searchParams.get('campaign') || null;
       const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit') || 20)));
@@ -1805,34 +1783,6 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { paths });
       } catch (e) { if (e.code === 'ENOENT') return json(res, 200, { paths: [] }); throw e; }
     }
-    // Bot report: GET /stats/bots?campaign=&from=&to=
-    if (url.pathname === '/stats/bots' && req.method === 'GET') {
-      const botCampaign = url.searchParams.get('campaign') || null;
-      const botFrom = url.searchParams.get('from') || null;
-      const botTo = url.searchParams.get('to') || null;
-      if (botFrom && !/^\d{4}-\d{2}-\d{2}$/.test(botFrom)) return json(res, 400, { error: 'invalid_from_date' });
-      if (botTo && !/^\d{4}-\d{2}-\d{2}$/.test(botTo)) return json(res, 400, { error: 'invalid_to_date' });
-      try {
-        const lines = (await readFile(eventsFile, 'utf8')).split('\n').filter(Boolean).map(JSON.parse);
-        const fromMs = botFrom ? Date.parse(`${botFrom}T00:00:00Z`) : null;
-        const toMs = botTo ? Date.parse(`${botTo}T23:59:59Z`) : null;
-        const bots = lines.filter((item) => {
-          if (item.type !== 'bot') return false;
-          if (botCampaign && item.campaign !== botCampaign) return false;
-          if (req.scope?.allowed && !req.scope.allowed.includes(item.campaign)) return false;
-          const t = item.at ? Date.parse(item.at) : null;
-          if (fromMs !== null && (t === null || t < fromMs)) return false;
-          if (toMs !== null && (t === null || t > toMs)) return false;
-          return true;
-        });
-        const byCampaign = {};
-        for (const b of bots) byCampaign[b.campaign] = (byCampaign[b.campaign] || 0) + 1;
-        return json(res, 200, { total: bots.length, byCampaign });
-      } catch (e) {
-        if (e.code === 'ENOENT') return json(res, 200, { total: 0, byCampaign: {} });
-        throw e;
-      }
-    }
     return json(res, 404, { error: 'not_found' });
   } catch (error) {
     return json(res, error.statusCode || 500, { error: error.statusCode ? error.message : 'internal_error' });
@@ -1842,9 +1792,11 @@ const server = http.createServer(async (req, res) => {
 await rates.start();
 await loadSettings();
 await loadSources();
+await loadNetworks();
 await loadOffers();
 await loadLandings();
 await loadCampaigns();
+if (requirePostgres && !db) throw new Error('REQUIRE_POSTGRES=1, но PostgreSQL недоступен');
 server.listen(port, '127.0.0.1', () => console.log(`Product Umbrella listening on http://127.0.0.1:${server.address().port}`));
 
 async function shutdown() { await new Promise((resolve) => server.close(resolve)); await eventMirror?.drain(); await closeDb(); process.exit(0); }

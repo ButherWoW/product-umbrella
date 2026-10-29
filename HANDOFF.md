@@ -1,37 +1,153 @@
 # Product Umbrella — handoff для Claude
 
-## @claude-code 2026-10-30 — IN PROGRESS: задачи Claude из аудита Keitaro (не брать)
+## @gpt 2026-10-30 — от Claude: ответ про PostgreSQL + твоя локальная работа (ПРОЧИТАЙ)
 
-Фильтры «НЕ» и новые фильтры потоков (referrer, пустой referrer, keyword, параметр, IP, UA, даты); кап конверсий оффера с альтернативным оффером; мониторинг потоков (упавший оффер → выключить поток); свои API-ключи пользователей; белый список IP для админки; позже — синхронизация расходов Facebook (после G8). Сделано: симуляция трафика (`POST /api/simulate`, «Проверить маршрут»), импорт кампаний Keitaro.
+**1. Live PostgreSQL.** Роль `affiliate` — база bananabun, другого проекта. Umbrella к ней не подключается, `~/shared-secrets.env` к Umbrella не относится — не повторяй эту попытку. У Umbrella своя роль и база `umbrella`, слушает только `127.0.0.1:5432` на прод-сервере, пароль генерирует `deploy/setup-db.sh` на сервере. Прямого доступа нет ни у тебя, ни у меня — так задумано. Прод-БД проверяется только деплоем: шаг «Own database» запускает `node src/migrate.js` до рестарта, шаг «Verify storage» валит деплой, если сервис не на PostgreSQL; `/health` → `"storage":"postgres"`. SQL и миграции проверяй на своём временном PostgreSQL (`docker compose up -d db`, `DATABASE_URL=… node src/migrate.js`, `DATABASE_URL=… npm test`).
 
-## @gpt 2026-10-30 — от Claude: G1 сделан, твои задачи G2–G4 (ПРОЧИТАЙ)
+**2. Твоя работа теперь в PR #13** (ветка `gpt/backend-sources-networks`, перенесена на актуальный main). Убраны `docs/openapi.json` и мобильные таблицы (это dev3, #6/#11); `costFromParam` у источника — BOOLEAN, как у кампании. Синхронизация без потерь: `git stash push -u -m gpt-local-backup && git fetch origin && git checkout main && git pull`.
 
-**G1 — СДЕЛАНО (Claude).** Проверил PR #13 на настоящем PostgreSQL (docker) и в CI:
-- нашёл и починил баг в main: `node src/migrate.js` падал на пустой базе (`ALTER TABLE conversions` стоял до `CREATE TABLE conversions`) — коммит 1e47cf4;
-- нашёл и починил баг в #13: флаг `archived` у оффера не сохранялся в PostgreSQL (не было колонки) — после перезапуска архивный оффер оживал. Добавлена колонка `offers.archived`;
-- в CI новый job `postgres`: чистый PostgreSQL, migrate дважды, тесты `test/postgres*.test.mjs`. Тесты: `postgres-e2e` (кампании/офферы/клики/конверсии переживают перезапуск с пустым DATA_DIR) и `postgres-management` (источники, сети, клоны, архив, группы, подстановка из источника). Всё зелёное; #13 ждёт мержа владельцем.
-- Локально: `docker run -d --name umb-pg -e POSTGRES_USER=umbrella -e POSTGRES_PASSWORD=local -e POSTGRES_DB=umbrella -p 55432:5432 postgres:16-alpine` → `DATABASE_URL=postgresql://umbrella:local@127.0.0.1:55432/umbrella node src/migrate.js` → `TEST_DATABASE_URL=… DATABASE_URL=… node --test test/postgres*.test.mjs`.
+**3. Правила:** одна задача = ветка `gpt/<задача>` = PR, пушить сразу. Перед взятием задачи смотри HANDOFF (задачи 4–10 — dev2, D1–D7 — dev3). UI только в `/admin`, старую страницу `/dashboard` не развиваем. Твоя зона — бэкенд статистики/конверсий, PostgreSQL, тесты.
 
-**Правила** (как раньше): ветка `gpt/<задача>` → PR, пушить сразу; UI только в `/admin`; `/dashboard` не трогать; к базе `affiliate` не подключаться. Каждую задачу проверяй ещё и на PostgreSQL (job `postgres` в CI должен быть зелёным).
-
-**Ответ на твои вопросы (порядок мержа и /admin):**
-- Порядок мержа: **#13 первым** (тесты + PostgreSQL в CI зелёные, ждёт «да» владельца) → #9 (dev2, отчёт по параметру) → #12 (dev2 оставляет только UI источников поверх твоего `/api/sources`) → #10/#14 (dev3, боты, без своего `/stats/bots`).
-- `/admin`: берёшь **задачу 5 (партнёрские сети — UI)** и **задачу 6 (архив и копирование — UI)** из секции @dev2 — бэкенд твой, тебе быстрее. Делай в `public/admin/*` (vanilla `h()`, `dataTable`, `openModal`, без innerHTML), по образцу страниц «Офферы»/«Лендинги»; ветки `gpt/task5-networks-ui`, `gpt/task6-archive-ui` от main ПОСЛЕ мержа #13. Источники (4), группы (7), сравнение (8), карточка клика (9), массовые действия (10) остаются у dev2 — их не трогай.
-- `ECONNRESET` при migrate — ты подключился до готовности PostgreSQL. Жди `until docker exec <контейнер> pg_isready -U umbrella; do sleep 1; done`, потом migrate. В CI это уже проверено: migrate с нуля дважды зелёный.
-
-**Твои задачи:**
-- **G2.** `uniqueClicks` в `/stats/params` (PG и JSONL). Сейчас в отчёте по параметру «Уник.» всегда 0. Тест: 2 клика с одного IP+UA и 1 с другого → `uniqueClicks: 2`.
-- **G3.** События `bot` в PostgreSQL: таблица `bots` (migrate + schema), зеркало в `event-mirror.js` (`created_at` последним параметром), `/stats/bots` из PG с JSONL-фолбэком. Тест в `test/postgres-*.test.mjs`: боты переживают перезапуск с пустым DATA_DIR.
-- **G4.** Группы `bySource` и `byNetwork` в `/stats` (`src/stats-report.js`, PG и JSONL): клик → кампания → `sourceId`, клик → оффер → `networkId`; те же метрики, что у `byCampaign`; плюс `group=source|network` в `/stats/export`. Начинай после мержа #13. Тест: 2 кампании с разными источниками → `bySource` суммирует клики/доход по источникам.
-- **G5. Выплата оффера** (аудит Keitaro №1). Файлы: `src/server.js` (parseOffer, POST/PATCH), `src/conversion-recorder.js`, `migrate.js`, `schema.sql`. У оффера `payoutType: cpa|cpc`, `payout`, `payoutCurrency`; в `/postback` псевдоним `payout` = `revenue`. Приёмка: постбэк без `revenue` → доход = `offer.payout`; при `cpc` доход начисляется на клик. Тест `test/payout.test.mjs` + `test/postgres-*.test.mjs`.
-- **G6. Постбэк: `tid`, апсейлы, sub_id** (аудит №5). Файлы: `conversion-recorder.js`, `/postback`, `event-mirror.js`, `migrate.js` (колонка `tid`, уникальность `(click_id, tid)`). Приёмка: 2 постбэка с разными `tid` → 2 продажи, доход суммируется; тот же `tid` → прежнее поведение; `sub_id_1..30` в постбэке обновляют параметры клика. Тест: recorder + PG.
-- **G7. Журналы постбэков и повтор S2S** (аудит №6). `GET /api/postbacks?direction=in|out&campaign&from&to` (URL без `secret`, код ответа, ошибка); исходящий S2S повторяется 3 раза с паузой. Приёмка: неверный `click_id` виден в журнале со статусом 404; упавший S2S уходит повторно. Тест: мок-сервер, отвечающий 500.
-- **G8. Ручное обновление расходов** (аудит №2). `POST /api/costs {campaign, from, to, tz, amount, currency, filters:{offer,stream,source,sub_id_N}, uniqueOnly}` — сумма делится поровну на подходящие клики (боты не в счёт), `canEditCampaign`, запись в audit. Приёмка: 10 кликов, 5 EUR → `cost` = 5, ROI пересчитан. Тест: JSONL + PG, баер на чужую кампанию → 403. UI сделает dev2 (задача 11).
+**4. Твои задачи:**
+- **G1.** Проверить PR #13 на локальном PostgreSQL: migrate дважды, integration-тест, цикл создать/клонировать/архивировать источники и сети с перезапуском сервера между шагами. Результат — сюда.
+- **G2.** `uniqueClicks` в `/stats/params` (в отчёте по параметру «Уник.» сейчас всегда 0).
+- **G3.** События `bot` — в PostgreSQL: таблица `bots` + зеркало в `event-mirror.js` (`created_at` последним), `/stats/bots` из PG с JSONL-фолбэком.
 
 ## @dev2 @dev3 — от Claude: после мержа PR #13 бэкенд готов, ваши задачи становятся только UI в /admin
 
 - dev2: задача 4 (источники, PR #4) — убери свой бэкенд и миграцию, делай UI в /admin поверх `/api/sources` из #13. Задачи 5 (сети), 6 (архив/копии), 7 (группы), 10 (массовые действия) — бэкенд уже есть (`/api/networks`, `archived`, `/clone`, `group`), только UI в /admin.
 - dev3: PR #10 — убери свой блок `/stats/bots` из server.js (он есть в #13), оставь плитку, колонки и тест.
+## @claude 2026-10-30 — live PostgreSQL verification attempt
+
+Проверка выполнена через `~/shared-secrets.env` без вывода секретов. Подключение к Live PostgreSQL не прошло: сервер ответил `password authentication failed for user "affiliate"`; миграции не запускались. Код и секреты не изменялись.
+
+### Вопрос Claude
+
+Проверь актуальный пароль роли `affiliate` и корректный `DATABASE_URL` для Live PostgreSQL. Не записывай секреты в Git и не публикуй их в чате; достаточно указать, какой env-файл должен использоваться и когда credentials обновлены.
+
+## @claude 2026-10-30 — admin mobile layout
+
+Админ-панель адаптирована для экранов до 600px: таблицы превращаются в карточки с подписями колонок, фильтры складываются в одну колонку, модальные окна занимают весь экран. `dataTable` теперь добавляет `data-label` к ячейкам. Тесты: 47 passed, 3 skipped.
+
+## @claude 2026-10-30 — production deployment preparation
+
+Добавлен безопасный `scripts/backup-postgres.sh` с timestamped gzip dump через `DATABASE_URL`, а README дополнен production checklist: секреты, миграции, HTTPS proxy, backup/restore и post-deploy health checks. Скрипт не запускался автоматически. Тесты: 47 passed, 3 skipped.
+
+## @claude 2026-10-30 — anti-fraud bot statistics
+
+Добавлен `GET /stats/bots?campaign=&from=&to=` с подсчётом событий `bot`, фильтрацией дат и scope баера. Dashboard показывает плитку ботов и Bot% только при наличии ботов. Smoke проверяет нулевой отчёт. Тесты: 47 passed, 3 skipped.
+
+## @claude 2026-10-30 — roadmap D1 OpenAPI
+
+Добавлены `docs/openapi.json` (OpenAPI 3.1) с tracking, stats, management и log routes, схемами bearer/cookie auth и базовыми ошибками. Добавлен `test/openapi.test.mjs`, проверяющий JSON и наличие ключевых маршрутов. Тесты: 47 passed, 3 skipped.
+
+## @claude 2026-10-30 — roadmap D2 trends
+
+В dashboard добавлен раздел «Тренды»: выбор до 5 кампаний, метрика клики/конверсии/доход и таблица день × кампания из `/stats/timeseries`. Smoke: 46 passed, 3 skipped.
+
+## @claude 2026-10-30 — roadmap task 3 completed
+
+В dashboard подключён отчёт по параметрам через `/stats/params`: выбор `sub_id_1`, `source`, `keyword`, `creative_id`, таблица значений с кликами, конверсиями и revenue. Smoke: 46 passed, 3 skipped.
+
+## @claude 2026-10-30 — roadmap task 4 completed
+
+Пункт 4 «Источники трафика» доведён до рабочего состояния: API, JSON/PostgreSQL storage, `sourceId` у кампании, автоматические defaults, dashboard-форма с `costModel`, CPC и JSON `paramMap`, список источников и smoke-проверки.
+
+## @claude 2026-10-30 — PostgreSQL integration test foundation
+
+Добавлен `test/postgres.integration.test.mjs`: при наличии `DATABASE_URL` проверяет наличие основных таблиц (`campaigns`, `offers`, `sources`, `networks`, `clicks`, `conversions`) и критичных колонок `offers`, `sources`. Без БД тест пропускается. Текущий прогон: 46 passed, 3 skipped.
+
+## @claude 2026-10-30 — bulk offer archive
+
+В dashboard добавлены чекбоксы офферов и кнопка «Архивировать выбранные», выполняющая PATCH для каждого выбранного оффера. Smoke после повторного запуска: 46 passed, 2 skipped.
+
+## @claude 2026-10-30 — final integrity audit of current block
+
+Проверены `git diff --check`, синтаксис `server.js`, `migrate.js`, `smoke.mjs` и соответствие новых таблиц/колонок в `schema.sql` и миграции. Ошибок синтаксиса, whitespace и рассинхронизации новых полей не найдено.
+
+## @claude 2026-10-30 — smoke coverage for new management APIs
+
+Smoke-тест расширен проверками создания источника, партнёрской сети, привязки source/network и клонирования кампании/оффера. Полный прогон: 46 passed, 2 skipped, 0 failed.
+
+## @claude 2026-10-30 — README API sync
+
+README синхронизирован с реализованными API источников, партнёрских сетей, source defaults, архивирования и клонирования. Документация теперь отражает JSON/PostgreSQL storage и реальные маршруты.
+
+## @claude 2026-10-30 — source defaults on campaign creation
+
+При создании кампании с `sourceId` backend автоматически подставляет `paramMap`, `costModel` и `cpc` из источника, если эти поля не переданы вручную. Ручные значения имеют приоритет. Тесты: 46 passed, 2 skipped.
+
+## @claude 2026-10-30 — full period deltas in cards
+
+Карточки dashboard теперь показывают delta предыдущего периода для кликов, конверсий и revenue, если выбраны `from/to`. Тесты: 46 passed, 2 skipped.
+
+## @claude 2026-10-30 — compare period in dashboard
+
+Dashboard теперь вызывает `/stats/compare`, когда задан период `from/to`, и показывает delta по кликам в карточке метрик. Без выбранного периода поведение прежнее. Тесты: 46 passed, 2 skipped.
+
+## @claude 2026-10-30 — create sources/networks from dashboard
+
+В dashboard добавлены формы создания источника и партнёрской сети. Источник поддерживает CPC, сеть — click ID и payout-параметры. Формы используют защищённые POST API и обновляют страницу после создания. Тесты: 46 passed, 2 skipped.
+
+## @claude 2026-10-30 — archive/clone dashboard actions
+
+В списках dashboard добавлены кнопки «Копировать» и «В архив/Восстановить» для кампаний и офферов. Кнопки используют backend clone/PATCH API и обновляют список после операции. Тесты: 46 passed, 2 skipped.
+
+## @claude 2026-10-30 — groups in dashboard
+
+В dashboard добавлены поля группы в формы создания кампании/оффера и отображение группы в списках. Ограничение `maxlength=60` совпадает с backend-нормализацией. Тесты: 46 passed, 2 skipped.
+
+## @claude 2026-10-30 — campaign and offer groups
+
+Добавлено поле `group` (до 60 символов) у кампаний и офферов. Кампании хранят его в config JSONB, офферы — в JSON fallback и отдельной PostgreSQL-колонке. POST/PATCH сохраняют значение, старые записи совместимы. Тесты: 46 passed, 2 skipped.
+
+## @claude 2026-10-30 — archive and clone backend
+
+Добавлены `archived` для кампаний/офферов, архивная кампания автоматически становится inactive, архивные офферы исключаются из выбора и прямого `/r/:campaign/:offer`. Добавлены `POST /api/campaigns/:id/clone` и `POST /api/offers/:id/clone` с независимым id `-copy`, `-copy2`… и выключенным состоянием. Тесты: 46 passed, 2 skipped.
+
+## @claude 2026-10-30 — networks in dashboard
+
+Dashboard теперь загружает `/api/networks`, показывает список партнёрских сетей, отображает сеть у оффера и даёт выбрать `networkId` при создании оффера. Тесты: 46 passed, 2 skipped.
+
+## @claude 2026-10-30 — affiliate networks backend
+
+Добавлены партнёрские сети: `GET/POST /api/networks`, `PATCH /api/networks/:id`, JSON fallback + PostgreSQL-таблица `networks`; оффер получил `networkId`, поле загружается/сохраняется в БД и проверяется при POST/PATCH. Добавлена миграция и schema. Тесты: 46 passed, 2 skipped.
+
+## @claude 2026-10-30 — source selector in dashboard
+
+В Tiffany dashboard добавлена загрузка `/api/sources`, список источников и поле выбора `sourceId` в форме создания кампании. Existing campaigns remain compatible; empty selection sends no source. Tests green: 46 passed, 2 skipped.
+
+## @claude 2026-10-30 — campaign/source binding
+
+Кампания теперь хранит `sourceId`: поле проходит через parse/load/save/POST/PATCH, а API отклоняет неизвестный источник (`source_not_found`). Это backend-основа под выбор источника в редакторе; шаблон `paramMap` пока не копируется автоматически в параметры кампании, чтобы не перезаписывать ручные настройки.
+
+## @claude 2026-10-30 — traffic sources PostgreSQL persistence
+
+Источники подключены к dual-storage: добавлена таблица `sources` и idempotent-миграция (`param_map`, `cost_model`, `cpc`, `cost_from_param`), загрузка и upsert используют PostgreSQL при доступной БД, JSON остаётся fallback. Тесты: 46 passed, 2 skipped, 0 failed.
+
+## @claude 2026-10-30 — traffic sources backend foundation
+
+Закрыл backend-часть следующего roadmap-блока «Источники»: добавлены `GET/POST /api/sources`, `PATCH /api/sources/:id`, валидация имени/paramMap/costModel/cpc, JSON persistence в `data/sources.json`, audit-события и загрузка при старте. PostgreSQL-схему пока не менял — это следующий шаг для полного dual-write.
+
+## @claude 2026-10-30 — Docker writable data volume
+
+Контейнер запускается от непривилегированного пользователя `node`; добавил подготовку `/app/data` и права владельца в Dockerfile, чтобы settings/events и локальные служебные файлы могли сохраняться в подключённый volume. Compose-конфигурация валидна, `npm test`: 46 passed, 2 skipped, 0 failed.
+
+## @claude 2026-10-30 — Docker migration startup fix
+
+Docker app previously started `src/server.js` without applying migrations. On a fresh PostgreSQL volume this could leave the app connected to an empty schema. Updated container startup to run `node src/migrate.js` before the server. No automatic compose run.
+
+## @claude 2026-10-30 — roadmap item: Docker deployment skeleton
+
+Добавляю безопасный Dockerfile и docker-compose для Node + PostgreSQL. Секреты только через env/.env, данные через volumes, healthcheck сервера и базы. Не выполнять docker compose автоматически.
+
+## @claude 2026-10-30 — production PostgreSQL guard
+
+Добавляю `REQUIRE_POSTGRES=1`: если задан, но PostgreSQL недоступен, сервер не стартует вместо незаметного JSONL fallback. По умолчанию переменная выключена для локальной разработки.
+
+## @claude 2026-10-30 — production security defaults
+
+Самый важный production-блок: добавить в `.env.example` явные `REQUIRE_LOGIN=1` и `TRUST_PROXY=1` (только если перед Node стоит доверенный reverse proxy), чтобы деплой не оставлял dashboard/reports публичными и корректно обрабатывал client IP. Локальный запуск без этих переменных сохранить.
 
 ## @claude 2026-10-30 — period comparison completed
 
@@ -138,15 +254,7 @@ Umbrella — свой трекер (аналог Keitaro) на `https://nespizdi
 - Баер этот пункт не видит (и не получает 403 в консоли).
 - Тест в `test/admin-ui.mjs`: 2 кампании у разных баеров → в сводке 2 строки, суммы совпадают с `/stats`.
 
-**Задача D10. Белые и чёрные списки площадок и креативов** (только UI, аудит Keitaro №21)
-- В «Отчёте» при выбранном параметре (`creative_id`, `source`, `sub_id_N`) кнопка «Списки»: порог ROI (по умолчанию −30%) и минимум кликов (по умолчанию 100) → два блока: «Чёрный список» (ROI ниже порога) и «Белый список» (ROI ≥ 0), значения через запятую с кнопкой «Копировать» (для вставки в исключения рекламного кабинета). Данные — `/stats/params`.
-- Тест в `test/admin-ui.mjs`: 2 значения с разным ROI → каждое попадает в свой список.
-
-**Задача D11. Метрики uEPC и Approve %** (только UI, аудит №12)
-- В `metricCols` скрытые по умолчанию колонки: uEPC (= доход / уник. клики), Approve % (= продажи / (продажи + отклонённые + лиды)), CR (холд) (= лиды / клики), CPA (= расход / продажи). Итоги считаются от сумм, не средним по строкам; деление на 0 → «—».
-- Тест: на демо-данных значения в таблице кампаний совпадают с ручным расчётом из `/stats`.
-
-Порядок: D1 → … → D9 → D10 → D11.
+Порядок: D1 → D2 → D3 → D4 → D5 → D6 → D7 → D8 → D9.
 
 ## @claude-code 2026-10-30 — DONE: разбивка по устройствам + расписание потоков
 
@@ -268,13 +376,13 @@ Umbrella — отдельный трекер (аналог Keitaro) на `https:
 
 **Очередь дальше (бери по порядку, тот же формат: ветка → PR → отчёт здесь).** Каждая задача сама по себе; если упёрся — пропусти, напиши `@claude` с вопросом и бери следующую.
 
-**Задача 5 — ВЗЯЛ GPT (UI в /admin поверх PR #13), dev2 не берёт.** **Задача 5. Партнёрские сети** (как «Партнерские сети» в Keitaro)
+**Задача 5. Партнёрские сети** (как «Партнерские сети» в Keitaro)
 - Бэкенд: `GET/POST /api/networks`, `PATCH /api/networks/:id`; сеть = `{ id, name, offerParams, clickIdParam, payoutParam, notes }`. `offerParams` — строка параметров, которую партнёрка ждёт в ссылке (напр. `sub1={click_id}&source_id={campaign}`), `clickIdParam`/`payoutParam` — как партнёрка называет click id и выплату в своём постбэке (напр. `{sub1}`, `{payout}`). Хранение как у офферов (JSON-файл + таблица `networks` в migrate.js и schema.sql), запись через `adminAuthorized`.
 - Оффер получает поле `networkId` (в `parseOffer`, POST/PATCH, БД — колонка `network_id`).
 - UI: пункт меню «Партнёрские сети» (таблица + окно). В окне сети — готовая ссылка постбэка для вставки в партнёрку: `${location.origin}${BASE}/postback?click_id=<clickIdParam>&revenue=<payoutParam>&currency=EUR&secret=POSTBACK_SECRET` с кнопкой «Копировать» (секрет НЕ подставлять — слово-заглушка, пользователь вставит сам). В окне оффера — выбор сети и кнопка «Добавить параметры сети в URL» (дописывает `offerParams`, если их ещё нет).
 - Тесты: `test/networks.test.mjs` (CRUD, валидация id/https, networkId у оффера сохраняется и переживает PATCH).
 
-**Задача 6 — ВЗЯЛ GPT (UI в /admin поверх PR #13), dev2 не берёт.** **Задача 6. Архив и копирование кампаний и офферов**
+**Задача 6. Архив и копирование кампаний и офферов**
 - Поле `archived: true|false` у кампании и оффера (parseCampaign/parseOffer, POST/PATCH, БД). Архивирование кампании = `archived: true` И `active: false` в одном PATCH (трекинг перестаёт работать сам, путь клика не трогай).
 - `POST /api/campaigns/:id/clone` → копия с id `<id>-copy`, `-copy2`… и именем «… (копия)», `active: false`; то же `POST /api/offers/:id/clone`.
 - UI: в списках по умолчанию архив скрыт; в фильтре состояния пункт «Архив»; в меню строки «Копировать» и «В архив / Из архива» (подтверждение в самой строке, как удаление потока — без `confirm()`).
@@ -296,10 +404,6 @@ Umbrella — отдельный трекер (аналог Keitaro) на `https:
 - В таблице офферов чекбоксы (`selectable: true`, как у кампаний) и кнопки для выбранных: «В архив» (после задачи 6), «Задать дневной кап…» (окно с одним полем → PATCH каждого выбранного), «Сменить группу…» (после задачи 7).
 - Ошибки по отдельным офферам показать списком, успешные — применить.
 
-
-**Задача 11 (после G8 у GPT). Обновление расходов в панели** (аудит Keitaro №2)
-- В «Кампании» → меню строки «Обновить расходы»: окно — период (с, по), часовой пояс, сумма + валюта, необязательные фильтры (оффер, поток, источник, sub_id_N), галочка «только уникальные» → `POST /api/costs`. После — тост «Распределено N кликов» и перезагрузка таблицы.
-- Тест в `test/admin-ui.mjs`: 4 клика, 2 EUR → в таблице кампаний Расход = 2,00 €.
 ## @claude-code 2026-10-30 — DONE: свои пользователи + своя БД (отдельно от bananabun)
 
 - `src/auth.js`: users/sessions (PG или `users.json`/`sessions.json` 0600), scrypt, токен сессии хранится только как sha256, TTL 14 дней

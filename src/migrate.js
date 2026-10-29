@@ -52,6 +52,21 @@ await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS ip TEXT`);
 await db.query(`ALTER TABLE clicks ADD COLUMN IF NOT EXISTS stream TEXT`);
 await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS daily_cap INTEGER`);
 await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS name TEXT`);
+await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS network_id TEXT`);
+await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT false`);
+await db.query(`ALTER TABLE offers ADD COLUMN IF NOT EXISTS "group" TEXT NOT NULL DEFAULT ''`);
+await db.query(`CREATE TABLE IF NOT EXISTS networks (id TEXT PRIMARY KEY, name TEXT NOT NULL, offer_params TEXT NOT NULL DEFAULT '', click_id_param TEXT NOT NULL DEFAULT 'sub1', payout_param TEXT NOT NULL DEFAULT 'payout', notes TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
+await db.query(`
+  CREATE TABLE IF NOT EXISTS sources (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    param_map JSONB NOT NULL DEFAULT '{}'::jsonb,
+    cost_model TEXT NOT NULL DEFAULT 'none',
+    cpc NUMERIC(12,6),
+    cost_from_param BOOLEAN NOT NULL DEFAULT false,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  )
+`);
 await db.query(`
   CREATE TABLE IF NOT EXISTS landings (
     id         TEXT        PRIMARY KEY,
@@ -102,22 +117,6 @@ await db.query(`CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id
 
 await db.query(`CREATE INDEX IF NOT EXISTS clicks_campaign_created_idx ON clicks(campaign, created_at)`);
 await db.query(`CREATE INDEX IF NOT EXISTS clicks_created_idx ON clicks(created_at)`);
-
-await db.query(`
-  CREATE TABLE IF NOT EXISTS sources (
-    id              TEXT        PRIMARY KEY,
-    name            TEXT,
-    param_map       JSONB       NOT NULL DEFAULT '{}'::jsonb,
-    cost_model      TEXT        NOT NULL DEFAULT 'none',
-    cpc             NUMERIC(12,6) NOT NULL DEFAULT 0,
-    cost_from_param BOOLEAN     NOT NULL DEFAULT false,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-  )
-`);
-await db.query(`ALTER TABLE sources ADD COLUMN IF NOT EXISTS param_map JSONB NOT NULL DEFAULT '{}'::jsonb`);
-await db.query(`ALTER TABLE sources ADD COLUMN IF NOT EXISTS cost_model TEXT NOT NULL DEFAULT 'none'`);
-await db.query(`ALTER TABLE sources ADD COLUMN IF NOT EXISTS cpc NUMERIC(12,6) NOT NULL DEFAULT 0`);
-await db.query(`ALTER TABLE sources ADD COLUMN IF NOT EXISTS cost_from_param BOOLEAN NOT NULL DEFAULT false`);
 
 console.log('[migrate] All tables ready');
 await db.end();
