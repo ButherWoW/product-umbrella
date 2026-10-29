@@ -776,6 +776,156 @@ try {
     }
   }
 
+  // D18: team daily goals (server-side /api/settings) → progress bars on «Доход» and «Прибыль» for «Сегодня».
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await api('/api/campaigns', { id: 'd18-goals', name: 'D18 Goals', streams: [{ name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] }] });
+  const d18Click = new URL((await fetch(server.url + '/r/d18-goals', { redirect: 'manual' })).headers.get('location')).searchParams.get('click_id');
+  await fetch(`${server.url}/postback?secret=conversion-test-secret&click_id=${d18Click}&revenue=25&currency=EUR`);
+  await page.goto(server.url + '/admin#/campaigns/d18-goals'); // the editor refreshes the cached campaign list (no reload: the key stays in memory)
+  await page.locator('.editor').waitFor();
+  await page.goto(server.url + '/admin#/dashboard');
+  await page.getByRole('heading', { name: 'Дашборд' }).waitFor();
+  await page.getByRole('combobox', { name: 'Период' }).selectOption('today');
+  await page.getByRole('combobox', { name: 'Валюта' }).selectOption('EUR');
+  await page.getByRole('button', { name: 'Цели', exact: true }).click();
+  const goalsDlg = page.getByRole('dialog', { name: 'Цели' });
+  await goalsDlg.getByLabel('План по доходу').fill('100');
+  await goalsDlg.getByLabel('План по прибыли').fill('20');
+  await goalsDlg.getByRole('button', { name: 'Сохранить' }).click();
+  await page.locator('#toast', { hasText: 'Цели сохранены' }).waitFor();
+  const d18Settings = await (await fetch(server.url + '/api/settings')).json();
+  assert.deepEqual([d18Settings.dailyRevenueGoal, d18Settings.dailyProfitGoal], [100, 20], 'goals stored on the server');
+  await page.getByRole('combobox', { name: 'Кампания' }).selectOption('d18-goals');
+  const d18Tile = (label) => page.locator('.kpi').filter({ has: page.locator('.k', { hasText: new RegExp(`^${label}$`) }) });
+  await d18Tile('Доход').locator('.goal-cap', { hasText: '25% плана' }).waitFor();
+  assert.equal(await d18Tile('Доход').locator('.goal-fill').evaluate((el) => el.style.width), '25%');
+  await d18Tile('Прибыль').locator('.goal.done .goal-cap', { hasText: 'план выполнен' }).waitFor();
+  await page.getByRole('combobox', { name: 'Валюта' }).selectOption('USD');
+  await d18Tile('Доход').locator('.v', { hasText: '31,25' }).waitFor();
+  assert.equal(await d18Tile('Доход').locator('.goal-cap').innerText(), '25% плана', 'goal converted into the selected currency');
+  await page.getByRole('combobox', { name: 'Период' }).selectOption('yesterday');
+  await d18Tile('Доход').locator('.v', { hasText: /^0,00/ }).waitFor();
+  assert.equal(await page.locator('.kpi .goal').count(), 0, 'no goal bar outside «Сегодня»');
+  await page.getByRole('combobox', { name: 'Период' }).selectOption('today');
+  // Danger zone «Очистить статистику»: typed campaign id unlocks the button; clears only this campaign.
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await api('/api/campaigns', { id: 'ui-clear', name: 'UI Clear', streams: [{ name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] }] });
+  for (let i = 0; i < 2; i++) await fetch(server.url + '/r/ui-clear', { redirect: 'manual' });
+  const flowsBefore = (await (await fetch(server.url + '/stats?campaign=ui-flows', { headers: { authorization: 'Bearer ' + TOKEN } })).json()).clicks;
+  await page.goto(server.url + '/admin#/campaigns/ui-clear');
+  const zone = page.getByRole('region', { name: 'Очистить статистику' });
+  await zone.waitFor();
+  const clearBtn = zone.getByRole('button', { name: 'Очистить статистику' });
+  assert.ok(await clearBtn.isDisabled(), 'locked until the id is typed');
+  await zone.getByLabel('Идентификатор кампании для подтверждения').fill('ui-clea');
+  assert.ok(await clearBtn.isDisabled(), 'a wrong id keeps it locked');
+  await zone.getByLabel('Идентификатор кампании для подтверждения').fill('ui-clear');
+  assert.ok(await clearBtn.isEnabled());
+  await clearBtn.click();
+  const clearKey = page.getByRole('dialog', { name: 'Ключ администратора' });
+  if (await clearKey.waitFor({ timeout: 1500 }).then(() => true, () => false)) {
+    await clearKey.locator('input[type=password]').fill(TOKEN);
+    await clearKey.getByRole('button', { name: 'Сохранить' }).click();
+    await clearBtn.click();
+  }
+  await page.locator('#toast', { hasText: 'Удалено: 2 кликов' }).waitFor();
+  const statsOf = async (id) => (await (await fetch(server.url + '/stats?campaign=' + id, { headers: { authorization: 'Bearer ' + TOKEN } })).json()).clicks;
+  assert.equal(await statsOf('ui-clear'), 0, 'campaign stats cleared');
+  assert.equal(await statsOf('ui-flows'), flowsBefore, 'other campaign untouched');
+  assert.equal(await zone.getByLabel('Идентификатор кампании для подтверждения').inputValue(), '', 'confirmation is reset');
+  assert.ok(await clearBtn.isDisabled());
+  assert.ok((await page.evaluate(() => document.documentElement.scrollWidth)) <= 1280, 'no horizontal scroll');
+  // Task 9: click card in the click log — all fields, hostile UA stays text, Enter opens the card
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await api('/api/campaigns', { id: 't9-card', name: 'T9 Card', streams: [{ name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] }] });
+  const t9Ua = '<img src=x onerror=alert(1)>';
+  const t9r = await fetch(server.url + '/r/t9-card?sub_id_1=t9-sub-one', { redirect: 'manual', headers: { 'user-agent': t9Ua } });
+  const t9cid = new URL(t9r.headers.get('location')).searchParams.get('click_id');
+  await page.goto(server.url + '/admin#/clicks?campaign=t9-card');
+  await page.getByRole('heading', { name: 'Лог кликов' }).waitFor();
+  // A reload may drop the in-memory key: enter it if the panel asks, then reload the log.
+  const t9Key = page.getByRole('dialog', { name: 'Ключ администратора' });
+  await page.locator('table.grid tbody tr, [role=dialog][aria-label="Ключ администратора"]').first().waitFor();
+  if (await t9Key.isVisible()) {
+    await t9Key.locator('input[type=password]').fill(TOKEN);
+    await t9Key.getByRole('button', { name: 'Сохранить' }).click();
+    await page.getByRole('button', { name: 'Обновить' }).click();
+  }
+  const t9Row = page.locator('table.grid tbody tr', { hasText: t9cid.slice(0, 13) });
+  await t9Row.click();
+  const t9Card = page.getByRole('dialog', { name: 'Клик' });
+  await t9Card.waitFor();
+  const t9Text = await t9Card.innerText();
+  assert.ok(t9Text.includes(t9Ua), 'hostile UA shown as text');
+  assert.equal(await t9Card.locator('img').count(), 0, 'UA must never become HTML');
+  assert.ok(t9Text.includes(t9cid), 'full click id visible');
+  assert.ok(t9Text.includes('sub_id_1') && t9Text.includes('t9-sub-one'), 'sub_id_1 visible');
+  await t9Card.getByRole('link', { name: 'T9 Card' }).waitFor();
+  await t9Card.getByRole('button', { name: 'Копировать' }).click();
+  await page.locator('#toast', { hasText: /скопир/i }).waitFor(); // copied, or fallback: ID selected for Ctrl+C
+  await page.keyboard.press('Escape');
+  await t9Card.waitFor({ state: 'detached' });
+  await t9Row.focus();
+  await page.keyboard.press('Enter');
+  await t9Card.waitFor();
+  await page.keyboard.press('Escape');
+  // Source postback: fields in the source modal and the campaign editor, «Тестовый постбэк» shows the HTTP status.
+  {
+    await page.setViewportSize({ width: 1280, height: 900 });
+    const { createServer } = await import('node:http');
+    const hits = [];
+    const mock = createServer((req, res) => { hits.push(req.url); res.writeHead(204); res.end(); });
+    await new Promise((resolve) => mock.listen(0, '127.0.0.1', resolve));
+    const mockUrl = `http://127.0.0.1:${mock.address().port}`;
+    const pbDir = await mkdtemp(join(tmpdir(), 'umbrella-admin-pb-'));
+    const pbServer = await startTestServer(pbDir, { ADMIN_TOKEN: TOKEN, SOURCE_POSTBACK_ALLOW_PRIVATE: '1' });
+    const pbPage = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+    pbPage.on('pageerror', (error) => errors.push(error.message));
+    try {
+      await pbPage.goto(pbServer.url + '/admin#/sources');
+      await pbPage.getByRole('button', { name: 'Создать', exact: true }).click();
+      const srcDialog = pbPage.getByRole('dialog', { name: 'Создание источника' });
+      await srcDialog.locator('input').nth(0).fill('fb-pb');
+      await srcDialog.locator('input').nth(1).fill('FB postback');
+      await srcDialog.getByRole('tab', { name: 'Постбэк' }).click();
+      await srcDialog.getByLabel('URL постбэка в источник').fill(`${mockUrl}/fb?cid={external_id}&s={status}`);
+      await srcDialog.getByLabel('Лид (lead)').check();
+      await srcDialog.getByRole('button', { name: 'Тестовый постбэк' }).click();
+      const keyDialog2 = pbPage.getByRole('dialog', { name: 'Ключ администратора' });
+      await keyDialog2.waitFor();
+      await keyDialog2.locator('input[type=password]').fill(TOKEN);
+      await keyDialog2.getByRole('button', { name: 'Сохранить' }).click();
+      await srcDialog.getByRole('button', { name: 'Тестовый постбэк' }).click();
+      await srcDialog.getByRole('status', { name: 'Результат тестового постбэка' }).filter({ hasText: 'HTTP 204' }).waitFor();
+      assert.ok(hits.at(-1).startsWith('/fb?cid=test_external_id&s=sale'), 'test postback filled sample macros');
+      await srcDialog.screenshot({ path: join(tmpdir(), 'umbrella-admin-source-postback.png') });
+      await srcDialog.getByRole('button', { name: 'Создать', exact: true }).click();
+      await pbPage.locator('table.grid tbody tr', { hasText: 'fb-pb' }).filter({ hasText: 'lead, sale' }).waitFor();
+      const saved = (await (await fetch(pbServer.url + '/api/sources')).json()).sources['fb-pb'];
+      assert.deepEqual([saved.postbackUrl, saved.postbackStatuses], [`${mockUrl}/fb?cid={external_id}&s={status}`, ['lead', 'sale']]);
+
+      await pbPage.goto(pbServer.url + '/admin#/campaigns/new');
+      await pbPage.getByLabel('Название кампании').fill('PB campaign');
+      await pbPage.getByRole('combobox', { name: 'Источник трафика' }).selectOption('fb-pb');
+      await pbPage.getByLabel('Постбэк в источник').fill(`${mockUrl}/camp?s={status}`);
+      await pbPage.getByLabel('Продажа (sale)').check();
+      await pbPage.getByRole('button', { name: 'Тестовый постбэк' }).click();
+      await pbPage.getByRole('status', { name: 'Результат тестового постбэка' }).filter({ hasText: 'HTTP 204' }).waitFor();
+      assert.ok(hits.at(-1).startsWith('/camp?s=sale'));
+      await pbPage.locator('.editor-head .btn.primary').click();
+      await pbPage.locator('#toast', { hasText: 'Кампания создана' }).waitFor();
+      const camps = (await (await fetch(pbServer.url + '/api/campaigns')).json()).campaigns;
+      const pbCamp = Object.values(camps).find((c) => c.name === 'PB campaign');
+      assert.deepEqual([pbCamp.sourceId, pbCamp.sourcePostbackUrl, pbCamp.sourcePostbackStatuses], ['fb-pb', `${mockUrl}/camp?s={status}`, ['sale']]);
+      await pbPage.screenshot({ path: join(tmpdir(), 'umbrella-admin-campaign-postback.png') });
+    } finally {
+      await pbPage.close();
+      await pbServer.stop();
+      await new Promise((resolve) => mock.close(resolve));
+      await rm(pbDir, { recursive: true, force: true });
+    }
+  }
+
   assert.deepEqual(errors, []);
   console.log('Admin UI browser test passed');
 } finally {

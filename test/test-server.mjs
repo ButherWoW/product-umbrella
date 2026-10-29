@@ -4,7 +4,7 @@ import { once } from 'node:events';
 export async function startTestServer(dataDir, environment = {}) {
   const child = spawn(process.execPath, ['src/server.js'], { env: { ...process.env,
     DATABASE_URL: '', ADMIN_TOKEN: '', GEOIP_DB: '', CLICK_RATE_LIMIT: '0', FX_REFRESH: '0', MONITOR: '0',
-    PORT: '0', DATA_DIR: dataDir, POSTBACK_SECRET: 'conversion-test-secret', ...environment },
+    PORT: '0', DATA_DIR: dataDir, POSTBACK_SECRET: 'conversion-test-secret', RETENTION_DAYS: '', ...environment },
     stdio: ['ignore', 'pipe', 'pipe'] });
   let diagnostics = '', output = '';
   child.stderr.on('data', (chunk) => { diagnostics += chunk; });
