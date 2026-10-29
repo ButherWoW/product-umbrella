@@ -188,8 +188,8 @@ try {
     const lockedApi = (path, body) => fetch(locked.url + path, { method: body ? 'POST' : 'GET', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + TOKEN }, body: body ? JSON.stringify(body) : undefined });
     const usersData = await (await lockedApi('/api/users')).json();
     const buyerUser = usersData.users.find((u) => u.email === 'buyer@example.com');
-    await lockedApi('/api/campaigns', { id: 'buyers-c1', name: 'Buyers C1', streams: [{ name: 'Main', offers: [{ offerId: 'o', weight: 1 }] }], ownerId: buyerUser.id });
-    await lockedApi('/api/campaigns', { id: 'buyers-c2', name: 'Buyers C2', streams: [{ name: 'Main', offers: [{ offerId: 'o', weight: 1 }] }] });
+    await lockedApi('/api/campaigns', { id: 'buyers-c1', name: 'Buyers C1', streams: [{ name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] }], ownerId: buyerUser.id });
+    await lockedApi('/api/campaigns', { id: 'buyers-c2', name: 'Buyers C2', streams: [{ name: 'Main', offers: [{ offerId: 'offer-1', weight: 1 }] }] });
     await fetch(locked.url + '/r/buyers-c1', { redirect: 'manual' });
     await fetch(locked.url + '/r/buyers-c1', { redirect: 'manual' });
     await fetch(locked.url + '/r/buyers-c2', { redirect: 'manual' });

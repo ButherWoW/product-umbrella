@@ -51,8 +51,21 @@ jobs:
       - name: PostgreSQL tests
         run: node --test $(ls test/postgres*.test.mjs)
 
+  ui:
+    # Browser checks of /admin (Playwright + Chromium). Not part of `npm test`, so they run here.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm ci --no-audit --no-fund
+      - name: Install Playwright (not a project dependency)
+        run: npm install --no-save --no-audit --no-fund playwright@1.64.1 && npx playwright install --with-deps chromium
+      - name: Admin UI, event logs, stream editor
+        run: for t in test/*-ui.mjs; do echo "== $t"; node "$t" || exit 1; done
+
   deploy:
-    needs: [test, postgres]
+    needs: [test, postgres, ui]
     # Pull requests only run tests; production deploys happen after merge into main.
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
