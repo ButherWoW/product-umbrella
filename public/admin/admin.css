@@ -214,3 +214,11 @@ body.read-only:not(.auth-mode) .btn.primary, body.read-only:not(.auth-mode) .row
 /* Key-value card (click details) */
 .kv { display: grid; grid-template-columns: minmax(100px, max-content) minmax(0, 1fr); gap: 6px 16px; align-items: baseline; }
 .kv-value { overflow-wrap: anywhere; }
+
+/* Public demo (/demo): a strip above the top bar; the fixed layout moves down by its height. */
+.demo-banner { position: fixed; inset: 0 0 auto 0; height: 28px; line-height: 28px; z-index: 25; padding: 0 8px; text-align: center;
+  background: var(--warn); color: #2a1d00; font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+body.demo .topbar { top: 28px; }
+body.demo .sidebar { top: 80px; }
+body.demo .view { margin-top: 80px; }
+@media (max-width: 480px) { .demo-banner { font-size: 10px; padding: 0 4px; } }

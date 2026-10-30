@@ -3,7 +3,15 @@
 import { cloakingCondition, cloakingMessage, disabledByPolicy } from './stream-policy.js';
 const state = { token: null, offers: {}, campaigns: {}, landings: {}, sources: {}, networks: {}, users: [] };
 // Set by the server when the tracker runs under a path prefix (BASE_PATH, e.g. /umbrella behind nginx).
-const BASE = document.querySelector('meta[name="umbrella-base"]')?.getAttribute('content') || '';
+const ROOT = document.querySelector('meta[name="umbrella-base"]')?.getAttribute('content') || '';
+// Public demo (<base>/demo/…, see src/panel-routes.js): the panel's pages live under /demo and every API call is answered
+// in the browser by demo.js with made-up data; writes are refused there. Nothing goes to the real API.
+const DEMO = document.querySelector('meta[name="umbrella-demo"]') !== null;
+const demo = DEMO ? await import('./demo.js') : null;
+// Panel pages: ROOT, or ROOT/demo in the demo. Tracking links (/r, /postback, /lp/click) always use ROOT.
+const BASE = ROOT + (DEMO ? '/demo' : '');
+// Every request of the panel goes through here.
+const send = (path, init) => (demo ? demo.request(path, init) : fetch(ROOT + path, init));
 const view = document.getElementById('view');
 
 // ---------- utils ----------
@@ -25,9 +33,11 @@ function h(tag, attrs, ...children) {
   return el;
 }
 const put = (el, ...kids) => el.replaceChildren(...kids.flat(Infinity).filter((k) => k !== null && k !== undefined && k !== false));
+// The demo keeps its own settings, so trying things there does not change the real panel's layout in this browser.
+const STORE_PREFIX = DEMO ? 'umbrella-demo:' : 'umbrella:';
 const store = {
-  get(key, fallback) { try { const v = localStorage.getItem('umbrella:' + key); return v === null ? fallback : JSON.parse(v); } catch { return fallback; } },
-  set(key, value) { try { localStorage.setItem('umbrella:' + key, JSON.stringify(value)); } catch { /* storage unavailable */ } },
+  get(key, fallback) { try { const v = localStorage.getItem(STORE_PREFIX + key); return v === null ? fallback : JSON.parse(v); } catch { return fallback; } },
+  set(key, value) { try { localStorage.setItem(STORE_PREFIX + key, JSON.stringify(value)); } catch { /* storage unavailable */ } },
 };
 const nf = new Intl.NumberFormat('ru-RU');
 const num = (v) => nf.format(Number(v) || 0);
@@ -67,7 +77,7 @@ async function api(path, { method = 'GET', body } = {}) {
   if (body !== undefined) headers['content-type'] = 'application/json';
   if (state.token) headers.authorization = 'Bearer ' + state.token;
   if (path.startsWith('/stats') && currency.code) path += (path.includes('?') ? '&' : '?') + 'currency=' + encodeURIComponent(currency.code);
-  const res = await fetch(BASE + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  const res = await send(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
   const data = await res.json().catch(() => ({}));
   if (res.status === 401 && !path.startsWith('/api/auth/')) {
     if (state.me?.loginRequired || data.error === 'login_required') { state.me = { ...state.me, user: null, loginRequired: true }; toLogin(); }
@@ -437,7 +447,7 @@ const sum = (rows, key) => rows.reduce((s, r) => s + (Number(r[key]) || 0), 0);
 const groupRows = (obj) => Object.entries(obj || {}).map(([id, v]) => ({ id, clicks: v.clicks || 0, uniqueClicks: v.uniqueClicks || 0, conversions: v.conversions || 0, revenue: v.revenue || 0, cost: v.cost || 0, lpClicks: v.lpClicks || 0,
   leads: v.leads || 0, sales: v.sales || 0, rejected: v.rejected || 0, pendingRevenue: v.pendingRevenue || 0 }));
 // Campaigns bound to a tracking domain get links on that domain (served at the root, HTTPS).
-const trackingUrl = (id) => (state.campaigns[id]?.domain ? `https://${state.campaigns[id].domain}/r/${encodeURIComponent(id)}` : `${location.origin}${BASE}/r/${encodeURIComponent(id)}`);
+const trackingUrl = (id) => (state.campaigns[id]?.domain ? `https://${state.campaigns[id].domain}/r/${encodeURIComponent(id)}` : `${location.origin}${ROOT}/r/${encodeURIComponent(id)}`);
 const typeLabel = { regular: 'Обычный', fallback: 'Замыкающий', forced: 'Перехватывающий' };
 
 // ---------- chart ----------
@@ -1330,11 +1340,11 @@ async function pageCampaignEditor(id) {
       field('URL при достижении капа', h('input', { class: 'input', type: 'url', value: d.capUrl || '', placeholder: 'https://… (иначе ответ 429)', oninput: bind('capUrl', 'url') })))],
     ['Tracking', () => isNew ? h('p', { class: 'muted' }, 'Ссылка кампании будет доступна после её сохранения.') : h('div', {},
       field('Домен трекинга', h('select', { class: 'select', onchange: (e) => { d.domain = e.target.value || null; mark(); } },
-        h('option', { value: '' }, `${location.host}${BASE} (основной)`), (state.domains || []).map((dm) => h('option', { value: dm, selected: d.domain === dm }, dm))),
+        h('option', { value: '' }, `${location.host}${ROOT} (основной)`), (state.domains || []).map((dm) => h('option', { value: dm, selected: d.domain === dm }, dm))),
         state.domains?.length ? 'Ссылка кампании будет на выбранном домене. Панель на нём недоступна — только трекинг.' : 'Свои домены добавляются в deploy/domains.txt (DNS A-запись на сервер); после деплоя они появятся здесь.'),
       field('Ссылка кампании', h('div', { class: 'link-box' }, h('input', { class: 'input', readonly: true, value: trackingUrl(d.id) }), h('button', { class: 'btn', onclick: () => copyText(trackingUrl(d.id)) }, 'Копировать')), 'Добавьте ?subid=… и utm-метки, они передадутся в оффер.'),
       field('Ссылка на конкретный оффер', h('input', { class: 'input', readonly: true, value: trackingUrl(d.id) + '/{offer_id}' })),
-      field('S2S постбэк для партнёрки', h('input', { class: 'input', readonly: true, value: `${location.origin}${BASE}/postback?click_id={click_id}&secret=POSTBACK_SECRET&revenue={payout}&currency=EUR&status={status}` }), 'Замените POSTBACK_SECRET и макросы партнёрки на свои. status: lead / sale / rejected / trash (понимает и approved, pending, declined…); повторный постбэк с другим статусом обновляет конверсию.'),
+      field('S2S постбэк для партнёрки', h('input', { class: 'input', readonly: true, value: `${location.origin}${ROOT}/postback?click_id={click_id}&secret=POSTBACK_SECRET&revenue={payout}&currency=EUR&status={status}` }), 'Замените POSTBACK_SECRET и макросы партнёрки на свои. status: lead / sale / rejected / trash (понимает и approved, pending, declined…); повторный постбэк с другим статусом обновляет конверсию.'),
       h('p', { class: 'muted' }, 'Макросы в URL оффера: {click_id} {subid} {campaign} {offer_id} {device} {country}.'))],
     ['Параметры', () => {
       const PARAM_FIELDS = ['keyword', 'source', 'external_id', 'creative_id', 'ad_campaign_id',
@@ -1586,7 +1596,7 @@ async function pageSources() {
 // Partner-network macros are stored with or without braces (`sub1` / `{sub1}`); the postback needs exactly one pair.
 const networkMacro = (param, fallback) => `{${(String(param || '').trim() || fallback).replace(/^\{+|\}+$/g, '')}}`;
 // The secret stays a placeholder: the real POSTBACK_SECRET never reaches the browser.
-const networkPostbackUrl = (n) => `${location.origin}${BASE}/postback?click_id=${networkMacro(n.clickIdParam, 'sub1')}&secret=POSTBACK_SECRET&revenue=${networkMacro(n.payoutParam, 'payout')}&currency=EUR`;
+const networkPostbackUrl = (n) => `${location.origin}${ROOT}/postback?click_id=${networkMacro(n.clickIdParam, 'sub1')}&secret=POSTBACK_SECRET&revenue=${networkMacro(n.payoutParam, 'payout')}&currency=EUR`;
 // Appends the network's offerParams (e.g. `sub1={click_id}&sub2={campaign}`) to an offer URL, skipping keys the URL already has.
 function withNetworkParams(url, offerParams) {
   const [base, ...hash] = String(url || '').split('#');
@@ -1688,7 +1698,7 @@ function landingModal(id, onSaved) {
       field('Название', h('input', { class: 'input', value: l.name, maxlength: 200, oninput: (e) => { l.name = e.target.value; } })),
       field('URL лендинга', h('input', { class: 'input', type: 'url', value: l.url, placeholder: 'https://…', oninput: (e) => { l.url = e.target.value.trim(); } }),
         'Посетитель попадает сюда из потока, к ссылке добавляется click_id. Кнопка на лендинге должна вести на ссылку перехода — её можно передать макросом {lp_click_url}, например https://ваш-лендинг/?go={lp_click_url}'),
-      h('p', { class: 'muted' }, `Ссылка перехода на оффер: ${location.origin}${BASE}/lp/click?click_id=<click_id>`),
+      h('p', { class: 'muted' }, `Ссылка перехода на оффер: ${location.origin}${ROOT}/lp/click?click_id=<click_id>`),
       err),
     footer: [h('button', { class: 'btn', onclick: () => close() }, 'Отмена'), h('button', { class: 'btn primary', onclick: async () => {
       err.textContent = '';
@@ -2361,7 +2371,7 @@ function authScreen() {
     e.preventDefault(); err.textContent = ''; submit.disabled = true;
     try {
       const headers = { 'content-type': 'application/json', 'x-requested-with': 'umbrella', ...(setup && adminKey.value ? { authorization: 'Bearer ' + adminKey.value.trim() } : {}) };
-      const res = await fetch(BASE + (setup ? '/api/auth/setup' : '/api/auth/login'), { method: 'POST', headers, body: JSON.stringify({ email: email.value, password: password.value }) });
+      const res = await send(setup ? '/api/auth/setup' : '/api/auth/login', { method: 'POST', headers, body: JSON.stringify({ email: email.value, password: password.value }) });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         err.textContent = ({ invalid_credentials: 'Неверный email или пароль.', too_many_attempts: 'Слишком много попыток, подождите 15 минут.', admin_token_required: 'Неверный ключ администратора.',
@@ -2392,7 +2402,7 @@ function drawUserBox() {
   // Viewers cannot write (the server answers 403 read_only), so creation, saving and row actions are hidden.
   document.body.classList.toggle('read-only', me?.role === 'viewer');
   put(box, me ? [h('span', { class: 'muted', title: ROLE_LABEL[me.role] || me.role }, me.email),
-    h('button', { class: 'btn', onclick: async () => { await fetch(BASE + '/api/auth/logout', { method: 'POST', headers: { 'x-requested-with': 'umbrella' } }); state.me = { ...state.me, user: null }; drawUserBox(); state.loaded = false; navigate(state.me.loginRequired ? '/login' : '/dashboard'); } }, 'Выйти')]
+    h('button', { class: 'btn', onclick: async () => { if (DEMO) { location.href = ROOT + '/'; return; } await send('/api/auth/logout', { method: 'POST', headers: { 'x-requested-with': 'umbrella' } }); state.me = { ...state.me, user: null }; drawUserBox(); state.loaded = false; navigate(state.me.loginRequired ? '/login' : '/dashboard'); } }, 'Выйти')]
     : state.me?.setupRequired ? h('button', { class: 'btn', onclick: () => navigate('/login') }, 'Создать владельца') : []);
 }
 
@@ -2694,7 +2704,7 @@ async function route() {
   modals.slice().forEach((close) => close());
   put(view, 'Загрузка…');
   try {
-    if (!state.me) { state.me = await (await fetch(BASE + '/api/auth/me')).json(); drawUserBox(); }
+    if (!state.me) { state.me = await (await send('/api/auth/me')).json(); drawUserBox(); }
     const signedOut = !state.me.user && (state.me.loginRequired || state.me.setupRequired);
     if (section === 'login') {
       if (signedOut) return authScreen();
