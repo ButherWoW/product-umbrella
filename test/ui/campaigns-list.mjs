@@ -12,7 +12,7 @@ await runUi('campaigns-list', async (ui) => {
   await ui.postback(`click_id=${d11cid}&revenue=10&currency=USD`);
   const d11Stats = await ui.json('/stats?campaign=d11');
   assert.deepEqual([d11Stats.sales, d11Stats.leads, d11Stats.rejected], [1, 0, 0], 'one sale, nothing else');
-  await ui.openWithKey(page, '#/campaigns');
+  await ui.openWithKey(page, '/campaigns');
   await page.locator('table.grid tbody tr', { hasText: 'D11 Test' }).waitFor();
   await page.locator('button[aria-label="Колонки"]').click();
   const d11Chooser = page.getByRole('dialog', { name: 'Выбор колонок' });
@@ -33,9 +33,9 @@ await runUi('campaigns-list', async (ui) => {
   await ui.campaign('d15-beta', 'D15 Beta');
   for (let i = 0; i < 3; i++) await ui.click('/r/d15-alpha');
   await ui.click('/r/d15-beta');
-  await ui.go(page, '#/campaigns/d15-alpha'); // the editor refreshes the cached campaign list
+  await ui.go(page, '/campaigns/d15-alpha'); // the editor refreshes the cached campaign list
   await page.locator('.editor').waitFor();
-  await ui.go(page, '#/campaigns');
+  await ui.go(page, '/campaigns');
   await page.locator('table.grid tbody tr', { hasText: 'D15 Alpha' }).locator('input[type=checkbox]').check();
   await page.locator('table.grid tbody tr', { hasText: 'D15 Beta' }).locator('input[type=checkbox]').check();
   await page.locator('button', { hasText: 'Сравнить' }).click();
@@ -54,7 +54,7 @@ await runUi('campaigns-list', async (ui) => {
   const statsOf = async (id) => (await ui.json('/stats?campaign=' + id)).clicks;
   const otherBefore = await statsOf('d15-alpha');
   assert.equal(otherBefore, 3);
-  await ui.go(page, '#/campaigns/ui-clear');
+  await ui.go(page, '/campaigns/ui-clear');
   const zone = page.getByRole('region', { name: 'Очистить статистику' });
   await zone.waitFor();
   const clearBtn = zone.getByRole('button', { name: 'Очистить статистику' });

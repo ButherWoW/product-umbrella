@@ -85,8 +85,10 @@ test('REQUIRE_LOGIN + ADMIN_TOKEN: private reports, public tracking, token-gated
   assert.equal((await call('/stats')).status, 401);
   assert.equal((await call('/api/campaigns')).status, 401);
   assert.equal((await call('/stats/timeseries')).status, 401);
-  assert.equal((await call('/dashboard')).status, 302);
-  assert.equal((await call('/admin')).status, 200, 'login page stays reachable');
+  assert.equal((await call('/dashboard')).status, 200, 'panel pages are the shell; the panel itself asks for a login');
+  assert.equal((await call('/login')).status, 200, 'login page stays reachable');
+  assert.equal((await call('/campaigns/demo')).status, 200, 'deep links load the shell');
+  assert.equal((await call('/admin')).status, 302, 'old panel address redirects');
   assert.equal((await call('/health')).status, 200);
   assert.equal((await call('/r/demo/offer-1')).status, 302, 'tracking stays public');
   assert.equal((await call('/api/auth/me')).json.loginRequired, true);
@@ -196,7 +198,8 @@ test('security headers: strict CSP and no framing on the panel, tracking redirec
   const dataDir = await mkdtemp(join(tmpdir(), 'umbrella-headers-'));
   const server = await startTestServer(dataDir, { BASE_PATH: '/umbrella' });
   t.after(async () => { await server.stop(); await rm(dataDir, { recursive: true, force: true }); });
-  const admin = await fetch(server.url + '/admin');
+  const admin = await fetch(server.url + '/campaigns/some-id');
+  assert.equal(admin.status, 200);
   const csp = admin.headers.get('content-security-policy');
   assert.match(csp, /script-src 'self'/);
   assert.match(csp, /frame-ancestors 'none'/);
@@ -204,6 +207,13 @@ test('security headers: strict CSP and no framing on the panel, tracking redirec
   const html = await admin.text();
   assert.ok(!/<script>/.test(html), 'no inline scripts in the panel shell');
   assert.match(html, /<meta name="umbrella-base" content="\/umbrella">/);
+  assert.match(html, /src="\/umbrella\/admin\/admin\.js"/, 'assets get the base path');
+  assert.match(html, /href="\/umbrella\/campaigns" data-nav="campaigns"/, 'menu links get the base path');
+  assert.ok(!html.includes('href="#/'), 'no hash links left');
+  const old = await fetch(server.url + '/admin', { redirect: 'manual' });
+  assert.deepEqual([old.status, old.headers.get('location')], [302, '/umbrella/'], '/admin → base (the browser keeps #/section)');
+  assert.equal((await fetch(server.url + '/nope')).status, 404, 'unknown paths are not the shell');
+  assert.equal((await fetch(server.url + '/campaigns/a/b')).status, 404);
   const api = await fetch(server.url + '/api/campaigns');
   assert.equal(api.headers.get('x-content-type-options'), 'nosniff');
   assert.equal(api.headers.get('referrer-policy'), 'same-origin');
@@ -222,8 +232,12 @@ test('tracking domains: only tracking routes on non-primary hosts, links without
   const get = (path, host, headers = {}) => new Promise((resolve, reject) => {
     http.get({ host: '127.0.0.1', port, path, headers: { host, ...headers } }, (res) => { res.resume(); resolve({ status: res.statusCode, location: res.headers.location }); }).on('error', reject);
   });
-  assert.equal((await get('/admin', 'panel.test')).status, 200);
+  assert.equal((await get('/admin', 'panel.test')).status, 302);
   assert.equal((await get('/admin', 'track.example.com')).status, 404, 'panel is not served on tracking domains');
+  for (const path of ['/', '/login', '/dashboard', '/campaigns', '/campaigns/demo', '/reports', '/admin/admin.js']) {
+    assert.equal((await get(path, 'panel.test')).status, 200, `${path} on the primary host`);
+    assert.equal((await get(path, 'track.example.com')).status, 404, `${path} is not served on tracking domains`);
+  }
   assert.equal((await get('/api/campaigns', 'track.example.com')).status, 404);
   assert.equal((await get('/stats', 'track.example.com')).status, 404);
   assert.equal((await get('/r/demo/offer-1', 'track.example.com')).status, 302, 'tracking works');

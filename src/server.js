@@ -21,6 +21,7 @@ import { createBindingStore, bindingKey, boundChoice, streamRef, parseBindMode, 
 import { createMonitor, MONITOR_MODES } from './monitor.js';
 import { BOT_UA_RE, DATACENTER_RE, cloakingCondition, cloakingMessage, disabledByPolicy, streamPolicyError } from './stream-policy.js';
 import { createRateLimiter, createLoginLimiter, loginLimitsFromEnv } from './rate-limit.js';
+import { isPanelPath } from './panel-routes.js';
 import { createJournalIndex, createClickCounters, createScanQueue, createOldClickLookup, scanJournalLines } from './journal-index.js';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -1420,12 +1421,12 @@ function safeEqual(a, b) {
 const ADMIN_CSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'";
 function securityHeaders(res, path) {
   res.setHeader('x-content-type-options', 'nosniff');
-  if (path === '/admin' || path.startsWith('/admin/') || path.startsWith('/api/') || path === '/stats' || path.startsWith('/stats/') || path === '/dashboard' || path.startsWith('/assets/')) {
+  if (isPanelPath(path) || path === '/admin' || path.startsWith('/admin/') || path.startsWith('/api/') || path === '/stats' || path.startsWith('/stats/') || path.startsWith('/assets/')) {
     res.setHeader('x-frame-options', 'DENY');
     res.setHeader('referrer-policy', 'same-origin');
     res.setHeader('cross-origin-opener-policy', 'same-origin');
   }
-  if (path === '/admin' || path.startsWith('/admin/')) res.setHeader('content-security-policy', ADMIN_CSP);
+  if (isPanelPath(path) || path === '/admin' || path.startsWith('/admin/')) res.setHeader('content-security-policy', ADMIN_CSP);
 }
 
 function json(res, status, body) {
@@ -1806,7 +1807,8 @@ function sessionCookie(req, token, maxAgeSeconds) {
   return `${SESSION_COOKIE}=${token}; Path=${basePath || '/'}; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}${secure ? '; Secure' : ''}`;
 }
 
-const isPrivatePath = (p) => (p.startsWith('/api/') && !p.startsWith('/api/auth/')) || p === '/stats' || p.startsWith('/stats/') || p === '/dashboard' || p.startsWith('/assets/');
+// Panel pages (src/panel-routes.js) are not private: the shell loads without a session and shows /login.
+const isPrivatePath = (p) => (p.startsWith('/api/') && !p.startsWith('/api/auth/')) || p === '/stats' || p.startsWith('/stats/') || p.startsWith('/assets/');
 
 async function readJson(req, maxBytes = 64 * 1024) {
   // Already read by the hideRevenue write check (with the largest route limit); the route's own limit still applies.
@@ -2108,10 +2110,7 @@ const server = http.createServer(async (req, res) => {
       req.user = found.user;
       req.apiKey = found.key;
     } else req.user = await sessionUser(req);
-    if (requireLogin && isPrivatePath(url.pathname) && !req.user && !bearerAuthorized(req)) {
-      if (url.pathname === '/dashboard') { res.writeHead(302, { location: `${basePath}/admin` }); return res.end(); }
-      return json(res, 401, { error: 'login_required' });
-    }
+    if (requireLogin && isPrivatePath(url.pathname) && !req.user && !bearerAuthorized(req)) return json(res, 401, { error: 'login_required' });
     // Read-only role: every write to the panel API is refused; signing in and out stays possible.
     if (isViewer(req) && !['GET', 'HEAD'].includes(req.method) && isPrivatePath(url.pathname)) return json(res, 403, { error: 'read_only' });
     if (hidesRevenue(req)) {
@@ -2824,22 +2823,27 @@ const server = http.createServer(async (req, res) => {
       await audit(req, 'update', 'campaign', id, current, campaigns.get(id));
       return json(res, 200, { id, streams });
     }
-    // The legacy inline /dashboard page is gone (the panel is /admin); old bookmarks are redirected.
-    if (url.pathname === '/dashboard' && req.method === 'GET') { res.writeHead(302, { location: `${basePath}/admin` }); return res.end(); }
     // The no-cloaking rule shared with the panel: one module, so the editor and the API refuse the same conditions.
     if (url.pathname === '/admin/stream-policy.js' && req.method === 'GET') {
       res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store' });
       return res.end(await readFile(join(root, 'src', 'stream-policy.js')));
     }
-    const adminAsset = { '/admin': ['index.html', 'text/html'], '/admin/': ['index.html', 'text/html'], '/admin/admin.js': ['admin.js', 'text/javascript'], '/admin/admin.css': ['admin.css', 'text/css'] }[url.pathname];
+    const adminAsset = { '/admin/admin.js': ['admin.js', 'text/javascript'], '/admin/admin.css': ['admin.css', 'text/css'] }[url.pathname];
     if (adminAsset && req.method === 'GET') {
       res.writeHead(200, { 'content-type': `${adminAsset[1]}; charset=utf-8`, 'cache-control': 'no-store' });
-      const body = await readFile(join(root, 'public', 'admin', adminAsset[0]));
-      if (adminAsset[0] !== 'index.html') return res.end(body);
-      // The base path goes into a meta tag (not an inline script) so the panel can run under a strict CSP.
-      return res.end(String(body).replaceAll('"/admin/', `"${basePath}/admin/`).replace('<head>', `<head>\n<meta name="umbrella-base" content="${basePath}">`));
+      return res.end(await readFile(join(root, 'public', 'admin', adminAsset[0])));
     }
-    if (url.pathname === '/' && req.method === 'GET') { res.writeHead(302, { location: `${basePath}/admin` }); return res.end(); }
+    // The panel used to live at /admin#/section. The browser keeps the #fragment across the redirect and the
+    // panel turns #/campaigns into /campaigns.
+    if ((url.pathname === '/admin' || url.pathname === '/admin/') && req.method === 'GET') { res.writeHead(302, { location: `${basePath}/` }); return res.end(); }
+    // Panel pages: /, /login, /dashboard, /campaigns, /campaigns/<id>, /reports… (src/panel-routes.js) get the same shell.
+    if (req.method === 'GET' && (url.pathname === '/' || isPanelPath(url.pathname))) {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+      const body = await readFile(join(root, 'public', 'admin', 'index.html'), 'utf8');
+      // Root-relative links (assets and menu) get the base path. It goes into a meta tag (not an inline script)
+      // so the panel can run under a strict CSP.
+      return res.end(body.replaceAll('="/', `="${basePath}/`).replace('<head>', `<head>\n<meta name="umbrella-base" content="${basePath}">`));
+    }
     if (url.pathname === '/health') {
       // db: 'up' | 'down' (SELECT 1 with a short timeout) when PostgreSQL is attached; degraded when DATABASE_URL is set
       // but PostgreSQL is down or was unreachable at startup (JSONL fallback). Counters only, no error texts.

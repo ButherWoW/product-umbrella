@@ -7,7 +7,7 @@ await runUi('reports', async (ui) => {
   await ui.campaign('ui-flows', 'UI flows');
   for (let i = 0; i < 3; i++) await ui.click('/r/ui-flows');
   const page = await ui.newPage();
-  await ui.openWithKey(page, '#/reports');
+  await ui.openWithKey(page, '/reports');
 
   // Saved reports: two reports with different groups+periods survive a reload and restore their filters.
   await page.getByRole('heading', { name: 'Отчёт' }).waitFor();
@@ -31,7 +31,7 @@ await runUi('reports', async (ui) => {
   await page.getByRole('button', { name: 'Открыть Rep-1' }).waitFor();
   await page.getByRole('button', { name: 'Открыть Rep-2' }).waitFor();
   await page.reload();
-  await page.goto(ui.url + '/admin#/reports');
+  await page.goto(ui.url + '/reports');
   await page.getByRole('heading', { name: 'Отчёт' }).waitFor();
   await page.getByRole('button', { name: 'Открыть Rep-1' }).waitFor();
   await page.getByRole('button', { name: 'Открыть Rep-2' }).waitFor();
@@ -45,7 +45,7 @@ await runUi('reports', async (ui) => {
   assert.equal(await page.getByLabel('Период').inputValue(), 'last_7_days', 'Rep-2 period restored');
 
   // The reload dropped the in-memory key.
-  await ui.openWithKey(page, '#/reports');
+  await ui.openWithKey(page, '/reports');
   // Heatmap: 7×24 grid (168 cells), click sum matches /stats, no page horizontal scroll at 390px.
   await page.getByRole('heading', { name: 'Отчёт' }).waitFor();
   const statsForHeatmap = await ui.json('/stats');
@@ -64,7 +64,7 @@ await runUi('reports', async (ui) => {
   // D12: expandable rows in the report.
   await ui.api('/api/campaigns', { id: 'd12-camp', name: 'D12 Camp', streams: [{ name: 'S1', offers: [{ offerId: 'offer-1', weight: 1 }] }] });
   await ui.click('/r/d12-camp');
-  await ui.go(page, '#/reports?group=campaign');
+  await ui.go(page, '/reports?group=campaign');
   await page.getByRole('heading', { name: 'Отчёт' }).waitFor();
   const d12Row = page.locator('table.grid tbody tr', { hasText: 'D12 Camp' });
   await d12Row.waitFor();
@@ -78,7 +78,7 @@ await runUi('reports', async (ui) => {
   assert.equal(await page.locator('tr.sub-row').count(), 0, 'sub-row removed on second click');
 
   // D17: CSV export from reports.
-  await ui.go(page, '#/reports?group=campaign');
+  await ui.go(page, '/reports?group=campaign');
   await page.getByRole('heading', { name: 'Отчёт' }).waitFor();
   await page.locator('table.grid tbody tr', { hasText: 'UI flows' }).waitFor();
   const [download] = await Promise.all([page.waitForEvent('download'), page.locator('button[aria-label="CSV"]').click()]);
@@ -90,7 +90,7 @@ await runUi('reports', async (ui) => {
   // Task 8: period comparison adds Δ% columns, «—» without previous data, disabled for «За всё время».
   await ui.campaign('t8-compare', 'T8 Compare');
   await ui.click('/r/t8-compare');
-  await ui.go(page, '#/reports?group=campaign&campaign=t8-compare');
+  await ui.go(page, '/reports?group=campaign&campaign=t8-compare');
   await page.getByRole('heading', { name: 'Отчёт' }).waitFor();
   await page.getByRole('combobox', { name: 'Период' }).selectOption('today');
   await page.locator('table.grid tbody tr', { hasText: 'T8 Compare' }).waitFor();

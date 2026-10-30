@@ -6,7 +6,7 @@ import { runUi, TOKEN, MAIN_STREAM } from './setup.mjs';
 
 await runUi('accounts', { env: { REQUIRE_LOGIN: '1' } }, async (ui) => {
   const p2 = await ui.newPage();
-  await p2.goto(ui.url + '/admin#/campaigns');
+  await p2.goto(ui.url + '/campaigns');
   await p2.getByRole('heading', { name: 'Первый запуск' }).waitFor();
   assert.ok(await p2.locator('#sidebar').isHidden(), 'navigation hidden before login');
   await p2.getByLabel('Email').fill('owner@example.com');
@@ -47,14 +47,14 @@ await runUi('accounts', { env: { REQUIRE_LOGIN: '1' } }, async (ui) => {
   assert.ok((await keyRow.innerText()).includes('umb_…' + secret.slice(-4)));
   assert.ok(!(await p2.locator('body').innerText()).includes(secret), 'the secret is gone after closing the dialog');
   await p2.setViewportSize({ width: 390, height: 844 });
-  for (const hash of ['#/keys', '#/users']) {
-    await p2.goto(ui.url + '/admin' + hash);
+  for (const path of ['/keys', '/users']) {
+    await p2.goto(ui.url + path);
     await p2.locator('table.grid').waitFor();
     const overflow = await p2.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
-    assert.ok(overflow <= 1, `${hash} overflows by ${overflow}px at 390px`);
+    assert.ok(overflow <= 1, `${path} overflows by ${overflow}px at 390px`);
   }
   await p2.setViewportSize({ width: 1280, height: 900 });
-  await p2.goto(ui.url + '/admin#/keys');
+  await p2.goto(ui.url + '/keys');
   const del = p2.locator('table.grid tbody tr', { hasText: 'UI script' }).getByRole('button', { name: 'Удалить ключ UI script' });
   await del.click();
   await p2.locator('table.grid tbody tr', { hasText: 'Удалить?' }).waitFor();
@@ -72,7 +72,7 @@ await runUi('accounts', { env: { REQUIRE_LOGIN: '1' } }, async (ui) => {
   await ui.click('/r/buyers-c1');
   await ui.click('/r/buyers-c1');
   await ui.click('/r/buyers-c2');
-  await p2.goto(ui.url + '/admin#/buyers');
+  await p2.goto(ui.url + '/buyers');
   await p2.getByRole('heading', { name: 'Сводка по баерам' }).waitFor();
   assert.ok(await p2.locator('[data-nav=buyers]').isVisible(), 'owner sees buyers summary nav item');
   await p2.locator('table.grid tfoot tr').waitFor();
@@ -91,15 +91,15 @@ await runUi('accounts', { env: { REQUIRE_LOGIN: '1' } }, async (ui) => {
   await p2.locator('#user-box', { hasText: 'buyer@example.com' }).waitFor();
   assert.ok(await p2.locator('[data-nav=users]').isHidden(), 'buyers do not see the users section');
   assert.ok(await p2.locator('[data-nav=buyers]').isHidden(), 'buyers do not see the buyers summary nav item');
-  // Navigating directly to #/buyers redirects a buyer to the dashboard.
-  await p2.goto(ui.url + '/admin#/buyers');
+  // Navigating directly to /buyers redirects a buyer to the dashboard.
+  await p2.goto(ui.url + '/buyers');
   await p2.getByRole('heading', { name: 'Дашборд' }).waitFor();
   await p2.locator('[data-nav=dashboard]').click();
   await p2.locator('.kpi', { hasText: 'Заработок баера' }).waitFor();
   assert.equal(await p2.getByRole('heading', { name: 'Баеры' }).count(), 0, 'buyers do not see the per-buyer table');
   // Ownership: a team offer is read-only for the buyer (badge, no edit/copy/archive); their own offer keeps the controls.
   await ui.api('/api/offers', { id: 'buyer-own', url: 'https://own.example.com/', ownerId: buyerUser.id });
-  await p2.goto(ui.url + '/admin#/offers');
+  await p2.goto(ui.url + '/offers');
   const teamRow = p2.locator('table.grid tbody tr', { hasText: 'offer-1' });
   const ownRow = p2.locator('table.grid tbody tr', { hasText: 'buyer-own' });
   await ownRow.waitFor();

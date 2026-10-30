@@ -11,11 +11,11 @@ await runUi('streams', async (ui) => {
   for (let i = 0; i < 3; i++) await ui.click('/r/ui-flows');
   const page = await ui.newPage();
 
-  await ui.go(page, '#/campaigns');
+  await ui.go(page, '/campaigns');
   await page.locator('table.grid tbody tr', { hasText: 'UI flows' }).waitFor();
   assert.ok(!(await page.locator('body').innerText()).includes('[object'), 'no stringified DOM nodes');
 
-  await ui.go(page, '#/campaigns/ui-flows');
+  await ui.go(page, '/campaigns/ui-flows');
   await page.locator('.stream .title').first().click();
   const dialog = page.getByRole('dialog', { name: 'Редактирование потока' });
   await dialog.getByRole('tab', { name: 'Схема' }).click();
@@ -44,7 +44,7 @@ await runUi('streams', async (ui) => {
   await lpDialog.locator('input[type=url]').fill('https://lp.example.net/?go={lp_click_url}');
   await lpDialog.getByRole('button', { name: 'Создать' }).click();
   await page.locator('table.grid tbody tr', { hasText: 'UI landing' }).waitFor();
-  await ui.go(page, '#/campaigns/ui-flows');
+  await ui.go(page, '/campaigns/ui-flows');
   await page.locator('.stream .title').nth(1).click();
   const spare = page.getByRole('dialog', { name: 'Редактирование потока' });
   await spare.getByRole('tab', { name: 'Схема' }).click();
@@ -79,7 +79,7 @@ await runUi('streams', async (ui) => {
   // Connection type: stream filter checkboxes (with «НЕ») and the «Тип соединения» report grouping.
   await ui.campaign('conn-ui', 'Conn UI');
   await ui.click('/r/conn-ui');
-  await ui.go(page, '#/campaigns/conn-ui');
+  await ui.go(page, '/campaigns/conn-ui');
   await page.locator('.stream .title').first().click();
   const connDlg = page.getByRole('dialog', { name: 'Редактирование потока' });
   await connDlg.getByRole('tab', { name: 'Фильтры' }).click();
@@ -97,13 +97,13 @@ await runUi('streams', async (ui) => {
   await ui.save(page);
   const connSaved = (await ui.json('/api/campaigns')).campaigns['conn-ui'].streams[0].conditions;
   assert.deepEqual([connSaved.connections, connSaved.not], [['mobile'], ['connections']], 'connection filter saved');
-  await ui.go(page, '#/reports?group=connection&campaign=conn-ui');
+  await ui.go(page, '/reports?group=connection&campaign=conn-ui');
   await page.locator('.chip-btn.on', { hasText: 'Тип соединения' }).waitFor();
   await page.locator('table.grid tbody tr', { hasText: '(неизвестно)' }).waitFor();
 
   // Visitor binding: «Привязка посетителя» and «Срок привязки, часов» round-trip through save.
   await ui.api('/api/campaigns', { id: 'bind-ui', name: 'Bind UI', streams: MAIN_STREAM });
-  await ui.go(page, '#/campaigns/bind-ui');
+  await ui.go(page, '/campaigns/bind-ui');
   const bindSelect = page.getByRole('combobox', { name: 'Привязка посетителя' });
   await bindSelect.waitFor();
   assert.equal(await bindSelect.inputValue(), 'off', 'binding is off by default');

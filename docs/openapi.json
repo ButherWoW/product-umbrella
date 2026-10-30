@@ -4938,11 +4938,11 @@
         ]
       }
     },
-    "/admin": {
+    "/": {
       "get": {
-        "summary": "Admin panel (HTML)",
-        "description": "Single-page panel; static files /admin/admin.js and /admin/admin.css are served next to it. Under BASE_PATH the links are rewritten.",
-        "operationId": "adminPage",
+        "summary": "Admin panel (HTML shell)",
+        "description": "The panel is a single page with path URLs. The same HTML shell answers GET /, /login and every panel section: /dashboard, /campaigns, /campaigns/{id} (and /campaigns/new), /offers, /landings, /sources, /networks, /trends, /reports, /clicks, /conversions, /botlog, /buyers, /users, /keys (list: src/panel-routes.js); query strings such as /reports?group=stream&campaign=… are read by the panel. Without a session the panel shows /login?next=<page>. Static files: /admin/admin.js, /admin/admin.css. Under BASE_PATH all links carry the prefix. Not served on tracking domains (404). Any other path answers 404.",
+        "operationId": "panelPage",
         "tags": [
           "ui"
         ],
@@ -4954,23 +4954,23 @@
             }
           }
         },
-        "x-summary-ru": "панель управления (HTML)"
+        "x-summary-ru": "панель управления (HTML): `/`, `/login`, `/campaigns`, `/campaigns/{id}`, `/offers`, `/reports?…`, `/clicks` и другие разделы"
       }
     },
-    "/dashboard": {
+    "/admin": {
       "get": {
-        "summary": "Legacy link to the panel",
-        "description": "The built-in dashboard page was removed; the old URL answers 302 to /admin (under BASE_PATH).",
-        "operationId": "dashboardPage",
+        "summary": "Old panel address",
+        "description": "The panel used to live at /admin#/section. Answers 302 to / (under BASE_PATH); the browser keeps the #fragment and the panel turns #/campaigns into /campaigns.",
+        "operationId": "adminPage",
         "tags": [
           "ui"
         ],
         "responses": {
           "302": {
-            "description": "Redirect to /admin"
+            "description": "Redirect to the panel root"
           }
         },
-        "x-summary-ru": "старая ссылка: `302` на `/admin` (встроенная страница удалена)"
+        "x-summary-ru": "старый адрес панели: `302` на `/`, ссылки вида `/admin#/campaigns` открывают `/campaigns`"
       }
     },
     "/stats/bots": {

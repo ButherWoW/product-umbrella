@@ -7,7 +7,7 @@ await runUi('click-log', async (ui) => {
   const t9Ua = '<img src=x onerror=alert(1)>';
   const t9cid = await ui.click('/r/t9-card?sub_id_1=t9-sub-one', { 'user-agent': t9Ua });
   const page = await ui.newPage();
-  await ui.openWithKey(page, '#/clicks?campaign=t9-card');
+  await ui.openWithKey(page, '/clicks?campaign=t9-card');
   await page.getByRole('heading', { name: 'Лог кликов' }).waitFor();
   const t9Row = page.locator('table.grid tbody tr', { hasText: t9cid.slice(0, 13) });
   await t9Row.click();
