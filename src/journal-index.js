@@ -47,7 +47,7 @@ function clickSummary(item) {
 }
 
 export function createJournalIndex({ clickLimit = 200000, visitorLimit = 200000 } = {}) {
-  let counts, clicks, lastClick, conversions, offerConversions, sourcePostbacks, clicksEvicted;
+  let counts, clicks, lastClick, conversions, offerConversions, sourcePostbacks, clicksEvicted, newestEvictedVisit;
   function reset() {
     counts = new Map(); // c|campaign|day, o|offer|day, t|campaign → clicks
     clicks = new Map(); // clickId → click summary (LRU)
@@ -56,9 +56,18 @@ export function createJournalIndex({ clickLimit = 200000, visitorLimit = 200000 
     offerConversions = new Map(); // offerId → Set of conversion keys
     sourcePostbacks = new Set(); // clickId|status
     clicksEvicted = false;
+    newestEvictedVisit = -Infinity; // latest click time among visitors pushed out of lastClick
   }
   reset();
   const bump = (key) => counts.set(key, (counts.get(key) || 0) + 1);
+  function markVisit(key, at) {
+    lastClick.delete(key);
+    lastClick.set(key, at);
+    if (lastClick.size <= visitorLimit) return;
+    const [oldest, oldestAt] = lastClick.entries().next().value;
+    lastClick.delete(oldest);
+    if (oldestAt > newestEvictedVisit) newestEvictedVisit = oldestAt;
+  }
 
   function observe(item) {
     if (!item || typeof item !== 'object') return;
@@ -68,7 +77,7 @@ export function createJournalIndex({ clickLimit = 200000, visitorLimit = 200000 
       if (item.ip) {
         const at = Date.parse(item.at);
         const key = `${item.campaign}|${item.ip}`;
-        if (Number.isFinite(at) && !(lastClick.get(key) > at)) lruSet(lastClick, key, at, visitorLimit);
+        if (Number.isFinite(at) && !(lastClick.get(key) > at)) markVisit(key, at);
       }
       if (lruSet(clicks, item.clickId, clickSummary(item), clickLimit)) clicksEvicted = true;
     } else if (item.type === 'conversion' && item.clickId) {
@@ -140,7 +149,9 @@ export function createJournalIndex({ clickLimit = 200000, visitorLimit = 200000 
     get complete() { return !clicksEvicted; },
     remember: (clickId, item) => { if (item && lruSet(clicks, clickId, clickSummary(item), clickLimit)) clicksEvicted = true; },
     lastClickAt: (campaign, ip) => lastClick.get(`${campaign}|${ip}`) ?? null,
-    markClick: (campaign, ip, at = Date.now()) => { if (ip) lruSet(lastClick, `${campaign}|${ip}`, at, visitorLimit); },
+    markClick: (campaign, ip, at = Date.now()) => { if (ip) markVisit(`${campaign}|${ip}`, at); },
+    // Whether a lastClickAt miss is final for clicks at or after sinceMs (no visitor seen since then was pushed out).
+    visitorsCompleteSince: (sinceMs) => newestEvictedVisit < sinceMs,
     // Latest conversion of a click and tid ({ status, revenue, currency }) or null; all conversions are indexed.
     conversion: (clickId, tid = '') => {
       const cv = conversions.get(`${clickId}|${conversionTid(tid)}`);

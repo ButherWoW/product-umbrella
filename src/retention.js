@@ -96,7 +96,8 @@ export function campaignPlan(campaign, beforeMs = null) {
   };
 }
 
-// Retention: clicks older than the cutoff without any conversion (and their landing clicks), old bot events.
+// Retention: clicks older than the cutoff without any conversion (and their landing clicks), old bot events and
+// old postback journal entries (in/out: a log of deliveries, the conversions themselves stay).
 // Converted clicks and their conversions are kept forever.
 export function retentionPlan(cutoffMs) {
   const converted = new Set();
@@ -107,7 +108,7 @@ export function retentionPlan(cutoffMs) {
       else if (e.type === 'click' && before(e.at, cutoffMs)) old.add(e.clickId);
     },
     drop(e) {
-      if (e.type === 'bot') return before(e.at, cutoffMs);
+      if (e.type === 'bot' || e.type === 'postback_in' || e.type === 'postback_out') return before(e.at, cutoffMs);
       if (e.type === 'click' || e.type === 'lp_click') return old.has(e.clickId) && !converted.has(e.clickId);
       return false;
     },
@@ -146,6 +147,7 @@ export function retentionRows(db, cutoffIso) {
     const clicks = await client.query(`DELETE FROM clicks c WHERE c.created_at < $1
       AND NOT EXISTS (SELECT 1 FROM conversions v WHERE v.click_id = c.click_id) RETURNING lp_clicked_at`, [cutoffIso]);
     const bots = await client.query('DELETE FROM bots WHERE created_at < $1', [cutoffIso]);
-    return { clicks: clicks.rowCount, conversions: 0, lpClicks: clicks.rows.filter((r) => r.lp_clicked_at).length, bots: bots.rowCount, postbacks: 0 };
+    const postbacks = await client.query('DELETE FROM postbacks WHERE created_at < $1', [cutoffIso]);
+    return { clicks: clicks.rowCount, conversions: 0, lpClicks: clicks.rows.filter((r) => r.lp_clicked_at).length, bots: bots.rowCount, postbacks: postbacks.rowCount };
   });
 }

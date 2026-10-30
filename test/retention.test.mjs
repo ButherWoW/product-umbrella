@@ -104,7 +104,7 @@ test('clear-stats removes only one campaign\'s events, respects `before`, keeps 
   assert.deepEqual(audit[1].changes.before, [null, '2026-06-01']);
 });
 
-test('RETENTION_DAYS removes old unconverted clicks and bots, keeps converted clicks forever', { timeout: 30000 }, async (t) => {
+test('RETENTION_DAYS removes old unconverted clicks, bots and postback journal entries, keeps converted clicks forever', { timeout: 30000 }, async (t) => {
   const ids = { paid: randomUUID(), unpaid: randomUUID(), recent: randomUUID() };
   const old = new Date(Date.now() - 40 * 86400000).toISOString();
   const recent = new Date(Date.now() - 5 * 86400000).toISOString();
@@ -116,6 +116,9 @@ test('RETENTION_DAYS removes old unconverted clicks and bots, keeps converted cl
     line('bot', old, { campaign: 'ret', reason: 'ua' }),
     line('bot', recent, { campaign: 'ret', reason: 'ua' }),
     line('click', recent, { clickId: ids.recent, campaign: 'ret', offerId: 'offer-1' }),
+    line('postback_in', old, { clickId: ids.paid, campaign: 'ret', statusCode: 200 }),
+    line('postback_out', old, { clickId: ids.paid, campaign: 'ret', statusCode: 200, attempt: 1 }),
+    line('postback_in', recent, { clickId: ids.paid, campaign: 'ret', statusCode: 200 }),
   ], { RETENTION_DAYS: '30', RETENTION_DELAY_MS: '0' });
   let journal = [];
   for (let i = 0; i < 100 && !journal.some((e) => e.action === 'retention'); i++) {
@@ -124,12 +127,13 @@ test('RETENTION_DAYS removes old unconverted clicks and bots, keeps converted cl
   }
   const done = journal.find((e) => e.action === 'retention');
   assert.ok(done, 'retention ran and wrote an audit entry');
-  assert.deepEqual([done.changes.clicks, done.changes.lpClicks, done.changes.bots], [[null, 1], [null, 1], [null, 1]]);
+  assert.deepEqual([done.changes.clicks, done.changes.lpClicks, done.changes.bots, done.changes.postbacks], [[null, 1], [null, 1], [null, 1], [null, 2]]);
   assert.ok(journal.some((e) => e.type === 'click' && e.clickId === ids.paid), 'converted click kept');
   assert.ok(journal.some((e) => e.type === 'conversion' && e.clickId === ids.paid), 'conversion kept');
   assert.ok(!journal.some((e) => e.clickId === ids.unpaid), 'old unconverted click and its lp click removed');
   assert.ok(journal.some((e) => e.clickId === ids.recent), 'recent click kept');
   assert.equal(journal.filter((e) => e.type === 'bot').length, 1, 'only the recent bot event is left');
+  assert.deepEqual(journal.filter((e) => e.type.startsWith('postback_')).map((e) => e.at), [recent], 'only the recent postback entry is left (the conversion stays)');
 });
 
 test('journal gate: a rewrite waits for in-flight appends and holds new ones until it finishes', async () => {
