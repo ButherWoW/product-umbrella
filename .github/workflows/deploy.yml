@@ -314,12 +314,20 @@ jobs:
 
       - name: Public check
         run: |
-          # demo…: the public demo (/umbrella/demo, made-up data in the browser, no login).
-          for path in login campaigns demo demo/campaigns demo/admin/demo.js; do
+          # Panel pages and the demo are behind the PIN pad on https://nespizdili.lol/ (deploy/nginx-umbrella.conf):
+          # without a pass they must be a 404 from outside, and they must work on the app itself.
+          for path in login campaigns admin/admin.js demo demo/campaigns demo/admin/demo.js; do
             code=$(curl -s -o /dev/null -w "%{http_code}" "https://nespizdili.lol/umbrella/$path")
-            echo "https://nespizdili.lol/umbrella/$path -> $code"
-            [ "$code" = 200 ] || exit 1
+            echo "https://nespizdili.lol/umbrella/$path without the PIN -> $code"
+            [ "$code" = 404 ] || exit 1
           done
-          curl -sf https://nespizdili.lol/umbrella/demo | grep -q 'name="umbrella-demo"' || { echo "/umbrella/demo is not the demo shell"; exit 1; }
+          code=$(curl -s -o /dev/null -w "%{http_code}" https://nespizdili.lol/umbrella/health)
+          echo "https://nespizdili.lol/umbrella/health -> $code"; [ "$code" = 200 ] || exit 1
+          ssh root@$HOST 'set -e
+            for path in login campaigns demo demo/campaigns demo/admin/demo.js; do
+              code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:4110/$path")
+              echo "app /$path -> $code"; [ "$code" = 200 ]
+            done
+            curl -sf http://127.0.0.1:4110/demo | grep -q "name=\"umbrella-demo\"" || { echo "/demo is not the demo shell"; exit 1; }'
           echo "demo ok"
           curl -sf https://nespizdili.lol/ -o /dev/null && echo "main site still ok"
