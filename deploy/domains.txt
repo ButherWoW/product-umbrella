@@ -2,3 +2,6 @@
 # The deploy then creates an nginx block and a Let's Encrypt certificate; domains that do not resolve here are skipped.
 # Example:
 # track.example.com
+# Перенесены из Keitaro (кампании группы Erland). Пока DNS указывает на Keitaro — деплой их пропускает.
+ninja-promo.cc
+ccdiscount-promo.cc
