@@ -2,7 +2,8 @@ import './log-setup.js';
 import http from 'node:http';
 import { randomUUID, createHash, timingSafeEqual } from 'node:crypto';
 import { mkdir, appendFile, readFile, writeFile as fsWriteFile, chmod, stat } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { existsSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { db, query, closeDb, dbStatus } from './db.js';
 import { readJournal, endsWithNewline, journalBadLines, noteBadLines } from './journal.js';
@@ -2102,17 +2103,26 @@ const PANEL_ASSETS = {
   '/admin/demo.js': ['public/admin/demo.js', 'text/javascript'], '/admin/stream-policy.js': ['src/stream-policy.js', 'text/javascript'],
   '/admin/stats-report.js': ['src/stats-report.js', 'text/javascript'],
 };
+// PANEL_BUILD=1 (production): the same files from build/panel/, made by scripts/obfuscate-panel.mjs in the deploy —
+// obfuscated JS, CSS and the shell without comments. Checked at startup, so a release without them never goes live.
+const panelBuild = /^(1|true|yes)$/i.test(process.env.PANEL_BUILD || '') ? join(root, 'build', 'panel') : null;
+const panelFile = (file) => (panelBuild ? join(panelBuild, basename(file)) : join(root, file));
+if (panelBuild) {
+  for (const file of [...Object.values(PANEL_ASSETS).map(([f]) => f), 'public/admin/index.html']) {
+    if (!existsSync(panelFile(file))) throw new Error(`PANEL_BUILD=1 but ${panelFile(file)} is missing (run scripts/obfuscate-panel.mjs)`);
+  }
+}
 async function sendPanelAsset(res, path) {
   const [file, type] = PANEL_ASSETS[path];
   res.writeHead(200, { 'content-type': `${type}; charset=utf-8`, 'cache-control': 'no-store' });
-  return res.end(await readFile(join(root, file)));
+  return res.end(await readFile(panelFile(file)));
 }
 
 // The panel page. Root-relative links (assets and menu) get the base path. It goes into a meta tag (not an inline
 // script) so the panel can run under a strict CSP. The demo shell links inside /demo, carries the umbrella-demo marker
 // that switches admin.js to made-up data, and shows the demo strip without any script.
 async function panelShell({ demo = false } = {}) {
-  const body = await readFile(join(root, 'public', 'admin', 'index.html'), 'utf8');
+  const body = await readFile(panelFile('public/admin/index.html'), 'utf8');
   const html = body.replaceAll('="/', `="${basePath}${demo ? DEMO_PREFIX : ''}/`).replace('<head>', `<head>\n<meta name="umbrella-base" content="${basePath}">`);
   if (!demo) return html;
   return html.replace('<head>', `<head>\n<meta name="umbrella-demo" content="1">\n<meta name="robots" content="noindex">`)
