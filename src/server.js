@@ -21,7 +21,7 @@ import { createBindingStore, bindingKey, boundChoice, streamRef, parseBindMode, 
 import { createMonitor, MONITOR_MODES } from './monitor.js';
 import { BOT_UA_RE, DATACENTER_RE, cloakingCondition, cloakingMessage, disabledByPolicy, streamPolicyError } from './stream-policy.js';
 import { createRateLimiter, createLoginLimiter, loginLimitsFromEnv } from './rate-limit.js';
-import { isPanelPath } from './panel-routes.js';
+import { DEMO_PREFIX, isDemoPanelPath, isDemoPath, isPanelPath } from './panel-routes.js';
 import { createJournalIndex, createClickCounters, createScanQueue, createOldClickLookup, scanJournalLines } from './journal-index.js';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -1421,12 +1421,12 @@ function safeEqual(a, b) {
 const ADMIN_CSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'";
 function securityHeaders(res, path) {
   res.setHeader('x-content-type-options', 'nosniff');
-  if (isPanelPath(path) || path === '/admin' || path.startsWith('/admin/') || path.startsWith('/api/') || path === '/stats' || path.startsWith('/stats/') || path.startsWith('/assets/')) {
+  if (isPanelPath(path) || isDemoPath(path) || path === '/admin' || path.startsWith('/admin/') || path.startsWith('/api/') || path === '/stats' || path.startsWith('/stats/') || path.startsWith('/assets/')) {
     res.setHeader('x-frame-options', 'DENY');
     res.setHeader('referrer-policy', 'same-origin');
     res.setHeader('cross-origin-opener-policy', 'same-origin');
   }
-  if (isPanelPath(path) || path === '/admin' || path.startsWith('/admin/')) res.setHeader('content-security-policy', ADMIN_CSP);
+  if (isPanelPath(path) || isDemoPath(path) || path === '/admin' || path.startsWith('/admin/')) res.setHeader('content-security-policy', ADMIN_CSP);
 }
 
 function json(res, status, body) {
@@ -2094,6 +2094,40 @@ async function handleAuthRoute(req, res, url) {
   return json(res, 404, { error: 'not_found' });
 }
 
+// Static panel files: /admin/<name> and, for the public demo, /demo/admin/<name>. stream-policy.js is the no-cloaking
+// rule shared with the server (the editor and the API refuse the same conditions); stats-report.js builds the demo's
+// reports the same way the server builds the real ones.
+const PANEL_ASSETS = {
+  '/admin/admin.js': ['public/admin/admin.js', 'text/javascript'], '/admin/admin.css': ['public/admin/admin.css', 'text/css'],
+  '/admin/demo.js': ['public/admin/demo.js', 'text/javascript'], '/admin/stream-policy.js': ['src/stream-policy.js', 'text/javascript'],
+  '/admin/stats-report.js': ['src/stats-report.js', 'text/javascript'],
+};
+async function sendPanelAsset(res, path) {
+  const [file, type] = PANEL_ASSETS[path];
+  res.writeHead(200, { 'content-type': `${type}; charset=utf-8`, 'cache-control': 'no-store' });
+  return res.end(await readFile(join(root, file)));
+}
+
+// The panel page. Root-relative links (assets and menu) get the base path. It goes into a meta tag (not an inline
+// script) so the panel can run under a strict CSP. The demo shell links inside /demo, carries the umbrella-demo marker
+// that switches admin.js to made-up data, and shows the demo strip without any script.
+async function panelShell({ demo = false } = {}) {
+  const body = await readFile(join(root, 'public', 'admin', 'index.html'), 'utf8');
+  const html = body.replaceAll('="/', `="${basePath}${demo ? DEMO_PREFIX : ''}/`).replace('<head>', `<head>\n<meta name="umbrella-base" content="${basePath}">`);
+  if (!demo) return html;
+  return html.replace('<head>', `<head>\n<meta name="umbrella-demo" content="1">\n<meta name="robots" content="noindex">`)
+    .replace('<body>', '<body class="demo">\n<div class="demo-banner" role="note">ДЕМО-РЕЖИМ — данные выдуманные, изменения не сохраняются</div>');
+}
+
+async function serveDemo(req, res, url) {
+  const asset = url.pathname.slice(DEMO_PREFIX.length);
+  if (req.method !== 'GET' && req.method !== 'HEAD') return json(res, 405, { error: 'method_not_allowed' });
+  if (asset.startsWith('/admin/') && Object.hasOwn(PANEL_ASSETS, asset)) return sendPanelAsset(res, asset);
+  if (!isDemoPanelPath(url.pathname)) return json(res, 404, { error: 'not_found' });
+  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+  return res.end(await panelShell({ demo: true }));
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -2102,6 +2136,9 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
       return res.end('Not Found');
     }
+    // Public demo (src/panel-routes.js): the shell and the panel's static files only, served before the IP allowlist and
+    // any session lookup. The demo answers its API calls in the browser (public/admin/demo.js) and never calls /api.
+    if (isDemoPath(url.pathname)) return await serveDemo(req, res, url);
     if (!isTrackingPath(url.pathname) && !adminIpAllowed(req)) return json(res, 403, { error: 'admin_ip_not_allowed' });
     const authorization = String(req.headers.authorization || '');
     if (!isTrackingPath(url.pathname) && authorization.startsWith(`Bearer ${API_KEY_PREFIX}`)) {
@@ -2823,26 +2860,14 @@ const server = http.createServer(async (req, res) => {
       await audit(req, 'update', 'campaign', id, current, campaigns.get(id));
       return json(res, 200, { id, streams });
     }
-    // The no-cloaking rule shared with the panel: one module, so the editor and the API refuse the same conditions.
-    if (url.pathname === '/admin/stream-policy.js' && req.method === 'GET') {
-      res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store' });
-      return res.end(await readFile(join(root, 'src', 'stream-policy.js')));
-    }
-    const adminAsset = { '/admin/admin.js': ['admin.js', 'text/javascript'], '/admin/admin.css': ['admin.css', 'text/css'] }[url.pathname];
-    if (adminAsset && req.method === 'GET') {
-      res.writeHead(200, { 'content-type': `${adminAsset[1]}; charset=utf-8`, 'cache-control': 'no-store' });
-      return res.end(await readFile(join(root, 'public', 'admin', adminAsset[0])));
-    }
+    if (Object.hasOwn(PANEL_ASSETS, url.pathname) && req.method === 'GET') return await sendPanelAsset(res, url.pathname);
     // The panel used to live at /admin#/section. The browser keeps the #fragment across the redirect and the
     // panel turns #/campaigns into /campaigns.
     if ((url.pathname === '/admin' || url.pathname === '/admin/') && req.method === 'GET') { res.writeHead(302, { location: `${basePath}/` }); return res.end(); }
     // Panel pages: /, /login, /dashboard, /campaigns, /campaigns/<id>, /reports… (src/panel-routes.js) get the same shell.
     if (req.method === 'GET' && (url.pathname === '/' || isPanelPath(url.pathname))) {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
-      const body = await readFile(join(root, 'public', 'admin', 'index.html'), 'utf8');
-      // Root-relative links (assets and menu) get the base path. It goes into a meta tag (not an inline script)
-      // so the panel can run under a strict CSP.
-      return res.end(body.replaceAll('="/', `="${basePath}/`).replace('<head>', `<head>\n<meta name="umbrella-base" content="${basePath}">`));
+      return res.end(await panelShell());
     }
     if (url.pathname === '/health') {
       // db: 'up' | 'down' (SELECT 1 with a short timeout) when PostgreSQL is attached; degraded when DATABASE_URL is set

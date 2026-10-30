@@ -30,7 +30,7 @@ jobs:
       - run: npm ci --no-audit --no-fund
       - name: Syntax check (catches files that tests do not import, e.g. migrate.js)
         run: |
-          for f in src/*.js scripts/*.mjs deploy/*.mjs public/admin/admin.js; do node --check "$f" || exit 1; done
+          for f in src/*.js scripts/*.mjs deploy/*.mjs public/admin/admin.js public/admin/demo.js; do node --check "$f" || exit 1; done
           if grep -l $'^\xEF\xBB\xBF' src/*.js public/admin/*.js public/admin/*.html scripts/*.mjs 2>/dev/null; then echo "::error::UTF-8 BOM found in the files above"; exit 1; fi
       - run: npm test
       - name: Shellcheck deploy scripts
@@ -314,9 +314,12 @@ jobs:
 
       - name: Public check
         run: |
-          for path in login campaigns; do
+          # demo…: the public demo (/umbrella/demo, made-up data in the browser, no login).
+          for path in login campaigns demo demo/campaigns demo/admin/demo.js; do
             code=$(curl -s -o /dev/null -w "%{http_code}" "https://nespizdili.lol/umbrella/$path")
             echo "https://nespizdili.lol/umbrella/$path -> $code"
             [ "$code" = 200 ] || exit 1
           done
+          curl -sf https://nespizdili.lol/umbrella/demo | grep -q 'name="umbrella-demo"' || { echo "/umbrella/demo is not the demo shell"; exit 1; }
+          echo "demo ok"
           curl -sf https://nespizdili.lol/ -o /dev/null && echo "main site still ok"

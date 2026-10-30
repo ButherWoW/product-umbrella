@@ -9,3 +9,9 @@ const SECTION_RE = new RegExp(`^/(?:login|${PANEL_SECTIONS.join('|')})/?$`);
 const CAMPAIGN_RE = /^\/campaigns\/[^/]{1,200}\/?$/;
 
 export const isPanelPath = (p) => p === '/' || SECTION_RE.test(p) || CAMPAIGN_RE.test(p);
+
+// Public demo: /demo and /demo/<panel path> get the same shell, marked as the demo. The panel then answers its own API
+// calls in the browser with made-up data (public/admin/demo.js), so nothing under /demo needs a session or reaches /api.
+export const DEMO_PREFIX = '/demo';
+export const isDemoPath = (p) => p === DEMO_PREFIX || p.startsWith(DEMO_PREFIX + '/');
+export const isDemoPanelPath = (p) => p === DEMO_PREFIX || (p.startsWith(DEMO_PREFIX + '/') && isPanelPath(p.slice(DEMO_PREFIX.length)));
