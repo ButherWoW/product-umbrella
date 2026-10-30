@@ -72,7 +72,9 @@ await runUi('demo', { env: { REQUIRE_LOGIN: '1' } }, async (ui) => {
   mobile.on('request', (r) => { const u = new URL(r.url()); if (u.origin === ui.url && !u.pathname.startsWith('/demo')) outside.push(u.pathname); });
   await mobile.goto(ui.url + '/demo/dashboard');
   await mobile.locator('.kpi').first().waitFor();
-  assert.ok(await mobile.locator('.demo-banner').evaluate((el) => el.scrollWidth <= el.clientWidth), 'demo strip text fits at 390px');
+  assert.ok(await mobile.locator('.demo-banner').evaluate((el) => el.scrollWidth <= el.clientWidth && el.scrollHeight <= el.clientHeight), 'demo strip text fits at 390px');
+  const top = await mobile.locator('.demo-banner').evaluate((el) => el.getBoundingClientRect().bottom);
+  assert.ok(await mobile.locator('.topbar').evaluate((el, y) => el.getBoundingClientRect().top >= y - 0.5, top), 'the top bar starts below the strip');
   assert.ok(await pageOverflow(mobile) <= 0, 'no horizontal scroll at 390px');
   await mobile.close();
 
