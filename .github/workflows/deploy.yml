@@ -74,6 +74,10 @@ jobs:
       - name: Admin UI (test/ui/*.mjs, each file its own server and browser)
         # Independent files, run in parallel by node --test; test/ui/setup.mjs is the shared helper, not a check.
         run: npm run test:ui
+      - name: Admin UI again on the obfuscated panel files (what production serves, PANEL_BUILD=1)
+        env:
+          PANEL_BUILD: '1'
+        run: node scripts/obfuscate-panel.mjs && npm run test:ui
 
   deploy:
     needs: [test, postgres, ui]
@@ -89,6 +93,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
 
       - name: Check secrets
         env:
@@ -132,6 +138,9 @@ jobs:
 
       # Release-based deploy (deploy/release.sh): each commit goes to /opt/umbrella/releases/<sha>,
       # /opt/umbrella/app is a symlink to the live one. The live release is not touched until "Switch release".
+      - name: Obfuscate the panel's browser files (build/panel, served with PANEL_BUILD=1)
+        run: npm ci --no-audit --no-fund && node scripts/obfuscate-panel.mjs
+
       - name: Sync app into a new release
         env:
           SHA: ${{ github.sha }}
@@ -167,6 +176,7 @@ jobs:
             echo "GEOIP_DB=/opt/umbrella/geo/country.mmdb"
             echo "GEOIP_ASN_DB=/opt/umbrella/geo/asn.mmdb"
             echo "PRIMARY_HOST=nespizdili.lol"
+            echo "PANEL_BUILD=1"
             echo "ADMIN_TOKEN=$ADMIN_TOKEN"
             echo "POSTBACK_SECRET=$POSTBACK_SECRET"
           } > umbrella.env
