@@ -168,9 +168,11 @@ const eventMirror = db ? createEventMirror({ query,
   } }) : null;
 // The click path never reads the whole journal: click counts, last click per (campaign, IP), recent clicks (LRU),
 // conversions and source postbacks are indexed in memory (src/journal-index.js). Reports stream the journal,
-// one scan at a time. CLICK_INDEX_LIMIT: clicks kept for /lp/click and postback lookups (older ones are streamed).
+// one scan at a time. CLICK_INDEX_LIMIT: clicks kept for /lp/click and postback lookups and (campaign, IP) visitors kept
+// for deduplication; older ones are streamed from the journal.
 const clickIndexLimit = Number.parseInt(process.env.CLICK_INDEX_LIMIT || '', 10);
-const journalIndex = createJournalIndex({ clickLimit: clickIndexLimit > 0 ? clickIndexLimit : 200000 });
+const indexLimit = clickIndexLimit > 0 ? clickIndexLimit : 200000;
+const journalIndex = createJournalIndex({ clickLimit: indexLimit, visitorLimit: indexLimit });
 const journalScans = createScanQueue();
 const journalRecords = (types = null) => journalScans.run(() => readJournal(eventsFile, types));
 const lookupOldClick = createOldClickLookup(eventsFile, journalScans);
@@ -735,15 +737,24 @@ const recentClick = (campaign, ip, windowMinutes) => Boolean(windowMinutes && ip
 async function isDuplicateClick(campaign, ip, windowMinutes) {
   if (!windowMinutes || !ip) return false;
   if (recentClick(campaign, ip, windowMinutes)) return true;
+  const sinceMs = Date.now() - windowMinutes * 60 * 1000;
   if (db) {
     try {
-      const since = new Date(Date.now() - windowMinutes * 60 * 1000).toISOString();
       const { rows } = await db.query(
         'SELECT 1 FROM clicks WHERE campaign = $1 AND ip = $2 AND created_at >= $3 LIMIT 1',
-        [campaign, ip, since],
+        [campaign, ip, new Date(sinceMs).toISOString()],
       );
       if (rows.length) return true;
     } catch (e) { console.warn('[db] dedupe fallback:', e.message); }
+  } else if (!journalIndex.visitorsCompleteSince(sinceMs)) {
+    // JSONL only: the index pushed out visitors seen inside this window, so a miss is not final — read the journal.
+    let lastAt = -Infinity;
+    await journalScans.run(() => scanJournalLines(eventsFile, (line) => {
+      if (!line.includes(ip)) return;
+      let item; try { item = JSON.parse(line); } catch { return; }
+      if (item.type === 'click' && item.campaign === campaign && item.ip === ip) lastAt = Math.max(lastAt, Date.parse(item.at) || -Infinity);
+    }));
+    if (lastAt >= sinceMs) { journalIndex.markClick(campaign, ip, lastAt); return true; }
   }
   return false;
 }
@@ -1157,15 +1168,16 @@ const reconciler = (() => {
   return { run, pause, resume, status: () => last };
 })();
 
-// RETENTION_DAYS=N: daily removal of unconverted clicks, their landing clicks and bot events older than N days.
+// RETENTION_DAYS=N: daily removal of unconverted clicks, their landing clicks, bot events and postback journal entries
+// older than N days.
 const retentionDays = Number.parseInt(process.env.RETENTION_DAYS || '', 10);
 async function runRetention() {
   const cutoff = new Date(Date.now() - retentionDays * 86400000);
   const removed = await removeStats(retentionPlan(cutoff.getTime()), (pool) => retentionRows(pool, cutoff.toISOString()));
-  console.log(`[retention] older than ${cutoff.toISOString()}: removed ${removed.clicks} clicks, ${removed.lpClicks} lp clicks, ${removed.bots} bots from the journal`
-    + (removed.postgres ? `; PostgreSQL: ${removed.postgres.clicks} clicks, ${removed.postgres.bots} bots` : ''));
+  console.log(`[retention] older than ${cutoff.toISOString()}: removed ${removed.clicks} clicks, ${removed.lpClicks} lp clicks, ${removed.bots} bots, ${removed.postbacks} postbacks from the journal`
+    + (removed.postgres ? `; PostgreSQL: ${removed.postgres.clicks} clicks, ${removed.postgres.bots} bots, ${removed.postgres.postbacks} postbacks` : ''));
   await event('audit', { actor: 'system', action: 'retention', entity: 'stats', entityId: 'retention',
-    changes: { days: [null, retentionDays], clicks: [null, removed.clicks], lpClicks: [null, removed.lpClicks], bots: [null, removed.bots] } });
+    changes: { days: [null, retentionDays], clicks: [null, removed.clicks], lpClicks: [null, removed.lpClicks], bots: [null, removed.bots], postbacks: [null, removed.postbacks] } });
   return removed;
 }
 

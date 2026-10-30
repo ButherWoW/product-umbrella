@@ -112,7 +112,7 @@ test('PostgreSQL: clear-stats deletes one campaign\'s rows (with `before`), othe
   } finally { await server.stop(); }
 });
 
-test('PostgreSQL: RETENTION_DAYS deletes old unconverted clicks and bots, converted clicks stay', { skip: !databaseUrl && 'set TEST_DATABASE_URL to run', timeout: 30000 }, async (t) => {
+test('PostgreSQL: RETENTION_DAYS deletes old unconverted clicks, bots and postback rows, converted clicks stay', { skip: !databaseUrl && 'set TEST_DATABASE_URL to run', timeout: 30000 }, async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'umbrella-pgret-'));
   const pool = await pgPool();
   t.after(async () => { await pool.end(); await rm(dir, { recursive: true, force: true }); });
@@ -121,6 +121,7 @@ test('PostgreSQL: RETENTION_DAYS deletes old unconverted clicks and bots, conver
   const unpaid = await insertClick(pool, campaign, { lp: true });
   const recent = await insertClick(pool, campaign, { at: new Date().toISOString() });
   await pool.query('INSERT INTO bots (campaign, reason, created_at) VALUES ($1, $2, $3), ($1, $2, now())', [campaign, 'ua', oldAt]);
+  await pool.query("INSERT INTO postbacks (direction, click_id, campaign, created_at) VALUES ('in', $2, $1, $3), ('out', $2, $1, $3), ('in', $2, $1, now())", [campaign, paid, oldAt]);
   const server = await startTestServer(dir, { DATABASE_URL: databaseUrl, REQUIRE_POSTGRES: '1', ADMIN_TOKEN: TOKEN, RETENTION_DAYS: '30', RETENTION_DELAY_MS: '0' });
   try {
     let left = [];
@@ -132,6 +133,7 @@ test('PostgreSQL: RETENTION_DAYS deletes old unconverted clicks and bots, conver
     assert.deepEqual(left.sort(), [paid, recent].sort(), 'only the old unconverted click is gone');
     assert.equal((await pool.query('SELECT 1 FROM conversions WHERE click_id = $1', [paid])).rowCount, 1, 'conversion kept');
     assert.equal((await pool.query('SELECT 1 FROM bots WHERE campaign = $1', [campaign])).rowCount, 1, 'old bot removed, recent kept');
+    assert.equal((await pool.query('SELECT 1 FROM postbacks WHERE campaign = $1', [campaign])).rowCount, 1, 'old postback rows removed, recent kept');
   } finally { await server.stop(); }
 });
 
