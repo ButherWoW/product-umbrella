@@ -8,7 +8,7 @@ await runUi('offers', async (ui) => {
   const offersNow = async () => (await ui.json('/api/offers')).offers;
   // Offer conversion cap: cap, its time zone and the alternative offer from the offer dialog.
   await ui.api('/api/offers', { id: 'ui-alt', url: 'https://alt.example.net/', name: 'Alt offer' });
-  await ui.openWithKey(page, '#/offers');
+  await ui.openWithKey(page, '/offers');
   await page.locator('table.grid tbody tr', { hasText: 'offer-1' }).getByRole('button', { name: 'Изменить' }).click();
   const offerDialog = page.getByRole('dialog', { name: 'Редактирование оффера' });
   await offerDialog.getByRole('tab', { name: 'Настройки' }).click();
@@ -21,8 +21,8 @@ await runUi('offers', async (ui) => {
   assert.deepEqual([savedOffer.conversionCap, savedOffer.capTz, savedOffer.altOfferId], [5, 'Europe/Paris', 'ui-alt']);
 
   // Partner networks: generated postback is visible/copyable, and offers can be linked to a network.
-  await ui.go(page, '#/networks');
-  await page.waitForFunction(() => location.hash === '#/networks');
+  await ui.go(page, '/networks');
+  await page.waitForFunction(() => location.pathname === '/networks');
   await page.locator('table.grid').waitFor();
   const createNetwork = page.getByRole('button', { name: 'Создать сеть' });
   await createNetwork.click();
@@ -43,7 +43,7 @@ await runUi('offers', async (ui) => {
   await savedNetworkDialog.getByRole('button', { name: 'Копировать' }).click();
   await savedNetworkDialog.getByRole('button', { name: 'Отмена' }).click();
 
-  await ui.go(page, '#/offers');
+  await ui.go(page, '/offers');
   await page.getByRole('button', { name: 'Создать', exact: true }).click();
   const networkOfferDialog = page.getByRole('dialog', { name: 'Создание оффера' });
   await networkOfferDialog.locator('input').nth(0).fill('offer-ui');
@@ -58,7 +58,7 @@ await runUi('offers', async (ui) => {
   await ui.api('/api/campaigns', { id: 't7-camp-a', name: 'T7 Camp A', group: 'T7-old', streams: MAIN_STREAM });
   await ui.api('/api/campaigns', { id: 't7-camp-b', name: 'T7 Camp B', streams: MAIN_STREAM });
   for (const id of ['t10-o1', 't10-o2', 't10-o3']) await ui.api('/api/offers', { id, url: `https://example.com/${id}`, group: 'T10' });
-  await ui.go(page, '#/campaigns/t7-camp-b');
+  await ui.go(page, '/campaigns/t7-camp-b');
   const t7GroupInput = page.locator('.editor').getByRole('combobox', { name: 'Группа' });
   await t7GroupInput.waitFor();
   const t7Datalist = await t7GroupInput.evaluate((el) => [...el.list.options].map((o) => o.value));
@@ -66,7 +66,7 @@ await runUi('offers', async (ui) => {
   await t7GroupInput.fill('T7-new');
   await ui.save(page);
   assert.equal((await ui.json('/api/campaigns')).campaigns['t7-camp-b'].group, 'T7-new', 'campaign group saved from the editor');
-  await ui.go(page, '#/campaigns');
+  await ui.go(page, '/campaigns');
   await page.locator('table.grid tbody tr', { hasText: 'T7 Camp B' }).filter({ hasText: 'T7-new' }).waitFor();
   const campGroupSel = page.getByLabel('Фильтр по группе');
   await campGroupSel.locator('option[value="T7-new"]').waitFor({ state: 'attached' });
@@ -82,7 +82,7 @@ await runUi('offers', async (ui) => {
   await page.locator('table.grid tbody tr', { hasText: 'T7 Camp A' }).waitFor();
   assert.equal(await page.locator('table.grid tbody tr', { hasText: 'T7 Camp B' }).count(), 0, 'archive view shows only archived campaigns');
   // Offer modal: group field with existing groups, value sent on save.
-  await ui.go(page, '#/offers');
+  await ui.go(page, '/offers');
   await page.locator('table.grid tbody tr', { hasText: 't10-o3' }).getByRole('button', { name: 'Изменить' }).click();
   const t7OfferDlg = page.getByRole('dialog', { name: 'Редактирование оффера' });
   const t7OfferGroup = t7OfferDlg.getByRole('combobox', { name: 'Группа' });
@@ -137,7 +137,7 @@ await runUi('offers', async (ui) => {
 
   // Tasks 5–6: network postback with the network's own click-id macro, offer URL params, copy and archive from the row menu.
   await ui.api('/api/networks', { id: 't6-net', name: 'T6 Net', offerParams: 'sub1={click_id}&sub2={campaign}', clickIdParam: '{sub1}', payoutParam: 'amount' });
-  await ui.go(page, '#/networks');
+  await ui.go(page, '/networks');
   await page.locator('table.grid tbody tr', { hasText: 'T6 Net' }).getByRole('button', { name: 'Изменить' }).click();
   const t6NetDlg = page.getByRole('dialog', { name: 'Редактирование сети' });
   const t6Postback = await t6NetDlg.getByLabel('URL постбэка').inputValue();
@@ -146,7 +146,7 @@ await runUi('offers', async (ui) => {
   await t6NetDlg.getByRole('button', { name: 'Отмена' }).click();
 
   await ui.api('/api/offers', { id: 't6-offer', url: 'https://t6.example.net/?x=1', name: 'T6 offer', networkId: 't6-net' });
-  await ui.go(page, '#/offers');
+  await ui.go(page, '/offers');
   const t6Row = (id) => page.locator('table.grid tbody tr').filter({ has: page.getByRole('link', { name: id, exact: true }) });
   await t6Row('t6-offer').getByRole('button', { name: 'Изменить' }).click();
   const t6OfferDlg = page.getByRole('dialog', { name: 'Редактирование оффера' });
@@ -175,7 +175,7 @@ await runUi('offers', async (ui) => {
   assert.equal((await offersNow())['t6-offer-copy'].archived, false, 'restored from archive');
 
   await ui.api('/api/campaigns', { id: 't6-camp', name: 'T6 camp', active: true, streams: [{ name: 'Main', offers: [{ offerId: 't6-offer', weight: 1 }] }] });
-  await ui.go(page, '#/campaigns');
+  await ui.go(page, '/campaigns');
   const t6CampRow = (id) => page.locator('table.grid tbody tr').filter({ has: page.locator('td', { hasText: new RegExp('^' + id + '$') }) });
   await t6CampRow('t6-camp').getByRole('button', { name: 'Копировать', exact: true }).click();
   await page.locator('#toast', { hasText: 'Копия создана (выключена): t6-camp-copy' }).waitFor();

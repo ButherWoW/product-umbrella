@@ -123,7 +123,7 @@ test('hideRevenue strips revenue fields and offer URLs on the server', { timeout
   assert.deepEqual(header.filter((c) => /revenue|profit|roi|epc|rpm/i.test(c)), [], `CSV header: ${header}`);
   assert.ok(header.includes('clicks') && header.includes('cost'));
   assert.ok((await call('/stats/export?group=campaign', { cookie: owner })).text.includes('revenue'), 'owner CSV keeps revenue');
-  assert.match((await call('/dashboard', { cookie: buyer.cookie })).location || '', /\/admin$/, 'legacy dashboard redirects');
+  assert.equal((await call('/dashboard', { cookie: buyer.cookie })).status, 200, '/dashboard is a panel page');
 
   // Turning the flag off restores the data on the next request.
   await call(`/api/users/${buyer.id}`, { method: 'PATCH', cookie: owner, body: { hideRevenue: false } });

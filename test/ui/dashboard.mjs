@@ -8,7 +8,7 @@ await runUi('dashboard', async (ui) => {
   const paidClick = await ui.click('/r/demo/offer-1');
   await ui.postback(`click_id=${paidClick}&revenue=25&currency=USD`);
   const page = await ui.newPage();
-  await ui.openWithKey(page, '#/dashboard');
+  await ui.openWithKey(page, '/dashboard');
 
   // Currency switch: 25 USD = 20 EUR = 2000 RUB at the fixed test rates.
   const revenueTile = page.locator('.kpi', { hasText: 'Доход' }).locator('.v');
@@ -32,7 +32,7 @@ await runUi('dashboard', async (ui) => {
   // D13: attention block lists a campaign with bad ROI (100 clicks at 1 EUR CPC, no revenue).
   await ui.campaign('d13-bad', 'D13 Bad ROI', { costModel: 'cpc', cpc: 1.0 });
   await Promise.all(Array.from({ length: 100 }, () => ui.click('/r/d13-bad')));
-  await ui.go(page, '#/');
+  await ui.go(page, '/');
   await page.getByRole('heading', { name: 'Дашборд' }).waitFor();
   const attentionCard = page.locator('.card', { hasText: 'Требуют внимания' });
   await attentionCard.waitFor({ timeout: 10000 });
@@ -44,9 +44,9 @@ await runUi('dashboard', async (ui) => {
   await ui.campaign('d18-goals', 'D18 Goals');
   const d18Click = await ui.click('/r/d18-goals');
   await ui.postback(`click_id=${d18Click}&revenue=25&currency=EUR`);
-  await ui.go(page, '#/campaigns/d18-goals'); // the editor refreshes the cached campaign list (no reload: the key stays in memory)
+  await ui.go(page, '/campaigns/d18-goals'); // the editor refreshes the cached campaign list (no reload: the key stays in memory)
   await page.locator('.editor').waitFor();
-  await ui.go(page, '#/dashboard');
+  await ui.go(page, '/dashboard');
   await page.getByRole('heading', { name: 'Дашборд' }).waitFor();
   await page.getByRole('combobox', { name: 'Период' }).selectOption('today');
   await page.getByRole('combobox', { name: 'Валюта' }).selectOption('EUR');

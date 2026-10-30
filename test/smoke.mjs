@@ -17,10 +17,13 @@ try {
   const healthBody = await health.json();
   assert.equal(healthBody.ok, true);
   assert.equal(healthBody.storage, 'jsonl');
-  // The legacy inline /dashboard page was removed; old links land in the admin panel.
-  const legacyDashboard = await fetch('http://127.0.0.1:4199/dashboard', { redirect: 'manual' });
-  assert.equal(legacyDashboard.status, 302);
-  assert.equal(legacyDashboard.headers.get('location'), '/admin');
+  // Panel pages are path URLs (/dashboard, /campaigns/<id>); the old /admin address redirects to the panel root.
+  const dashboardPage = await fetch('http://127.0.0.1:4199/dashboard', { redirect: 'manual' });
+  assert.equal(dashboardPage.status, 200);
+  assert.match(await dashboardPage.text(), /<main id="view"/);
+  const legacyAdmin = await fetch('http://127.0.0.1:4199/admin', { redirect: 'manual' });
+  assert.equal(legacyAdmin.status, 302);
+  assert.equal(legacyAdmin.headers.get('location'), '/');
   assert.equal((await fetch('http://127.0.0.1:4199/assets/stream-editor.js')).status, 404, 'legacy dashboard assets are gone');
   const created = await fetch('http://127.0.0.1:4199/api/offers', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: 'new-offer', url: 'https://example.org/product' }) });
   assert.equal(created.status, 201);

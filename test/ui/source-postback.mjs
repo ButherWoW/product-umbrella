@@ -12,7 +12,7 @@ const mockUrl = `http://127.0.0.1:${mock.address().port}`;
 try {
   await runUi('source-postback', { env: { SOURCE_POSTBACK_ALLOW_PRIVATE: '1' } }, async (ui) => {
     const pbPage = await ui.newPage();
-    await pbPage.goto(ui.url + '/admin#/sources');
+    await pbPage.goto(ui.url + '/sources');
     await pbPage.getByRole('button', { name: 'Создать', exact: true }).click();
     const srcDialog = pbPage.getByRole('dialog', { name: 'Создание источника' });
     await srcDialog.locator('input').nth(0).fill('fb-pb');
@@ -35,7 +35,7 @@ try {
     const saved = (await ui.json('/api/sources')).sources['fb-pb'];
     assert.deepEqual([saved.postbackUrl, saved.postbackStatuses], [`${mockUrl}/fb?cid={external_id}&s={status}`, ['lead', 'sale']]);
 
-    await pbPage.goto(ui.url + '/admin#/campaigns/new');
+    await ui.go(pbPage, '/campaigns/new'); // in-panel navigation keeps the key entered above
     await pbPage.getByLabel('Название кампании').fill('PB campaign');
     await pbPage.getByRole('combobox', { name: 'Источник трафика' }).selectOption('fb-pb');
     await pbPage.getByLabel('Постбэк в источник').fill(`${mockUrl}/camp?s={status}`);

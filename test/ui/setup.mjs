@@ -1,4 +1,4 @@
-// Shared setup for the browser checks of /admin (test/ui/*.mjs). Every check file starts its own server with
+// Shared setup for the browser checks of the panel (test/ui/*.mjs). Every check file starts its own server with
 // its own data directory and browser, so the files are independent and can run in parallel and in any order:
 //   node --test $(ls test/ui/*.mjs | grep -v setup.mjs)      or      node test/ui/<file>.mjs
 // Requires Playwright, or PLAYWRIGHT_MODULE pointing at an existing installation.
@@ -45,20 +45,23 @@ export async function startUi(name, { env = {}, rates = true } = {}) {
       page.on('pageerror', (error) => errors.push(error.message));
       return page;
     },
-    /** Opens the panel at `hash` and stores the admin key in the tab (it lives in memory until a reload). */
-    async openWithKey(page, hash) {
+    /** Opens the panel at `path` (/campaigns, /reports?group=…) and stores the admin key in the tab (it lives in memory until a reload). */
+    async openWithKey(page, path) {
       // Landings need no key, so no key dialog pops up on its own before we open it.
-      await page.goto(url + '/admin#/landings');
+      await page.goto(url + '/landings');
       await page.locator('table.grid').waitFor();
       const dialog = page.getByRole('dialog', { name: 'Ключ администратора' });
       if (!(await dialog.isVisible())) await page.locator('#token-btn').click();
       await dialog.locator('input[type=password]').fill(TOKEN);
       await dialog.getByRole('button', { name: 'Сохранить' }).click();
       await dialog.waitFor({ state: 'detached' });
-      await page.goto(url + '/admin' + hash);
+      await ui.go(page, path);
     },
-    /** Same-document navigation inside the panel: keeps the in-memory admin key. */
-    async go(page, hash) { await page.goto(url + '/admin' + hash); },
+    /** In-panel navigation (history.pushState, as a link click does): no reload, so the in-memory admin key stays. */
+    async go(page, path) {
+      if (!page.url().startsWith(url + '/')) return void await page.goto(url + path); // a fresh tab: first load
+      await page.evaluate((p) => { history.pushState(null, '', p); dispatchEvent(new PopStateEvent('popstate')); }, path);
+    },
     async save(page, toast = 'Сохранено') {
       await page.locator('.editor-head .btn.primary').click();
       await page.locator('#toast', { hasText: toast }).waitFor();

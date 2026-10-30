@@ -12,7 +12,7 @@ await runUi('report-metrics', async (ui) => {
   await ui.postback(`click_id=${d10cid}&revenue=10&currency=USD`);
   await ui.click('/r/d10-bw?sub_id_1=value-b');
   await ui.click('/r/d10-bw?sub_id_1=value-b');
-  await ui.openWithKey(page, '#/reports?field=sub_id_1&campaign=d10-bw');
+  await ui.openWithKey(page, '/reports?field=sub_id_1&campaign=d10-bw');
   await page.getByRole('heading', { name: 'Отчёт' }).waitFor();
   await page.locator('table.grid tbody tr').first().waitFor();
   assert.ok(await page.getByRole('button', { name: 'Списки' }).isVisible(), 'lists button visible when list-type parameter field selected');
@@ -42,7 +42,7 @@ await runUi('report-metrics', async (ui) => {
   await ui.postback(`click_id=${d14cid}&status=sale&revenue=10&currency=EUR`);
   const d14Stats = await ui.json('/stats?campaign=d14-conv');
   assert.deepEqual([d14Stats.leads, d14Stats.sales], [0, 1], '/stats: the lead turned into a sale');
-  await ui.go(page, '#/reports?group=conversions&campaign=d14-conv');
+  await ui.go(page, '/reports?group=conversions&campaign=d14-conv');
   await page.getByRole('heading', { name: 'Отчёт' }).waitFor();
   await page.getByRole('combobox', { name: 'Период' }).selectOption('today');
   await page.getByRole('combobox', { name: 'Валюта' }).selectOption('USD'); // 10 EUR = 12,50 $ at the test rate
@@ -67,7 +67,7 @@ await runUi('report-metrics', async (ui) => {
   await ui.click('/r/d16-camp');
   await ui.click('/r/d16-camp');
   if (d16cid) await fetch(ui.url + '/lp/click?click_id=' + d16cid, { redirect: 'manual' });
-  await ui.go(page, '#/reports?group=landing');
+  await ui.go(page, '/reports?group=landing');
   await page.getByRole('heading', { name: 'Отчёт' }).waitFor();
   await page.locator('button.chip-btn', { hasText: 'Лендинг' }).click();
   await page.locator('table.grid').waitFor({ timeout: 5000 });

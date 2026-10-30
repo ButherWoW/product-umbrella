@@ -314,7 +314,9 @@ jobs:
 
       - name: Public check
         run: |
-          code=$(curl -s -o /dev/null -w "%{http_code}" https://nespizdili.lol/umbrella/admin)
-          echo "https://nespizdili.lol/umbrella/admin -> $code"
-          [ "$code" = 200 ]
+          for path in login campaigns; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "https://nespizdili.lol/umbrella/$path")
+            echo "https://nespizdili.lol/umbrella/$path -> $code"
+            [ "$code" = 200 ] || exit 1
+          done
           curl -sf https://nespizdili.lol/ -o /dev/null && echo "main site still ok"

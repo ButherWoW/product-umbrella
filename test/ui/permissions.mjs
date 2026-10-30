@@ -9,7 +9,7 @@ await runUi('permissions', { env: { REQUIRE_LOGIN: '1' } }, async (ui) => {
     const ctx = await ui.browser.newContext({ viewport: { width: 1280, height: 900 } });
     const pg = await ctx.newPage();
     pg.on('pageerror', (error) => ui.errors.push(error.message));
-    await pg.goto(ui.url + '/admin#/dashboard');
+    await pg.goto(ui.url + '/dashboard');
     await pg.getByLabel('Email').fill(email);
     await pg.getByLabel('Пароль').fill(password);
     await pg.getByRole('button', { name: 'Войти' }).click();
@@ -17,7 +17,7 @@ await runUi('permissions', { env: { REQUIRE_LOGIN: '1' } }, async (ui) => {
     return { ctx, pg };
   };
   const own = await login('perm-owner@example.com', 'owner-password-1');
-  await own.pg.goto(ui.url + '/admin#/users');
+  await own.pg.goto(ui.url + '/users');
   await own.pg.getByRole('heading', { name: 'Пользователи' }).waitFor();
   const createUser = async (email, role) => {
     await own.pg.getByRole('button', { name: 'Создать', exact: true }).click();
@@ -50,11 +50,11 @@ await runUi('permissions', { env: { REQUIRE_LOGIN: '1' } }, async (ui) => {
   await hid.pg.locator('.kpi', { hasText: 'Расход' }).waitFor();
   assert.equal(await hid.pg.locator('.kpi', { hasText: 'Доход' }).count(), 0, 'no revenue tile');
   assert.equal(await hid.pg.locator('.kpi', { hasText: 'ROI' }).count(), 0, 'no ROI tile');
-  await hid.pg.goto(ui.url + '/admin#/campaigns');
+  await hid.pg.goto(ui.url + '/campaigns');
   await hid.pg.locator('table.grid tbody tr', { hasText: 'Perm camp' }).waitFor();
   const heads = await hid.pg.locator('table.grid thead').innerText();
   assert.ok(!/Доход|Прибыль|ROI|EPC/.test(heads), `revenue columns hidden: ${heads}`);
-  await hid.pg.goto(ui.url + '/admin#/reports?group=conversions');
+  await hid.pg.goto(ui.url + '/reports?group=conversions');
   await hid.pg.locator('table.grid thead th', { hasText: 'Лиды' }).waitFor();
   const convHeads = await hid.pg.locator('table.grid thead').innerText();
   assert.ok(!/Доход/.test(convHeads), `conversions report hides revenue: ${convHeads}`);
@@ -62,7 +62,7 @@ await runUi('permissions', { env: { REQUIRE_LOGIN: '1' } }, async (ui) => {
 
   const ro = await login('perm-viewer@example.com', 'user-password-1');
   assert.ok(await ro.pg.evaluate(() => document.body.classList.contains('read-only')));
-  await ro.pg.goto(ui.url + '/admin#/campaigns');
+  await ro.pg.goto(ui.url + '/campaigns');
   await ro.pg.locator('table.grid').waitFor();
   assert.ok(await ro.pg.locator('a.btn.primary', { hasText: 'Создать' }).isHidden(), 'viewer has no create button');
   await ro.pg.getByRole('button', { name: 'Выйти' }).click();

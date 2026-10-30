@@ -6,7 +6,7 @@ await runUi('costs', async (ui) => {
   await ui.campaign('cost-ui', 'Cost UI');
   for (let i = 0; i < 4; i++) await ui.click('/r/cost-ui');
   const page = await ui.newPage();
-  await ui.openWithKey(page, '#/campaigns');
+  await ui.openWithKey(page, '/campaigns');
   await page.getByRole('combobox', { name: 'Период' }).selectOption('today');
   await page.getByRole('combobox', { name: 'Валюта' }).selectOption('EUR');
   const costRow = page.locator('table.grid tbody tr', { hasText: 'Cost UI' });

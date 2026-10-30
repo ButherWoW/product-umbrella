@@ -14,8 +14,7 @@ const METHODS = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options'];
 
 // Routes the server answers but that are deliberately not part of the API description.
 const EXCEPTIONS = new Map([
-  ['/', 'redirect to /admin'],
-  ['/admin/', 'same page as /admin'],
+  ['/admin/', 'same redirect as /admin'],
   ['/admin/admin.js', 'static file of the panel'],
   ['/admin/admin.css', 'static file of the panel'],
   ['/admin/stream-policy.js', 'src/stream-policy.js served to the panel (same no-cloaking check in the browser)'],

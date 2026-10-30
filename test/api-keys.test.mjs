@@ -115,6 +115,7 @@ test('ADMIN_ALLOWED_IPS: panel and APIs only from listed IPs, tracking stays ope
   assert.equal((await call('/api/campaigns', { headers: from('192.0.2.1'), bearer: 'ip-token' })).status, 403, 'even with ADMIN_TOKEN');
   assert.equal((await call('/stats', { headers: from('192.0.2.1') })).status, 403);
   assert.equal((await call('/admin', { headers: from('192.0.2.1') })).status, 403);
+  assert.equal((await call('/campaigns', { headers: from('192.0.2.1') })).status, 403, 'panel pages follow ADMIN_ALLOWED_IPS');
   assert.equal((await call('/api/auth/login', { method: 'POST', headers: from('192.0.2.1'), body: { email: 'a@example.com', password: 'whatever-123' } })).status, 403);
   assert.equal((await call('/api/campaigns', { headers: from('192.0.2.1, 203.0.113.7') })).status, 200, 'the proxy-appended address counts');
   assert.equal((await call('/api/campaigns', { headers: from('203.0.113.7, 192.0.2.1') })).status, 403, 'a spoofed left entry does not');
