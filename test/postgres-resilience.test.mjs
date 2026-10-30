@@ -165,7 +165,9 @@ test('reconciliation copies an existing journal into an empty database (clicks, 
   // A bot row written before event ids existed (old backfill) must not be duplicated.
   await db.query(`INSERT INTO bots (campaign, reason, ip, created_at) VALUES ('att', 'ua', '10.0.0.1', $1)`, [at(8)]);
   server = await startTestServer(dir, { DATABASE_URL: url, ADMIN_TOKEN: TOKEN, RECONCILE_INTERVAL_MS: '3600000', RECONCILE_DELAY_MS: '0' });
-  const ok = await waitFor(async () => (await db.query('SELECT 1 FROM postbacks')).rowCount === 1);
+  // Reconciliation writes table by table: wait for the postback row and the cost import, not just one of them.
+  const ok = await waitFor(async () => (await db.query('SELECT 1 FROM postbacks')).rowCount === 1
+    && (await db.query(`SELECT 1 FROM cost_imports WHERE import_key = 'att|k'`)).rowCount === 1);
   assert.ok(ok, 'startup reconciliation ran');
   const clicks = Object.fromEntries((await db.query('SELECT click_id::text AS id, cost::float AS cost, params, lp_clicked_at FROM clicks')).rows.map((r) => [r.id, r]));
   assert.deepEqual(clicks[a].params, { sub_id_1: 'x', sub_id_2: 'net' });
