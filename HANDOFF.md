@@ -40,3 +40,24 @@
 - **Старые PR без действия:** #18 (сети, GPT), #32 (D11), #34 (D12), #37 (D13), #52 (D18) — функциональность уже в `main` другими PR; закрыть или пересобрать — решает владелец.
 - **Задачи владельца (README, «Деплой» и «Бэкапы»):** секрет `SSH_KNOWN_HOSTS`; маска `secret=` в access-логе nginx; выбор хранилища для копии бэкапов вне сервера (сейчас бэкапы только на том же сервере).
 - **Боевые конверсии ещё идут в Keitaro:** офферы перенесены `scripts/import-keitaro-offers.mjs`, но постбэк партнёрки на Umbrella не переключён — переключает владелец.
+
+## Задача dev2 (2026-11-02): статус входа в FB у профилей на сервере — в репозитории bananabun
+
+Это задача **не в Umbrella**, а в `ButherWoW/bananabun`. Полное описание — запись `@dev2 2026-11-02` в `docs/HANDOFF.md` bananabun. Зачем: профиль AdsPower на нашем сервере может быть не залогинен в Facebook (сессия осталась на Маке), и платформа узнаёт это только при заливе. Нужно показывать это заранее.
+
+По шагам:
+
+1. `git clone https://github.com/ButherWoW/bananabun` (или `git fetch` в своей копии), прочитай `CLAUDE.md` и верхнюю запись `@dev2` в `docs/HANDOFF.md`.
+2. Ветка от свежего main: `git checkout -b dev2-fb-session origin/main`.
+3. Бронь: допиши в `docs/HANDOFF.md` bananabun запись `@claude`, что берёшь файлы из списка «Бронь» (журнал правится только в main — запись короткая, отдельным коммитом в main или попроси Claude).
+4. Агент — `mac-agent/lib/fbprofile.js`, функция `openFbSession`: когда токена нет, по адресу вкладки определить причину и бросить ошибку с полем `code`: `fb_logged_out` (адрес содержит `/login` или `/loginpage`), `fb_checkpoint` (`/checkpoint`), иначе `fb_timeout`. Текст ошибки оставить как есть. Передать `code` в результате задач `check-profile` и `push` (`mac-agent/bananabun_agent.js`).
+5. Тест агента: `mac-agent/test/fbsession.test.js` — разбор адресов без сети (вынеси разбор в отдельную функцию). Запуск: `node --test mac-agent/test/`.
+6. Миграция `platform/backend/src/db/migrations/039_fb_session.sql`: в `fb_accounts` поля `fb_session TEXT DEFAULT 'unknown'` и `fb_session_at TIMESTAMPTZ`.
+7. Сервер — `platform/backend/src/api/routes/agent.js`, приём результата `check-profile`: успех → `fb_session='ok'`; ошибка с `code` → `logged_out` / `checkpoint` / `timeout`; плюс `fb_session_at=NOW()`. `GET /api/accounts` должен отдавать оба поля.
+8. Тест сервера на временной PostgreSQL (как `platform/backend/test/buyer-access.test.js`): результат агента с `code: 'fb_logged_out'` → у аккаунта `fb_session='logged_out'`. Запуск: `BANANABUN_TEST_DATABASE_URL=postgres://…/bb_test npm test --prefix platform/backend` (имя базы должно кончаться на `_test`).
+9. Фронт «Аккаунты»: бейдж у аккаунта — зелёный «FB вход есть», красный «Не залогинен на сервере», жёлтый «Чекпоинт». У красного — «?» с текстом: «Открой профиль в AdsPower на Маке, проверь, что Ads Manager открывается, и закрой профиль — сессия уйдёт на сервер. Потом нажми «Проверить»».
+10. Фронт «Залив» (`PushWizard`, шаг «Кабинет»): если у профиля выбранного кабинета `fb_session` не `ok` — жёлтое предупреждение с той же подсказкой над «Далее». Залив не блокировать.
+11. Проверка: `npm run build --prefix platform/frontend` без ошибок, все тесты зелёные.
+12. PR в `main` bananabun с описанием, что сделано и как проверено. Выкатывает Claude — сам на сервер не выкатывай.
+
+Нельзя: вводить или хранить пароли, 2FA, куки; выводить токены FB, заметки профилей, прокси. `services/push.js` и `api/routes/push.js` не трогать — нужна правка там, пиши `@claude`.
