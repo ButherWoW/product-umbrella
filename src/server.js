@@ -2747,6 +2747,8 @@ const server = http.createServer(async (req, res) => {
     }
     // Source postback URLs often carry tokens: buyers see them without the query string and cannot change them.
     const canSeeSourcePostback = !restrictedUser(req);
+    // The history never keeps the query of a source's postback URL (network tokens); a change of it is still visible.
+    const sourceAuditView = (s) => ({ ...s, postbackUrl: s.postbackUrl ? stripQuery(s.postbackUrl) : null, postbackQueryHash: s.postbackUrl ? createHash('sha256').update(s.postbackUrl).digest('hex').slice(0, 8) : null });
     const publicSource = (s) => (canSeeSourcePostback || !s.postbackUrl ? s : { ...s, postbackUrl: stripQuery(s.postbackUrl), postbackUrlMasked: true });
     if (url.pathname === '/api/sources' && req.method === 'GET') return json(res, 200, { sources: Object.fromEntries([...sources].map(([id, s]) => [id, publicSource(s)])) });
     if (url.pathname === '/api/sources/postback-test' && req.method === 'POST') {
@@ -2771,6 +2773,7 @@ const server = http.createServer(async (req, res) => {
       if (!source) return json(res, 400, { error: 'invalid_source' });
       sources.set(String(body.id), source);
       await persistSource(String(body.id), source);
+      await audit(req, 'create', 'source', String(body.id), null, sourceAuditView(source));
       return json(res, 201, { id: body.id, ...publicSource(source) });
     }
     const sourceUpdate = url.pathname.match(/^\/api\/sources\/([A-Za-z0-9_-]{2,80})$/);
@@ -2795,6 +2798,7 @@ const server = http.createServer(async (req, res) => {
       });
       sources.set(id, updated);
       await persistSource(id, updated);
+      await audit(req, 'update', 'source', id, sourceAuditView(cur), sourceAuditView(updated));
       return json(res, 200, { id, ...publicSource(updated) });
     }
     if (url.pathname === '/api/networks' && req.method === 'GET') return json(res, 200, { networks: Object.fromEntries(networks) });
