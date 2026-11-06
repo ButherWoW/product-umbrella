@@ -2190,12 +2190,10 @@ const server = http.createServer(async (req, res) => {
       req.apiKey = found.key;
     } else req.user = await sessionUser(req);
     if (requireLogin && isPrivatePath(url.pathname) && !req.user && !bearerAuthorized(req)) return json(res, 401, { error: 'login_required' });
-    // Offers and sources carry the networks' postback URLs with their tokens: closed to anonymous visitors whatever REQUIRE_LOGIN says
-    // as soon as any credential exists (ADMIN_TOKEN, a user, or REQUIRE_LOGIN). Only a fresh install with no credentials at all stays open.
-    if (!req.user && isSecretCarrier(url.pathname) && !bearerAuthorized(req) && (adminToken || (await users.count()) > 0)) {
-      // Panel: «login_required» sends it to /login, «admin_authorization_required» opens the admin-key dialog (ADMIN_TOKEN-only setups).
-      return json(res, 401, { error: requireLogin || (await users.count()) > 0 ? 'login_required' : 'admin_authorization_required' });
-    }
+    // Offers and sources carry the networks' postback URLs with their tokens: once any user account exists they are closed to anonymous
+    // visitors whatever REQUIRE_LOGIN says (a dropped variable must not publish them). Not applied to ADMIN_TOKEN-only setups
+    // without accounts (the panel's admin-key mode reloads and reads anonymously) nor to a fresh install.
+    if (!req.user && isSecretCarrier(url.pathname) && !bearerAuthorized(req) && (await users.count()) > 0) return json(res, 401, { error: 'login_required' });
     // Read-only role: every write to the panel API is refused; signing in and out stays possible.
     if (isViewer(req) && !['GET', 'HEAD'].includes(req.method) && isPrivatePath(url.pathname)) return json(res, 403, { error: 'read_only' });
     if (hidesRevenue(req)) {

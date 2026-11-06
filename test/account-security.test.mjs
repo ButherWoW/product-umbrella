@@ -25,8 +25,10 @@ async function boot(t, environment = {}) {
   return { call, server };
 }
 
-test('/api/offers and /api/sources are closed to anonymous visitors once any credential exists, even without REQUIRE_LOGIN', { timeout: 20000 }, async (t) => {
+test('/api/offers and /api/sources are closed to anonymous visitors once a user account exists, even without REQUIRE_LOGIN', { timeout: 20000 }, async (t) => {
   const { call } = await boot(t, { ADMIN_TOKEN: 'carrier-token' }); // no REQUIRE_LOGIN
+  assert.equal((await call('/api/offers')).status, 200, 'ADMIN_TOKEN-only setup without accounts: the panel key mode reads anonymously');
+  assert.equal((await call('/api/auth/setup', { method: 'POST', bearer: 'carrier-token', body: { email: 'boss@example.com', password: 'long-password-1' } })).status, 201);
   for (const path of ['/api/offers', '/api/sources', '/api/offers/offer-1']) assert.equal((await call(path)).status, 401, path);
   assert.equal((await call('/api/offers', { bearer: 'carrier-token' })).status, 200);
   assert.equal((await call('/api/sources', { bearer: 'carrier-token' })).status, 200);
