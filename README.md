@@ -256,7 +256,7 @@ Tracking URL принимает `utm_source`, `utm_medium`, `utm_campaign`, `utm
 - При создании кампании с `sourceId` его параметры стоимости и `paramMap` подставляются автоматически, если не указаны вручную.
 - Архивирование: `PATCH /api/campaigns/:id` или `/api/offers/:id` с `{ "archived": true }`. Клонирование: `POST /api/campaigns/:id/clone` и `POST /api/offers/:id/clone`.
 
-- `GET /api/audit?entity=campaign|offer|landing|user|settings|api_key&id=&limit=` — кто, когда и что изменил (новые сверху): создание и правки кампаний, потоков, офферов, лендингов, пользователей, входы, автопауза по капу (`actor: system`). Пароли не пишутся. В редакторе кампании — кнопка «История».
+- `GET /api/audit?entity=campaign|offer|landing|source|network|user|settings|api_key&id=&limit=` — кто, когда и что изменил (новые сверху): создание и правки кампаний, потоков, офферов, лендингов, источников (адрес постбэка источника — без query, только его отпечаток `postbackQueryHash`), сетей, пользователей, входы, автопауза по капу (`actor: system`). Пароли не пишутся. В редакторе кампании — кнопка «История».
 - `GET /api/settings`, `PATCH /api/settings { buyerSharePct }` (только владелец, 0–100, по умолчанию 35). Дашборд показывает «Заработок баера» = процент от чистой прибыли (доход − расход) за выбранный период/кампанию в выбранной валюте; при убытке — 0. Владелец меняет процент кликом по плитке.
 - Цели: `PATCH /api/settings { dailyRevenueGoal, dailyProfitGoal }` — дневной план команды по доходу и прибыли в базовой валюте (`DEFAULT_CURRENCY`); число ≥ 0 или `null` (нет цели), только владелец. Поля PATCH независимы: можно менять только цели или только `buyerSharePct`. Хранятся на сервере в `settings.json` рядом с `buyerSharePct`, а не в браузере. Владелец задаёт их кнопкой «Цели» на дашборде. Когда выбран период «Сегодня», плитки «Доход» и «Прибыль» показывают полоску прогресса и подпись «73% плана» (от 100% — зелёное «план выполнен»); цель пересчитывается в выбранную валюту по `/api/rates`. С фильтром по кампании прогресс считается по её доходу/прибыли. Баеры видят полоску относительно цели команды (по своим кампаниям), но менять цели не могут; за другие периоды полоски нет.
 
@@ -393,8 +393,6 @@ Tracking URL принимает `utm_source`, `utm_medium`, `utm_campaign`, `utm
 Настраивается только переменной окружения, не из панели — так никто не запрёт команду кнопкой. На странице «Пользователи» видно текущее состояние и ваш IP (`GET /api/security`, только владелец). Перед включением на проде проверьте свой IP там же: при ошибке доступ возвращается только правкой env на сервере.
 
 ## Деплой на nespizdili.lol/umbrella
-
-GitHub Actions (`.github/workflows/deploy.yml`): тесты → отдельный systemd-сервис `umbrella` (порт 4110, пользователь `umbrella`) → своя база PostgreSQL `umbrella` со своей ролью (`deploy/setup-db.sh`) → `location /umbrella` в nginx (бэкап конфига, `nginx -t`, откат при ошибке) → демо-данные один раз. Секреты репозитория: `SSH_PRIVATE_KEY`, `UMBRELLA_ADMIN_TOKEN`, `UMBRELLA_POSTBACK_SECRET`, `SSH_KNOWN_HOSTS` (рекомендуется).
 
 Job `deploy` запускается только для `refs/heads/main` (push в main или ручной запуск именно на main); PR и ручной запуск на другой ветке только тестируются.
 
@@ -539,8 +537,6 @@ CR в API — доля (`0.25` = 25%), EPC = revenue / clicks, RPM = revenue × 
 `from`/`to` задаются реальными календарными датами `YYYY-MM-DD`; `to` включает весь день по UTC (граница — `< следующий день 00:00`), так же во всех отчётах (`/stats*`, `/stats/export`, `/api/bots`, `/api/postbacks`) и в обоих хранилищах. В журнале конверсий даты относятся к `at` (первый постбэк конверсии), а фильтры campaign/offer/stream — к исходному клику. Это отличается от `/stats`, где период относится к выбранным кликам.
 
 `test/ui/*.mjs` — браузерные проверки панели по разделам (`routing`, `streams`, `offers`, `dashboard`, `reports`, `report-metrics`, `campaigns-list`, `costs`, `click-log`, `monitor`, `mobile`, `accounts`, `permissions`, `source-postback`), см. «Браузерные тесты панели». Требуют Playwright или `PLAYWRIGHT_MODULE`.
-
-## PostgreSQL
 
 ## Надёжность postback
 
