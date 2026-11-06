@@ -1,3 +1,4 @@
+import './env-local.js'; // must stay first: .env.local overrides are read before any other module looks at process.env
 import './log-setup.js';
 import http from 'node:http';
 import { randomUUID, createHash, timingSafeEqual } from 'node:crypto';
