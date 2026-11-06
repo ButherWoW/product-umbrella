@@ -3716,7 +3716,7 @@
     "/api/users/{id}": {
       "patch": {
         "summary": "Change a user's role and permissions",
-        "description": "Owner only. Cannot change your own role or demote the last owner.",
+        "description": "Owner only. Cannot change your own role or demote the last owner. `password` resets the user's password (min 10 characters) and ends all of their sessions.",
         "operationId": "updateUser",
         "tags": [
           "users"
@@ -3767,6 +3767,11 @@
                   },
                   "viewAll": {
                     "type": "boolean"
+                  },
+                  "password": {
+                    "type": "string",
+                    "minLength": 10,
+                    "maxLength": 200
                   }
                 }
               }
@@ -3842,7 +3847,7 @@
             }
           }
         },
-        "x-summary-ru": "изменить роль и права пользователя (владелец)"
+        "x-summary-ru": "изменить роль, права или сбросить пароль пользователя (владелец)"
       },
       "delete": {
         "summary": "Delete a user",
@@ -5891,6 +5896,103 @@
           }
         },
         "x-summary-ru": "очистить статистику кампании (только владелец): `{ confirm: \"<id>\", before?: \"YYYY-MM-DD\" }`"
+      }
+    },
+    "/api/auth/password": {
+      "post": {
+        "summary": "Change your own password",
+        "description": "Needs the current password (counted by the login limiter). All other sessions of the user end; API keys stay. Not available to API keys.",
+        "operationId": "authPassword",
+        "tags": [
+          "auth"
+        ],
+        "security": [
+          {
+            "cookieAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "currentPassword",
+                  "newPassword"
+                ],
+                "properties": {
+                  "currentPassword": {
+                    "type": "string"
+                  },
+                  "newPassword": {
+                    "type": "string",
+                    "minLength": 10,
+                    "maxLength": 200
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Password changed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "New password too short (password_too_short)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Not logged in",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong current password (invalid_current_password), API key (session_required) or CSRF header required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many attempts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "x-summary-ru": "сменить свой пароль (нужен текущий; остальные сессии завершаются)"
       }
     }
   },

@@ -102,9 +102,11 @@ const postbackLimiter = createRateLimiter({ limit: envLimit('POSTBACK_RATE_LIMIT
 const adminAllowedIps = parseAdminAllowedIps(process.env.ADMIN_ALLOWED_IPS);
 const adminIpAllowed = (req) => !adminAllowedIps.length || adminAllowedIps.some((rule) => ipMatches(normalizeIp(clientIp(req)), rule));
 // Offers store { url, postbackUrl } objects. Old saves with bare strings are migrated on load.
-const offers = new Map([
-  ['offer-1', { url: process.env.OFFER_1_URL || 'https://example.com/', postbackUrl: null }],
-]);
+// The `demo` campaign and `offer-1` are for development and tests: anyone can click them, and the clicks would land in the real
+// database. Production (REQUIRE_POSTGRES + PANEL_BUILD, as the deploy writes it) does not create them; SEED_DEMO=1/0 forces either way.
+const seedDemo = process.env.SEED_DEMO === '1' ? true : process.env.SEED_DEMO === '0' ? false
+  : !(/^(1|true|yes)$/i.test(process.env.REQUIRE_POSTGRES || '') && /^(1|true|yes)$/i.test(process.env.PANEL_BUILD || ''));
+const offers = new Map(seedDemo ? [['offer-1', { url: process.env.OFFER_1_URL || 'https://example.com/', postbackUrl: null }]] : []);
 
 // Optional geo-lookup. Requires GEOIP_DB env var + @maxmind/geoip2-node installed.
 let geoReader = null;
@@ -155,7 +157,7 @@ function clientIp(req) {
 function rateLimited(ip, limiter = clickLimiter) {
   return limiter.hit(ip);
 }
-const campaigns = new Map([['demo', { name: 'Demo campaign', active: true, streams: [], dailyCap: null, capUrl: null, allowDevices: [], allowGeos: [], geoCapUrl: null }]]);
+const campaigns = new Map(seedDemo ? [['demo', { name: 'Demo campaign', active: true, streams: [], dailyCap: null, capUrl: null, allowDevices: [], allowGeos: [], geoCapUrl: null }]] : []);
 // Clicks whose PostgreSQL insert failed: only for these may getClickRecord fall back to the JSONL journal.
 const unmirroredClicks = new Set();
 const eventMirror = db ? createEventMirror({ query,
@@ -1821,6 +1823,7 @@ function sessionCookie(req, token, maxAgeSeconds) {
 }
 
 // Panel pages (src/panel-routes.js) are not private: the shell loads without a session and shows /login.
+const isSecretCarrier = (p) => p === '/api/offers' || p.startsWith('/api/offers/') || p === '/api/sources' || p.startsWith('/api/sources/');
 const isPrivatePath = (p) => (p.startsWith('/api/') && !p.startsWith('/api/auth/')) || p === '/stats' || p.startsWith('/stats/') || p.startsWith('/assets/');
 
 async function readJson(req, maxBytes = 64 * 1024) {
@@ -2033,6 +2036,18 @@ async function handleAuthRoute(req, res, url) {
     res.setHeader('set-cookie', sessionCookie(req, '', 0));
     return json(res, 200, { ok: true });
   }
+  // Own password: needs the current one; every other session of the user ends. Not for API keys (a leaked key must not change it).
+  if (path === '/api/auth/password' && req.method === 'POST') {
+    if (!req.user) return json(res, 401, { error: 'login_required' });
+    if (req.apiKey) return json(res, 403, { error: 'session_required' });
+    const ticket = loginLimiter.reserve(req.user.email, clientIp(req) || 'unknown');
+    if (!ticket) return json(res, 429, { error: 'too_many_attempts' });
+    if (!(await users.authenticate(req.user.email, body.currentPassword))) return json(res, 403, { error: 'invalid_current_password' });
+    loginLimiter.success(ticket);
+    await users.setPassword(req.user.id, body.newPassword, { keepToken: readCookie(req, SESSION_COOKIE) });
+    await audit(req, 'update', 'user', req.user.id, null, { passwordChanged: true });
+    return json(res, 200, { ok: true });
+  }
   const isOwner = req.user?.role === 'owner' || bearerAuthorized(req);
   if (path === '/api/users' && req.method === 'GET') {
     if (!isOwner) return json(res, 403, { error: 'owner_only' });
@@ -2058,6 +2073,11 @@ async function handleAuthRoute(req, res, url) {
     }
     const updated = await users.update(id, input);
     const view = (u) => ({ role: u.role, hideRevenue: u.hideRevenue, offersAccess: u.offersAccess, viewAll: u.viewAll });
+    // Password reset by the owner: the user's sessions end (the owner's own current session stays when it resets its own password).
+    if (body.password !== undefined) {
+      await users.setPassword(id, body.password, { keepToken: req.user?.id === id ? readCookie(req, SESSION_COOKIE) : null });
+      await audit(req, 'update', 'user', id, null, { passwordChanged: true });
+    }
     await audit(req, 'update', 'user', id, view(target), view(updated));
     return json(res, 200, { user: updated });
   }
@@ -2170,6 +2190,9 @@ const server = http.createServer(async (req, res) => {
       req.apiKey = found.key;
     } else req.user = await sessionUser(req);
     if (requireLogin && isPrivatePath(url.pathname) && !req.user && !bearerAuthorized(req)) return json(res, 401, { error: 'login_required' });
+    // Offers and sources carry the networks' postback URLs with their tokens: closed to anonymous visitors whatever REQUIRE_LOGIN says
+    // as soon as any credential exists (ADMIN_TOKEN, a user, or REQUIRE_LOGIN). Only a fresh install with no credentials at all stays open.
+    if (!req.user && isSecretCarrier(url.pathname) && !bearerAuthorized(req) && (adminToken || (await users.count()) > 0)) return json(res, 401, { error: 'login_required' });
     // Read-only role: every write to the panel API is refused; signing in and out stays possible.
     if (isViewer(req) && !['GET', 'HEAD'].includes(req.method) && isPrivatePath(url.pathname)) return json(res, 403, { error: 'read_only' });
     if (hidesRevenue(req)) {
@@ -3095,6 +3118,8 @@ if (retentionDays > 0) {
   console.log(`[retention] enabled: ${retentionDays} days`);
 }
 if (monitorEnabled) monitor.start();
+setInterval(() => users.purgeExpiredSessions().catch((error) => console.warn('[auth] session cleanup failed:', error.message)), 3600000).unref();
+users.purgeExpiredSessions().catch(() => {});
 // Startup reconciliation (whole journal) also replaces the old one-time bot backfill: attaching PostgreSQL to an
 // existing journal copies its clicks, conversions, bots, postbacks and cost updates.
 if (db && reconcileIntervalMs > 0) {
