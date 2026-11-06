@@ -7,7 +7,7 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { db, query, closeDb, dbStatus } from './db.js';
 import { readJournal, endsWithNewline, journalBadLines, noteBadLines } from './journal.js';
-import { reconcileEvents, ReconcileStopped } from './reconcile.js';
+import { reconcileJournal, ReconcileStopped } from './reconcile.js';
 import { reportFromRows, reportFromEvents, metrics } from './stats-report.js';
 import { createUserStore, readCookie, SESSION_TTL_MS, API_KEY_PREFIX } from './auth.js';
 import { createRates, normalizeCurrency } from './currency.js';
@@ -1131,7 +1131,7 @@ async function removeStats(plan, deleteRows) {
 // Events in the journal before a run's snapshot have finished mirroring (flush) before the run compares them.
 const reconcileIntervalMs = Math.max(0, Number(process.env.RECONCILE_INTERVAL_MS ?? 900000) || 0);
 const reconciler = (() => {
-  let watermark = 0; // events (parsed journal lines) already reconciled
+  let watermark = 0; // journal lines (complete JSON objects) already reconciled
   let running = null;
   let paused = 0;
   let last = null;
@@ -1139,13 +1139,12 @@ const reconciler = (() => {
     if (!db || paused) return null;
     if (running) return running;
     running = (async () => {
-      const events = await readJournal(eventsFile);
-      await eventMirror?.flush();
-      const from = full || watermark > events.length ? 0 : watermark;
+      const from = full ? 0 : watermark;
       const started = Date.now();
       try {
-        const counts = await reconcileEvents({ db, events, from, shouldStop: () => paused > 0 });
-        watermark = events.length;
+        // Streams the journal: memory is bounded by the window of new events, not by the journal size.
+        const { counts, total } = await reconcileJournal({ db, eventsFile, from, shouldStop: () => paused > 0, beforeCompare: async () => { await eventMirror?.flush(); } });
+        watermark = total;
         const replayed = Object.values(counts).reduce((a, b) => a + b, 0);
         last = { at: new Date().toISOString(), ok: true, replayed };
         if (replayed) console.log(`[reconcile] PostgreSQL was missing journal data, replayed: ${JSON.stringify(counts)} (${Date.now() - started} ms)`);
@@ -2899,7 +2898,8 @@ const server = http.createServer(async (req, res) => {
       const ok = !(requirePostgres && dbState !== 'up');
       return json(res, ok ? 200 : 503, { ok, storage: db ? 'postgres' : 'jsonl', ...(dbState ? { db: dbState } : {}), ...(degraded ? { degraded: true } : {}),
         ...(eventMirror ? { mirrorErrors: eventMirror.stats().errors } : {}), journalBadLines: journalBadLines(),
-        geo: Boolean(geoReader), isp: Boolean(asnReader), now: new Date().toISOString(), uptime: Math.round(process.uptime()) });
+        geo: Boolean(geoReader), isp: Boolean(asnReader), now: new Date().toISOString(), uptime: Math.round(process.uptime()),
+        memory: { rssMb: Math.round(process.memoryUsage().rss / 1048576), heapUsedMb: Math.round(process.memoryUsage().heapUsed / 1048576) } });
     }
     // Time-series: GET /stats/timeseries?campaign=X&from=YYYY-MM-DD&to=YYYY-MM-DD&granularity=day|hour
     if (url.pathname === '/stats/timeseries' && req.method === 'GET') {
