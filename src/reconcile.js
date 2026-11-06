@@ -11,9 +11,11 @@
 //   bots/postbacks inserted when no row has their event_id (rows written before event_id existed are matched by
 //                 campaign/direction, time, ip/click/url);
 //   cost imports  the latest import per key.
-// `from` limits the work to the events at index >= from (the tail since the previous run); state is still
-// computed from the whole journal. `shouldStop()` is checked between batches (a statistics cleanup waits for it).
+// `from` limits the work to the events at index >= from (the tail since the previous run); the state of the clicks
+// the tail touches is read from the whole journal (streamed, only for those clicks — never the whole journal in memory). `shouldStop()` is checked between batches (a statistics cleanup waits for it).
 import { CLICK_COLUMNS, clickValues, COST_IMPORT_UPSERT } from './event-mirror.js';
+import { createReadStream } from 'node:fs';
+import { createInterface } from 'node:readline';
 import { conversionTid } from './conversion-recorder.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -31,49 +33,117 @@ function chunks(list, size = BATCH) {
 
 export class ReconcileStopped extends Error {}
 
-export async function reconcileEvents({ db, events, from = 0, shouldStop = () => false }) {
-  const counts = { clicks: 0, conversions: 0, clickState: 0, bots: 0, postbacks: 0, costImports: 0 };
-  const checkpoint = () => { if (shouldStop()) throw new ReconcileStopped('reconcile stopped'); };
-  const tail = from > 0 ? events.slice(from) : events;
-  if (!tail.length) return counts;
+// Tail window → what it touches (ids only, no whole-journal state).
+function scanTail(tail) {
+  const watch = new Set(); // click ids whose journal state is needed
+  const tailClicks = new Set(), touched = new Set(), tailConversions = new Set(), bots = [], postbacks = [], imports = new Map();
+  for (const e of tail) {
+    if (e.type === 'click' && UUID.test(e.clickId || '')) { tailClicks.add(e.clickId); touched.add(e.clickId); watch.add(e.clickId); }
+    else if (e.type === 'conversion' && UUID.test(e.clickId || '')) { tailConversions.add(`${e.clickId}|${conversionTid(e.tid)}`); touched.add(e.clickId); watch.add(e.clickId); }
+    else if (e.type === 'lp_click' && e.clickId) { touched.add(e.clickId); watch.add(e.clickId); }
+    else if (e.type === 'cost_update' && Array.isArray(e.clickIds)) {
+      for (const id of e.clickIds) { touched.add(id); watch.add(id); }
+      if (e.importKey) imports.set(e.importKey, e);
+    } else if (e.type === 'bot' && e.campaign && timeKey(e.at) !== null) bots.push(e);
+    else if ((e.type === 'postback_in' || e.type === 'postback_out') && timeKey(e.at) !== null) {
+      postbacks.push(e);
+      if (e.campaign && e.clickId) watch.add(e.clickId);
+    }
+  }
+  return { watch, tailClicks, touched, tailConversions, bots, postbacks, imports };
+}
 
-  // Journal state (whole file).
+// Journal state of the watched clicks only. `scan(visit)` calls visit(event) for every journal event, in order.
+async function loadState(watch, scan) {
   const clicks = new Map();
   const conversions = new Map(); // clickId|tid → { first, latest, params }
   const clickParams = new Map(); // clickId → params merged in journal order
   const clickCost = new Map();
   const lpFirst = new Map();
-  for (const e of events) {
+  await scan((e) => {
     if (e.type === 'click' && UUID.test(e.clickId || '')) {
+      if (!watch.has(e.clickId)) return;
       if (!clicks.has(e.clickId)) clicks.set(e.clickId, e);
       if (e.params) clickParams.set(e.clickId, { ...(clickParams.get(e.clickId) || {}), ...e.params });
       clickCost.set(e.clickId, e.cost ?? 0);
     } else if (e.type === 'conversion' && UUID.test(e.clickId || '')) {
+      if (!watch.has(e.clickId)) return;
       const key = `${e.clickId}|${conversionTid(e.tid)}`;
       const prev = conversions.get(key);
       conversions.set(key, { first: prev?.first ?? e, latest: e, params: e.params || prev?.params || null });
       if (e.params && Object.keys(e.params).length) clickParams.set(e.clickId, { ...(clickParams.get(e.clickId) || {}), ...e.params });
-    } else if (e.type === 'lp_click' && e.clickId && !lpFirst.has(e.clickId)) lpFirst.set(e.clickId, e.at);
+    } else if (e.type === 'lp_click' && e.clickId && watch.has(e.clickId) && !lpFirst.has(e.clickId)) lpFirst.set(e.clickId, e.at);
     else if (e.type === 'cost_update' && Array.isArray(e.clickIds)) {
-      for (const id of e.clickIds) clickCost.set(id, e.cost ?? 0);
-      if (e.lastClickId) clickCost.set(e.lastClickId, e.lastCost ?? e.cost ?? 0);
+      for (const id of e.clickIds) if (watch.has(id)) clickCost.set(id, e.cost ?? 0);
+      if (e.lastClickId && watch.has(e.lastClickId)) clickCost.set(e.lastClickId, e.lastCost ?? e.cost ?? 0);
     }
-  }
+  });
+  return { clicks, conversions, clickParams, clickCost, lpFirst };
+}
 
-  // What the tail touches.
-  const tailClicks = new Set(), touched = new Set(), tailConversions = new Set(), bots = [], postbacks = [], imports = new Map();
-  for (const e of tail) {
-    if (e.type === 'click' && clicks.has(e.clickId)) { tailClicks.add(e.clickId); touched.add(e.clickId); }
-    else if (e.type === 'conversion' && UUID.test(e.clickId || '')) { tailConversions.add(`${e.clickId}|${conversionTid(e.tid)}`); touched.add(e.clickId); }
-    else if (e.type === 'lp_click' && e.clickId) touched.add(e.clickId);
-    else if (e.type === 'cost_update' && Array.isArray(e.clickIds)) {
-      for (const id of e.clickIds) touched.add(id);
-      if (e.importKey) imports.set(e.importKey, e);
-    } else if (e.type === 'bot' && e.campaign && timeKey(e.at) !== null) bots.push(e);
-    // «Очистка статистики» deletes a campaign's postback rows but keeps their journal lines (only the click lines go):
-    // a postback of a campaign is replayed only while its click is still in the journal.
-    else if ((e.type === 'postback_in' || e.type === 'postback_out') && timeKey(e.at) !== null && (!e.campaign || clicks.has(e.clickId))) postbacks.push(e);
+// In-memory journal (tests, small scripts): `events` is the whole journal, the tail starts at index `from`.
+export function reconcileEvents({ db, events, from = 0, shouldStop = () => false }) {
+  const tail = from > 0 ? events.slice(from) : events;
+  return reconcileWindow({ db, tail, shouldStop, scan: async (visit) => { for (const e of events) visit(e); } });
+}
+
+const NEEDLES = ['"click"', '"conversion"', '"lp_click"', '"cost_update"'];
+const complete = (line) => line[0] === '{' && line[line.length - 1] === '}';
+
+// Streams the journal file; memory is bounded by `windowSize` tail events plus the state of the clicks they touch,
+// not by the journal size. Every window costs one more streaming pass over the file (parsing only click-state lines),
+// so a 15-minute tail is a single window and the startup run over a huge journal is several.
+// `from` is a line offset (non-blank lines that look like a complete JSON object); the new offset is returned in `total`.
+export async function reconcileJournal({ db, eventsFile, from = 0, shouldStop = () => false, beforeCompare = async () => {}, windowSize = 25000 }) {
+  const counts = { clicks: 0, conversions: 0, clickState: 0, bots: 0, postbacks: 0, costImports: 0 };
+  const lines = async function* () {
+    let input;
+    try {
+      input = createReadStream(eventsFile, { encoding: 'utf8', highWaterMark: 256 * 1024 });
+      await new Promise((resolve, reject) => { input.once('open', resolve); input.once('error', reject); });
+    } catch (error) { if (error.code === 'ENOENT') return; throw error; }
+    for await (const raw of createInterface({ input, crlfDelay: Infinity })) {
+      const line = raw.trim();
+      if (line) yield line;
+    }
+  };
+  const scanAll = async (visit) => {
+    for await (const line of lines()) {
+      if (!complete(line) || !NEEDLES.some((needle) => line.includes(needle))) continue;
+      let e; try { e = JSON.parse(line); } catch { continue; }
+      visit(e);
+    }
+  };
+  const flushWindow = async (tail) => {
+    await beforeCompare();
+    const part = await reconcileWindow({ db, tail, shouldStop, scan: scanAll });
+    for (const key of Object.keys(counts)) counts[key] += part[key];
+  };
+  let index = 0, weight = 0, tail = [];
+  for await (const line of lines()) {
+    if (!complete(line)) continue;
+    const i = index++;
+    if (i < from) continue;
+    let e; try { e = JSON.parse(line); } catch { continue; }
+    if (!e || typeof e !== 'object' || Array.isArray(e)) continue;
+    tail.push(e);
+    weight += 1 + (Array.isArray(e.clickIds) ? e.clickIds.length : 0);
+    if (weight >= windowSize) { const part = tail; tail = []; weight = 0; await flushWindow(part); }
   }
+  if (tail.length) await flushWindow(tail);
+  if (from > index) return reconcileJournal({ db, eventsFile, from: 0, shouldStop, beforeCompare, windowSize }); // journal was rewritten
+  return { counts, total: index };
+}
+
+async function reconcileWindow({ db, tail, scan, shouldStop = () => false }) {
+  const counts = { clicks: 0, conversions: 0, clickState: 0, bots: 0, postbacks: 0, costImports: 0 };
+  const checkpoint = () => { if (shouldStop()) throw new ReconcileStopped('reconcile stopped'); };
+  if (!tail.length) return counts;
+  const { watch, tailClicks, touched, tailConversions, bots, postbacks: tailPostbacks, imports } = scanTail(tail);
+  const { clicks, conversions, clickParams, clickCost, lpFirst } = await loadState(watch, scan);
+  // «Очистка статистики» deletes a campaign's postback rows but keeps their journal lines (only the click lines go):
+  // a postback of a campaign is replayed only while its click is still in the journal.
+  const postbacks = tailPostbacks.filter((e) => !e.campaign || clicks.has(e.clickId));
 
   // 1. Missing clicks.
   for (const ids of chunks([...tailClicks], 5000)) {

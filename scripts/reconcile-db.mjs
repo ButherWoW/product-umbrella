@@ -14,15 +14,13 @@ const dataDir = dirFlag >= 0 ? args[dirFlag + 1] : (process.env.DATA_DIR || join
 if (!process.env.DATABASE_URL) { console.error('DATABASE_URL is not set'); process.exit(1); }
 
 const { db, closeDb } = await import('../src/db.js');
-const { readJournal, journalBadLines } = await import('../src/journal.js');
-const { reconcileEvents } = await import('../src/reconcile.js');
+const { reconcileJournal } = await import('../src/reconcile.js');
 if (!db) { console.error('PostgreSQL is unreachable'); process.exit(1); }
 
 try {
   const started = Date.now();
-  const events = await readJournal(join(dataDir, 'events.jsonl'));
-  const replayed = await reconcileEvents({ db, events });
-  console.log(JSON.stringify({ ok: true, events: events.length, unreadableLines: journalBadLines(), replayed, ms: Date.now() - started }));
+  const { counts: replayed, total } = await reconcileJournal({ db, eventsFile: join(dataDir, 'events.jsonl') });
+  console.log(JSON.stringify({ ok: true, events: total, replayed, ms: Date.now() - started }));
 } catch (error) {
   console.error('[reconcile] failed:', error.message);
   process.exitCode = 1;
