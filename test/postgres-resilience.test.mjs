@@ -271,7 +271,7 @@ test('a repeated sale is a duplicate even while the PostgreSQL row still holds t
   await sleep(200);
   assert.equal((await db.query('SELECT status FROM conversions WHERE click_id = $1', [clickId])).rows[0].status, 'lead');
   const repeat = await post('sale');
-  assert.equal(repeat.status, 409, 'not taken for a lead → sale update (that would re-send S2S postbacks)');
+  assert.equal((await repeat.json()).duplicate, true, 'not taken for a lead → sale update (that would re-send S2S postbacks)');
   await db.query('ALTER TABLE conversions DROP CONSTRAINT block_sale');
   const fix = spawnSync(process.execPath, ['scripts/reconcile-db.mjs', '--data-dir', dir], { env: { ...process.env, DATABASE_URL: url }, encoding: 'utf8' });
   assert.equal(fix.status, 0, fix.stderr);

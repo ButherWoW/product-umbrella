@@ -184,6 +184,24 @@ test('postbacks with a wrong secret: one journal event per IP and minute, the re
   assert.deepEqual(events.map((e) => e.error), ['invalid_postback_secret', 'invalid_postback_secret ×5 more']);
 });
 
+test('a flood of postbacks that change nothing (unknown click, malformed id, duplicates) is aggregated in the journal', { timeout: 30000 }, async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'umbrella-security-'));
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  const server = await startTestServer(dataDir, { ADMIN_TOKEN: TOKEN });
+  const pb = (id, extra = '') => fetch(`${server.url}/postback?click_id=${id}&secret=conversion-test-secret${extra}`);
+  for (let i = 0; i < 10; i++) assert.equal((await pb(randomUUID())).status, 404);
+  for (let i = 0; i < 10; i++) assert.equal((await pb(`bad-${i}`)).status, 400);
+  const hit = await fetch(`${server.url}/r/demo/offer-1`, { redirect: 'manual' });
+  const clickId = new URL(hit.headers.get('location')).searchParams.get('click_id');
+  for (let i = 0; i < 10; i++) assert.equal((await (await pb(clickId, '&revenue=1')).json()).duplicate, i > 0 ? true : undefined);
+  await server.stop();
+  const events = (await readFile(join(dataDir, 'events.jsonl'), 'utf8')).trim().split('\n').map((l) => JSON.parse(l)).filter((e) => e.type === 'postback_in');
+  assert.deepEqual(events.map((e) => [e.statusCode, e.error]).sort(), [
+    [200, 'conversion_already_recorded'], [200, 'conversion_already_recorded ×8 more'], [200, null],
+    [400, 'invalid_click_id'], [400, 'invalid_click_id ×9 more'],
+    [404, 'click_not_found'], [404, 'click_not_found ×9 more']].sort());
+});
+
 // ---------- 4. File modes ----------
 
 test('data files are written owner-only (0600) and older files are tightened at startup', { skip: process.platform === 'win32' && 'POSIX modes', timeout: 30000 }, async (t) => {

@@ -17,8 +17,8 @@ export async function checkUpsells(server, call, run = 'u') {
   assert.equal((await postback('revenue=10')).status, 200, 'main conversion (no tid)');
   assert.equal((await postback('revenue=4&tid=order-2')).status, 200, 'upsell with another tid');
   assert.equal((await postback('revenue=6&tid=order-3&sub_id_3=from-network&sub_id_7=net7')).status, 200);
-  assert.equal((await postback('revenue=4&tid=order-2')).status, 409, 'same tid again = duplicate');
-  assert.equal((await postback('revenue=10')).status, 409, 'no tid twice = duplicate, as before');
+  assert.equal((await (await postback('revenue=4&tid=order-2')).json()).duplicate, true, 'same tid again = duplicate');
+  assert.equal((await (await postback('revenue=10')).json()).duplicate, true, 'no tid twice = duplicate, as before');
   const update = await postback('tid=order-3&status=rejected');
   assert.equal(update.status, 200);
   assert.deepEqual(await update.json(), { ok: true, status: 'rejected', updated: true, tid: 'order-3' });

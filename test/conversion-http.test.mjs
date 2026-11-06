@@ -19,12 +19,10 @@ test('real concurrent HTTP postbacks remain unique after server restart', { time
   };
   const concurrentId = await click();
   const attempts = await Promise.all(Array.from({ length: 20 }, () => post(concurrentId)));
-  assert.equal(attempts.filter((response) => response.status === 200).length, 1);
-  assert.equal(attempts.filter((response) => response.status === 409).length, 19);
-  for (const response of attempts) {
-    const body = await response.json();
-    assert.deepEqual(body, response.status === 200 ? { ok: true } : { error: 'conversion_already_recorded' });
-  }
+  const bodies = await Promise.all(attempts.map((response) => response.json()));
+  assert.equal(attempts.every((response) => response.status === 200), true, 'a repeated postback is acknowledged, not 409');
+  assert.equal(bodies.filter((body) => body.duplicate === true).length, 19);
+  assert.equal(bodies.filter((body) => body.duplicate === undefined && body.ok === true).length, 1);
   const invalidId = await click();
   for (const revenue of ['NaN', 'Infinity', '-1', '1e3', '0x10', '100000000', '1.12345']) {
     const rejected = await post(invalidId, revenue);
@@ -46,8 +44,8 @@ test('real concurrent HTTP postbacks remain unique after server restart', { time
   assert.equal(before.revenue, 2.5);
   await server.stop();
   server = await startTestServer(dataDir);
-  assert.equal((await post(concurrentId)).status, 409, 'restart must not permit an already recorded conversion');
-  assert.equal((await post(invalidId)).status, 409);
+  assert.deepEqual(await (await post(concurrentId)).json(), { ok: true, duplicate: true }, 'restart must not permit an already recorded conversion');
+  assert.equal((await (await post(invalidId)).json()).duplicate, true);
   const after = await (await fetch(`${server.url}/stats?campaign=demo`)).json();
   assert.equal(after.conversions, 2);
   assert.equal(after.revenue, 2.5);
