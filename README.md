@@ -538,6 +538,8 @@ CR в API — доля (`0.25` = 25%), EPC = revenue / clicks, RPM = revenue × 
 
 `from`/`to` задаются реальными календарными датами `YYYY-MM-DD`; `to` включает весь день по UTC (граница — `< следующий день 00:00`), так же во всех отчётах (`/stats*`, `/stats/export`, `/api/bots`, `/api/postbacks`) и в обоих хранилищах. В журнале конверсий даты относятся к `at` (первый постбэк конверсии), а фильтры campaign/offer/stream — к исходному клику. Это отличается от `/stats`, где период относится к выбранным кликам.
 
+**Часовой пояс отчётов:** `/stats`, `/stats/compare`, `/stats/export`, `/stats/params`, `/stats/timeseries` и `/stats/bots` принимают `tz` (IANA, например `tz=Europe/Paris`): `from`/`to` тогда означают местные сутки этого пояса, а дневные и часовые корзины `/stats/timeseries` считаются по местному времени (сутки с переводом часов бывают 23 или 25 часов). Без `tz` (или `tz=UTC`) — UTC-сутки, как раньше. Неизвестный пояс — `400 invalid_tz`. Журналы `/api/clicks`, `/api/conversions`, `/api/bots`, `/api/postbacks` пока только по UTC; панель пока тоже считает пресеты периодов в UTC.
+
 `test/ui/*.mjs` — браузерные проверки панели по разделам (`routing`, `streams`, `offers`, `dashboard`, `reports`, `report-metrics`, `campaigns-list`, `costs`, `click-log`, `monitor`, `mobile`, `accounts`, `permissions`, `source-postback`), см. «Браузерные тесты панели». Требуют Playwright или `PLAYWRIGHT_MODULE`.
 
 ## PostgreSQL

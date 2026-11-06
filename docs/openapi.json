@@ -1007,6 +1007,15 @@
         "schema": {
           "type": "string"
         }
+      },
+      "tz": {
+        "name": "tz",
+        "in": "query",
+        "description": "IANA time zone (for example Europe/Paris) in which from/to dates and day/hour buckets are counted. Default and `UTC`: UTC days.",
+        "schema": {
+          "type": "string",
+          "example": "Europe/Paris"
+        }
       }
     }
   },
@@ -1672,6 +1681,9 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "$ref": "#/components/parameters/tz"
           }
         ],
         "responses": {
@@ -1742,6 +1754,9 @@
               ],
               "default": "day"
             }
+          },
+          {
+            "$ref": "#/components/parameters/tz"
           }
         ],
         "responses": {
@@ -1837,6 +1852,9 @@
               "type": "string",
               "format": "date"
             }
+          },
+          {
+            "$ref": "#/components/parameters/tz"
           }
         ],
         "responses": {
@@ -1988,6 +2006,9 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "$ref": "#/components/parameters/tz"
           }
         ],
         "responses": {
@@ -2174,6 +2195,9 @@
           },
           {
             "$ref": "#/components/parameters/campaign"
+          },
+          {
+            "$ref": "#/components/parameters/tz"
           }
         ],
         "responses": {
@@ -5000,6 +5024,9 @@
           },
           {
             "$ref": "#/components/parameters/to"
+          },
+          {
+            "$ref": "#/components/parameters/tz"
           }
         ],
         "responses": {
