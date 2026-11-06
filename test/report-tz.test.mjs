@@ -23,6 +23,11 @@ test('dayRange: UTC by default, local midnights with tz (DST-safe)', () => {
   assert.deepEqual(dayRange(null, null, 'Europe/Paris'), { fromMs: null, toMs: null, fromIso: null, toIso: null });
 });
 
+test('dayRange: malformed dates are 400, not a crash', () => {
+  assert.throws(() => dayRange('not-a-date', null), { message: 'invalid_from_date', statusCode: 400 });
+  assert.throws(() => dayRange(null, '2026-13-45', 'Europe/Paris'), { message: 'invalid_to_date', statusCode: 400 });
+});
+
 test('localBucket', () => {
   assert.equal(localBucket('2026-11-05T23:30:00Z', 'Europe/Paris'), '2026-11-06');
   assert.equal(localBucket('2026-11-05T23:30:00Z', 'Europe/Paris', true), '2026-11-06T00');

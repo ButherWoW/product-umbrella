@@ -23,6 +23,9 @@ export const dayStartMs = (day, tz = null) => (tz ? zonedDayStart(day, tz) : Dat
 
 // [from, to] inclusive dates → half-open instants. Missing dates → null.
 export function dayRange(from, to, tz = null) {
+  const bad = (day) => day && (!/^\d{4}-\d{2}-\d{2}$/.test(day) || !Number.isFinite(Date.parse(`${day}T00:00:00Z`)));
+  if (bad(from)) throw Object.assign(new Error('invalid_from_date'), { statusCode: 400 });
+  if (bad(to)) throw Object.assign(new Error('invalid_to_date'), { statusCode: 400 });
   const fromMs = from ? dayStartMs(from, tz) : null;
   const toMs = to ? dayStartMs(nextDay(to), tz) : null;
   return { fromMs, toMs, fromIso: fromMs === null ? null : new Date(fromMs).toISOString(), toIso: toMs === null ? null : new Date(toMs).toISOString() };
