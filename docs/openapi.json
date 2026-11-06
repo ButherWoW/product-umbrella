@@ -1608,6 +1608,9 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Starting (the stores and the journal index are still loading: { ok: false, starting: true }) or PostgreSQL required but down"
           }
         },
         "x-summary-ru": "состояние сервера: хранилище (`postgres`/`jsonl`), GeoIP, аптайм"

@@ -57,10 +57,12 @@ export function createRates({ dataDir, defaultCurrency = 'EUR', refreshMs = 12 *
 
   return {
     defaultCurrency,
-    async start() {
+    // blocking: false — do not wait for the first network refresh (the cached rates are enough to start serving).
+    async start({ blocking = true } = {}) {
       await loadCache();
       if (refreshMs > 0) {
-        await refresh();
+        const first = refresh(); // never rejects: failures keep the last rates
+        if (blocking) await first;
         timer = setInterval(refresh, refreshMs);
         timer.unref?.();
       }
