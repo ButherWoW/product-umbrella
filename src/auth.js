@@ -129,6 +129,39 @@ export function createUserStore({ db = null, dataDir }) {
         return publicUser(user);
       });
     },
+    // New password for a user (owner reset or the user's own change). All sessions of the user end, except `keepToken`
+    // (the session that made the change). API keys are separate credentials and stay. Returns false when there is no such user.
+    async setPassword(id, password, { keepToken = null } = {}) {
+      if (typeof password !== 'string' || password.length < 10 || password.length > 200) throw fail('password_too_short', 400);
+      const hash = await hashPassword(password);
+      const keep = keepToken ? tokenHash(keepToken) : null;
+      if (db) {
+        const { rowCount } = await db.query('UPDATE users SET password_hash = $2 WHERE id = $1', [id, hash]);
+        if (!rowCount) return false;
+        await db.query('DELETE FROM sessions WHERE user_id = $1 AND ($2::text IS NULL OR token_hash <> $2)', [id, keep]);
+        return true;
+      }
+      return locked(async () => {
+        const all = await load(usersFile);
+        const user = all.find((u) => u.id === id);
+        if (!user) return false;
+        user.password_hash = hash;
+        await save(usersFile, all);
+        await save(sessionsFile, (await load(sessionsFile)).filter((s) => s.user_id !== id || s.token_hash === keep));
+        return true;
+      });
+    },
+    // Expired sessions are useless but would stay forever (PostgreSQL); the JSON store drops them on every login anyway.
+    async purgeExpiredSessions() {
+      if (db) return (await db.query('DELETE FROM sessions WHERE expires_at <= now()')).rowCount;
+      return locked(async () => {
+        const now = Date.now();
+        const all = await load(sessionsFile);
+        const live = all.filter((s) => Date.parse(s.expires_at) > now);
+        if (live.length !== all.length) await save(sessionsFile, live);
+        return all.length - live.length;
+      });
+    },
     async remove(id) {
       if (db) { await db.query('DELETE FROM users WHERE id = $1', [id]); return; }
       await locked(async () => {
@@ -140,7 +173,10 @@ export function createUserStore({ db = null, dataDir }) {
     async createSession(userId) {
       const token = randomBytes(32).toString('base64url');
       const row = { token_hash: tokenHash(token), user_id: userId, expires_at: new Date(Date.now() + SESSION_TTL_MS).toISOString() };
-      if (db) await db.query('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES ($1,$2,$3)', [row.token_hash, row.user_id, row.expires_at]);
+      if (db) {
+        await db.query('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES ($1,$2,$3)', [row.token_hash, row.user_id, row.expires_at]);
+        db.query('DELETE FROM sessions WHERE expires_at <= now()').catch(() => {}); // housekeeping, never blocks a login
+      }
       else await locked(async () => { const now = Date.now(); await save(sessionsFile, [...(await load(sessionsFile)).filter((s) => Date.parse(s.expires_at) > now), row]); });
       return token;
     },

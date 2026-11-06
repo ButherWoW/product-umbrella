@@ -37,19 +37,27 @@ export function loginLimitsFromEnv(env = process.env) {
 export function createLoginLimiter({ windowMs = LOGIN_DEFAULTS.windowMs, perPair = LOGIN_DEFAULTS.perPair, perEmail = LOGIN_DEFAULTS.perEmail,
   perIp = LOGIN_DEFAULTS.perIp, maxKeys = 50000 } = {}) {
   const buckets = new Map();
+  // (email, IP) pairs that logged in successfully within the last KNOWN_TTL_MS. They are neither blocked by nor counted in the
+  // per-email counter, so someone who only knows an email address cannot lock its owner out by guessing from other
+  // addresses (that guard still stops a distributed guess from unknown addresses). In memory: a restart forgets them.
+  const known = new Map();
+  const KNOWN_TTL_MS = 30 * 24 * 3600 * 1000;
+  const isKnown = (pair, now) => { const at = known.get(pair); if (at === undefined) return false; if (now - at < KNOWN_TTL_MS) return true; known.delete(pair); return false; };
   const recent = (key, now) => {
     const values = (buckets.get(key) || []).filter((at) => now - at < windowMs);
     if (values.length) buckets.set(key, values); else buckets.delete(key);
     return values;
   };
   const normalizeEmail = (email) => String(email ?? '').trim().toLowerCase().slice(0, 320);
-  function keysFor(email, ip) {
+  function keysFor(email, ip, now = Date.now()) {
     const e = normalizeEmail(email), i = String(ip || 'unknown');
-    return [[`p:${e}\n${i}`, perPair], [`e:${e}`, perEmail], [`i:${i}`, perIp]];
+    const pair = `p:${e}\n${i}`;
+    const keys = [[pair, perPair], [`e:${e}`, perEmail], [`i:${i}`, perIp]];
+    return isKnown(pair, now) ? [keys[0], keys[2]] : keys;
   }
   // Returns null when blocked, otherwise a ticket for success()/failure().
   function reserve(email, ip, now = Date.now()) {
-    const keys = keysFor(email, ip);
+    const keys = keysFor(email, ip, now);
     if (keys.some(([key, limit]) => limit && recent(key, now).length >= limit)) return null;
     for (const [key, limit] of keys) if (limit) { const values = buckets.get(key) || []; values.push(now); buckets.set(key, values); }
     if (buckets.size > maxKeys) for (const key of buckets.keys()) recent(key, now);
@@ -60,6 +68,8 @@ export function createLoginLimiter({ windowMs = LOGIN_DEFAULTS.windowMs, perPair
     if (!ticket) return;
     const [[pairKey], ...others] = ticket.keys;
     buckets.delete(pairKey);
+    known.set(pairKey, Date.now());
+    if (known.size > 10000) known.delete(known.keys().next().value);
     for (const [key] of others) {
       const values = buckets.get(key);
       const index = values ? values.indexOf(ticket.at) : -1;
