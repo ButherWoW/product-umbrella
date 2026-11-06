@@ -1,5 +1,6 @@
 import './log-setup.js';
 import http from 'node:http';
+import { once } from 'node:events';
 import { randomUUID, createHash, timingSafeEqual } from 'node:crypto';
 import { mkdir, appendFile, readFile, writeFile as fsWriteFile, chmod, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
@@ -2150,10 +2151,17 @@ async function serveDemo(req, res, url) {
   return res.end(await panelShell({ demo: true }));
 }
 
+// The port is bound before the stores and the journal index are built (a big journal takes longer than a deploy's
+// health-check window); until `ready` every request gets 503 and /health says «starting» (release.sh keeps waiting).
+let ready = false;
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     securityHeaders(res, url.pathname);
+    if (!ready) {
+      res.setHeader('retry-after', '2');
+      return json(res, 503, url.pathname === '/health' ? { ok: false, starting: true, uptime: Math.round(process.uptime()) } : { error: 'starting' });
+    }
     if (onTrackingDomain(req) && !isTrackingPath(url.pathname)) {
       res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
       return res.end('Not Found');
@@ -3071,8 +3079,10 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+server.listen(port, '127.0.0.1', () => console.log(`[start] port bound on http://127.0.0.1:${server.address().port}, loading data (503 until ready)`));
+await once(server, 'listening');
 await tightenDataFiles();
-await rates.start();
+await rates.start({ blocking: false });
 await loadSettings();
 await loadSources();
 await loadNetworks();
@@ -3087,7 +3097,8 @@ if (requirePostgres && !db) throw new Error('REQUIRE_POSTGRES=1, но PostgreSQL
   const size = journalIndex.stats();
   console.log(`[journal] index ready in ${Date.now() - started} ms: ${size.clicks} recent clicks, ${size.conversions} conversions`);
 }
-server.listen(port, '127.0.0.1', () => console.log(`Product Umbrella listening on http://127.0.0.1:${server.address().port}`));
+ready = true;
+console.log(`Product Umbrella listening on http://127.0.0.1:${server.address().port}`);
 if (retentionDays > 0) {
   const retentionTick = () => runRetention().catch((error) => console.warn('[retention] failed:', error.message));
   const firstRunMs = Math.max(0, Number(process.env.RETENTION_DELAY_MS ?? 60000));
