@@ -47,10 +47,10 @@ export async function startUi(name, { env = {}, rates = true } = {}) {
     },
     /** Opens the panel at `path` (/campaigns, /reports?group=…) and stores the admin key in the tab (it lives in memory until a reload). */
     async openWithKey(page, path) {
-      // Landings need no key, so no key dialog pops up on its own before we open it.
+      // Offers and sources need a key since they carry partner tokens, so the dialog may pop up on its own: wait for either.
       await page.goto(url + '/landings');
-      await page.locator('table.grid').waitFor();
       const dialog = page.getByRole('dialog', { name: 'Ключ администратора' });
+      await dialog.or(page.locator('table.grid')).first().waitFor();
       if (!(await dialog.isVisible())) await page.locator('#token-btn').click();
       await dialog.locator('input[type=password]').fill(TOKEN);
       await dialog.getByRole('button', { name: 'Сохранить' }).click();
