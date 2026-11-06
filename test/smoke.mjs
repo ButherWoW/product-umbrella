@@ -56,10 +56,10 @@ try {
   const postback = await fetch(`http://127.0.0.1:4199/postback?click_id=${clickId}&secret=test-secret&revenue=1&currency=USD`);
   assert.deepEqual(await postback.json(), { ok: true });
 
-  // Duplicate postback must be rejected with 409
+  // Duplicate postback is acknowledged with 200 (networks retry non-2xx) and recorded only once
   const duplicate = await fetch(`http://127.0.0.1:4199/postback?click_id=${clickId}&secret=test-secret&revenue=1&currency=USD`);
-  assert.equal(duplicate.status, 409);
-  assert.equal((await duplicate.json()).error, 'conversion_already_recorded');
+  assert.equal(duplicate.status, 200);
+  assert.deepEqual(await duplicate.json(), { ok: true, duplicate: true });
 
   // Unknown click_id must return 404
   const unknown = await fetch(`http://127.0.0.1:4199/postback?click_id=00000000-0000-0000-0000-000000000000&secret=test-secret`);

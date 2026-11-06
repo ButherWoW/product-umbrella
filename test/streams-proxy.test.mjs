@@ -249,7 +249,7 @@ test('postback statuses: lead → sale → rejected, duplicates, aliases, amount
     assert.deepEqual(await lead.json(), { ok: true, status: 'lead' }, 'alias pending → lead');
     let s = await stats();
     assert.deepEqual([s.conversions, s.leads, s.sales, s.revenue, s.pendingRevenue], [1, 1, 0, 0, 20], 'lead is pending revenue, not revenue');
-    assert.equal((await pb(`click_id=${cid}&status=lead`)).status, 409, 'same status again is a duplicate');
+    assert.equal((await (await pb(`click_id=${cid}&status=lead`)).json()).duplicate, true, 'same status again is a duplicate');
 
     const sale = await pb(`click_id=${cid}&status=approved`);
     assert.deepEqual(await sale.json(), { ok: true, status: 'sale', updated: true });

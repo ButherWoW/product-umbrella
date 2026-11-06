@@ -1480,30 +1480,36 @@ async function deliverS2s(s2sUrl, meta, send = sendPostback) {
   if (result.error) console.warn('[s2s] postback failed:', result.error, `(attempt ${result.attempts})`);
   return result;
 }
-// Postbacks with a wrong secret: the first one per IP and minute is journaled as usual, the rest only counted;
-// at the end of the minute the count is journaled as one event («invalid_postback_secret ×N more»).
+// Postbacks that change nothing (wrong secret 401, unknown or malformed click 404/400, repeated status 200 «duplicate»):
+// the first one per IP, response and minute is journaled as usual, the rest only counted; at the end of the minute the count
+// is journaled as one event («invalid_postback_secret ×N more»). A flood with a leaked secret cannot grow the journal.
 const rejectedPostbacks = (() => {
   const windows = new Map();
   const flush = (all = false) => {
     const now = Date.now(), writes = [];
-    for (const [ip, w] of windows) {
+    for (const [key, w] of windows) {
       if (!all && now - w.since < 60000) continue;
-      windows.delete(ip);
+      windows.delete(key);
       if (w.suppressed) writes.push(logPostback('postback_in', { clickId: null, campaign: null, offerId: null, tid: null, status: null, revenue: null, currency: null,
-        url: null, statusCode: 401, error: `invalid_postback_secret ×${w.suppressed} more`, ip: ip === 'unknown' || ip === 'other' ? null : ip }));
+        url: null, statusCode: w.statusCode, error: `${w.reason} ×${w.suppressed} more`, ip: w.ip === 'unknown' || w.ip === 'other' ? null : w.ip }));
     }
     return Promise.all(writes);
   };
   setInterval(flush, 60000).unref();
   return {
-    // true → journal this rejection; false → counted only.
-    note(ip) {
+    // true → journal this one; false → counted only.
+    note(ip, statusCode = 401, reason = 'invalid_postback_secret') {
       const now = Date.now();
-      const w = windows.get(ip);
+      const key = `${ip}|${statusCode}|${reason}`;
+      const w = windows.get(key);
       if (w && now - w.since < 60000) { w.suppressed += 1; return false; }
       if (w) flush();
-      if (windows.size >= 10000) { const other = windows.get('other') || { since: now, suppressed: 0 }; other.suppressed += 1; windows.set('other', other); return false; }
-      windows.set(ip, { since: now, suppressed: 0 });
+      if (windows.size >= 10000) {
+        const otherKey = `other|${statusCode}|${reason}`;
+        const other = windows.get(otherKey) || { since: now, suppressed: 0, ip: 'other', statusCode, reason };
+        other.suppressed += 1; windows.set(otherKey, other); return false;
+      }
+      windows.set(key, { since: now, suppressed: 0, ip, statusCode, reason });
       return true;
     },
     flush,
@@ -2396,9 +2402,10 @@ const server = http.createServer(async (req, res) => {
         offerId: context.click?.offerId ?? null, tid: q('tid'), status: q('status'), revenue: q('revenue') || q('payout'), currency: q('currency'),
         url: redactUrl(req.url), statusCode, error, ip: clientIp(req) || null });
       if (postbackSecret && !safeEqual(url.searchParams.get('secret'), postbackSecret)) {
-        if (rejectedPostbacks.note(clientIp(req) || 'unknown')) await logIncoming(401, 'invalid_postback_secret');
+        if (rejectedPostbacks.note(clientIp(req) || 'unknown', 401, 'invalid_postback_secret')) await logIncoming(401, 'invalid_postback_secret');
         return json(res, 401, { error: 'invalid_postback_secret' });
       }
+      const ip = clientIp(req) || 'unknown';
       try {
         // `payout` is an alias of `revenue`; without either, a CPA offer's payout is used (see recordPostback).
         const result = await recordPostback({ clickId: url.searchParams.get('click_id'), context,
@@ -2407,7 +2414,14 @@ const server = http.createServer(async (req, res) => {
         await logIncoming(200);
         return json(res, 200, result);
       } catch (error) {
-        await logIncoming(error.statusCode || 500, String(error.message || error).slice(0, 300));
+        // The same status again: networks retry anything but 2xx, so a repeat is acknowledged (nothing is recorded or re-sent).
+        if (error.statusCode === 409 && error.message === 'conversion_already_recorded') {
+          if (rejectedPostbacks.note(ip, 200, 'conversion_already_recorded')) await logIncoming(200, 'conversion_already_recorded');
+          return json(res, 200, { ok: true, duplicate: true });
+        }
+        // Unknown or malformed click_id / bad values: aggregated like a wrong secret.
+        const aggregated = (error.statusCode === 400 || error.statusCode === 404) && !rejectedPostbacks.note(ip, error.statusCode, String(error.message).slice(0, 80));
+        if (!aggregated) await logIncoming(error.statusCode || 500, String(error.message || error).slice(0, 300));
         if (!error.statusCode) throw error;
         return json(res, error.statusCode, { error: error.message,
           ...(error.conversionWindowDays ? { conversionWindowDays: error.conversionWindowDays } : {}) });

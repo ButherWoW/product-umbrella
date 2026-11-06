@@ -1487,6 +1487,10 @@
                     },
                     "updated": {
                       "type": "boolean"
+                    },
+                    "duplicate": {
+                      "type": "boolean",
+                      "description": "true: the same status was already recorded for this click and tid; nothing was changed or re-sent"
                     }
                   }
                 }
@@ -1539,18 +1543,13 @@
             }
           },
           "409": {
-            "description": "Duplicate or expired conversion",
+            "description": "Conversion window expired (a repeated status is a 200 with duplicate: true)",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/Error"
                 },
                 "examples": {
-                  "duplicate": {
-                    "value": {
-                      "error": "conversion_already_recorded"
-                    }
-                  },
                   "window": {
                     "value": {
                       "error": "conversion_window_expired",

@@ -64,7 +64,7 @@ test('sale fires once with macros substituted and is logged without the query st
   assert.deepEqual(Object.fromEntries(hit.searchParams), { cid: 'fbclid 123', click: id, s: 'sale', p: '12.5', cur: 'USD', ad: 'ad-7', keep: '{unknown}' });
   const [logged] = await sourceEvents(id);
   assert.deepEqual([logged.campaign, logged.status, logged.httpStatus, logged.error, logged.url], ['fbc', 'sale', 200, null, `${mock.base}/fb`]);
-  assert.equal((await postback(id, { status: 'sale' })).status, 409);
+  assert.equal((await (await postback(id, { status: 'sale' })).json()).duplicate, true);
   await sleep(300);
   assert.equal(mock.hits.length, 1, 'duplicate sale does not fire again');
 });

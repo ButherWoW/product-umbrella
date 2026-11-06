@@ -98,7 +98,7 @@ async function traffic(base) {
     await P({ click_id: '00000000-0000-4000-8000-000000000000' }),
     await pb({ secret: 'nope', click_id: ids.x2 }),
   ];
-  assert.deepEqual(codes, [200, 200, 409, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 404, 401]);
+  assert.deepEqual(codes, [200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 404, 401]);
   await H('m3', '/r/c2?sub_id_1=n', { ip: '90.1.1.4' }); // o-cpa2 capped → o-alt
   assert.equal(await P({ click_id: ids.m3, revenue: '2', status: 'sale' }), 200);
   const day = today();
