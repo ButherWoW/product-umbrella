@@ -2045,7 +2045,7 @@ async function handleAuthRoute(req, res, url) {
     if (!(await users.authenticate(req.user.email, body.currentPassword))) return json(res, 403, { error: 'invalid_current_password' });
     loginLimiter.success(ticket);
     await users.setPassword(req.user.id, body.newPassword, { keepToken: readCookie(req, SESSION_COOKIE) });
-    await audit(req, 'update', 'user', req.user.id, null, { passwordChanged: true });
+    await audit(req, 'update', 'user', req.user.id, null, { credentialsChanged: true });
     return json(res, 200, { ok: true });
   }
   const isOwner = req.user?.role === 'owner' || bearerAuthorized(req);
@@ -2076,7 +2076,7 @@ async function handleAuthRoute(req, res, url) {
     // Password reset by the owner: the user's sessions end (the owner's own current session stays when it resets its own password).
     if (body.password !== undefined) {
       await users.setPassword(id, body.password, { keepToken: req.user?.id === id ? readCookie(req, SESSION_COOKIE) : null });
-      await audit(req, 'update', 'user', id, null, { passwordChanged: true });
+      await audit(req, 'update', 'user', id, null, { credentialsChanged: true });
     }
     await audit(req, 'update', 'user', id, view(target), view(updated));
     return json(res, 200, { user: updated });
